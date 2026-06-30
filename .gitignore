@@ -1,0 +1,10 @@
+node_modules
+
+# issue-cache local data
+issue-cache/.pgdata/
+issue-cache/corpus.json
+issue-cache/*.jsonl
+.DS_Store
+
+# local test postgres
+test/.pgdata/

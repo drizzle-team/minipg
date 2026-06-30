@@ -1,0 +1,38 @@
+{
+  "name": "nodepg-postgresjs",
+  "module": "src/index.ts",
+  "type": "module",
+  "private": true,
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "bun test",
+    "test:unit": "bun test test/unit",
+    "test:integration": "bun test test/integration",
+    "test:smoke": "bun test/smoke.ts",
+    "test:setup": "bash test/setup-pg.sh",
+    "bench": "bun bench/drivers.bench.ts",
+    "bench:micro": "bun bench/micro.bench.ts",
+    "bench:overhead": "bun bench/overhead.bench.ts",
+    "bench:json": "bun bench/json-decode.bench.ts",
+    "demo:codegen": "bun codegen-demo.ts",
+    "bench:decode-vs": "bun bench/decode-vs.bench.ts",
+    "bench:chunks": "bun bench/chunks.bench.ts"
+  },
+  "devDependencies": {
+    "@mitata/counters": "^0.0.8",
+    "@types/bun": "latest",
+    "@types/pg": "^8.20.0",
+    "cli-highlight": "^2.1.11",
+    "fast-check": "^4.8.0",
+    "mitata": "^1.0.34",
+    "pg": "^8.22.0",
+    "postgres": "^3.4.9",
+    "prettier": "^3.9.1"
+  },
+  "peerDependencies": {
+    "typescript": "^5"
+  }
+}
