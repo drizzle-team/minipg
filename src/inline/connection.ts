@@ -19,6 +19,7 @@ interface NormalizedConfig {
   applicationName: string; connectTimeout: number; decoders: Map<number, Decoder>
   reconnect: { enabled: boolean; base: number; max: number; maxRetries: number | null }
   socket?: () => Duplex
+  path?: string
 }
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms))
@@ -127,6 +128,7 @@ export class Connection {
         return { enabled: rc === true || (rc != null && typeof rc === 'object'), base: o.baseMs ?? 100, max: o.maxMs ?? 5000, maxRetries: o.maxRetries ?? null }
       })(config.reconnect),
       socket: config.socket,
+      path: config.path,
     }
     // keep the password out of console.log / JSON / inspection of the connection
     Object.defineProperty(this.cfg, 'password', { value: this.cfg.password, enumerable: false, writable: true, configurable: true })
@@ -156,10 +158,11 @@ export class Connection {
         queueMicrotask(() => this.afterTransport())
         return
       }
-      const sock = net.connect({ host: this.cfg.host, port: this.cfg.port })
+      // unix-domain socket (cfg.path) bypasses host/port and SSL; otherwise TCP
+      const sock = this.cfg.path ? net.connect({ path: this.cfg.path }) : net.connect({ host: this.cfg.host, port: this.cfg.port })
       this.socket = sock
       this.attachSocket(sock)
-      sock.once('connect', () => (this.cfg.ssl ? this.startSSL() : this.afterTransport()))
+      sock.once('connect', () => (this.cfg.ssl && !this.cfg.path ? this.startSSL() : this.afterTransport()))
     })
   }
 
@@ -286,6 +289,7 @@ export class Connection {
     // `this.current` once we have bytes to write, so a throw can't wedge the queue.
     let payload: Buffer
     try {
+      if (!Array.isArray(t.params)) throw new TypeError('params must be an array')
       const enc = t.params.map(encodeParam)
       const name = t.name ?? ''
       let reuse = false

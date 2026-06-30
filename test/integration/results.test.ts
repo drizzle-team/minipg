@@ -46,12 +46,20 @@ describe('array mode (default) row shape', () => {
 })
 
 describe('object mode row shape & duplicate-column collapse', () => {
-  test('plain record with all distinct keys (note: null-prototype object, not Object.prototype)', async () => {
+  test('plain record with all distinct keys (Object.prototype-backed, like pg/postgres.js)', async () => {
     const r = await c.query('select 1 as a, 2 as b', [], { mode: 'object' })
     const row = obj(r)
-    // makeRow uses Object.create(null) so __proto__ cannot pollute — proto is null, NOT Object.prototype.
-    expect(Object.getPrototypeOf(row)).toBeNull()
+    // rows are plain {} (V8 keeps these in fast hidden-class mode; null-proto demotes to dictionary).
+    expect(Object.getPrototypeOf(row)).toBe(Object.prototype)
     expect(JSON.stringify(row)).toBe('{"a":1,"b":2}')
+  })
+
+  test('a column named __proto__ is set as an OWN property, never a prototype mutation', async () => {
+    const r = await c.query(`select 1 as a, 'x' as "__proto__"`, [], { mode: 'object' })
+    const row = obj(r) as Record<string, unknown>
+    expect(Object.getPrototypeOf(row)).toBe(Object.prototype) // not polluted
+    expect(Object.prototype.hasOwnProperty.call(row, '__proto__')).toBe(true)
+    expect(row.a).toBe(1)
   })
 
   test('duplicate names collapse rightmost-wins: select 1 as x, 2 as x -> {x:2}', async () => {

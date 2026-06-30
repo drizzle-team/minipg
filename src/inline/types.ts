@@ -34,6 +34,9 @@ export interface ConnectConfig {
   ssl?: boolean | 'require' | tls.ConnectionOptions
   applicationName?: string
   connectTimeout?: number
+  /** Connect via a unix-domain socket at this path (e.g. /tmp/.s.PGSQL.5432) instead of
+   *  host/port TCP — lower latency / higher throughput on the same machine; SSL is skipped. */
+  path?: string
   /** Per-OID decoder overrides for the parsed ('array'/'object') modes. */
   types?: Record<number, Decoder>
   /** How to decode integers inside ANY json/jsonb value that exceed 2^53 (which plain

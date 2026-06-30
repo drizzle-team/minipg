@@ -58,6 +58,74 @@ export const W = {
   cancelRequest: (pid: number, secret: number) => Buffer.concat([i32(16), i32(80877102), i32(pid), i32(secret)]),
 }
 
+// Reusable growable write buffer with back-patched int32 message lengths — eliminates the
+// per-message Buffer.from/allocUnsafe/Buffer.concat the `W` builders do. One instance is reused
+// per query (one query in flight at a time), so the hot extended-query packet is ~1 allocation.
+export class Writer {
+  private buf: Buffer
+  private off = 0
+  private msgStart = 0
+  constructor(size = 4096) { this.buf = Buffer.allocUnsafe(size) }
+  reset(): void { this.off = 0 }
+  private ensure(n: number): void {
+    const need = this.off + n
+    if (need <= this.buf.length) return
+    let cap = this.buf.length * 2
+    while (cap < need) cap *= 2
+    const nb = Buffer.allocUnsafe(cap)
+    this.buf.copy(nb, 0, 0, this.off)
+    this.buf = nb
+  }
+  byte(n: number): void { this.ensure(1); this.buf[this.off++] = n }
+  int16(n: number): void { this.ensure(2); this.buf.writeUInt16BE(n, this.off); this.off += 2 }
+  int32(n: number): void { this.ensure(4); this.buf.writeInt32BE(n, this.off); this.off += 4 }
+  str(s: string): void { const len = Buffer.byteLength(s, 'utf8'); this.ensure(len); this.buf.write(s, this.off, 'utf8'); this.off += len } // no NUL terminator
+  cstr(s: string): void { this.str(s); this.byte(0) }
+  bytes(b: Buffer): void { this.ensure(b.length); b.copy(this.buf, this.off); this.off += b.length }
+  // type byte + reserved int32 length (back-patched in end() to cover itself + payload)
+  start(type: string): void { this.byte(type.charCodeAt(0)); this.msgStart = this.off; this.ensure(4); this.off += 4 }
+  end(): void { this.buf.writeInt32BE(this.off - this.msgStart, this.msgStart) }
+  slice(): Buffer { return this.buf.subarray(0, this.off) }
+}
+
+export function writeParse(w: Writer, name: string, sql: string): void {
+  guardNul(sql, 'query text')
+  w.start('P'); w.cstr(name); w.cstr(sql); w.int16(0); w.end() // 0 param-type oids => server infers
+}
+export function writeDescribe(w: Writer, kind: 'S' | 'P', name: string): void {
+  w.start('D'); w.byte(kind.charCodeAt(0)); w.cstr(name); w.end()
+}
+export function writeExecute(w: Writer, portal: string, maxRows = 0): void {
+  w.start('E'); w.cstr(portal); w.int32(maxRows); w.end()
+}
+export function writeClose(w: Writer, kind: 'S' | 'P', name: string): void {
+  w.start('C'); w.byte(kind.charCodeAt(0)); w.cstr(name); w.end()
+}
+export function writeSync(w: Writer): void { w.start('S'); w.end() }
+
+// Encode one Bind parameter straight into the write buffer — no intermediate per-param Buffer.
+// Length-prefixed: int32 byte-length (computed without allocating) then the bytes.
+function writeParam(w: Writer, p: unknown): void {
+  if (p == null) { w.int32(-1); return }            // SQL NULL
+  if (Buffer.isBuffer(p)) { w.int32(p.length); w.bytes(p); return } // binary param (format 1)
+  if (typeof p === 'boolean') { w.int32(1); w.byte(p ? 116 : 102); return } // 't' / 'f'
+  const s = p instanceof Date ? p.toISOString() : typeof p === 'object' ? JSON.stringify(p) : String(p)
+  guardNul(s, 'parameter')
+  w.int32(Buffer.byteLength(s, 'utf8')); w.str(s)
+}
+
+export function writeBind(w: Writer, portal: string, statement: string, params: unknown[], resultFormat = 0): void {
+  if (!Array.isArray(params)) throw new TypeError('params must be an array')
+  if (params.length > 65535) throw new Error(`too many bind parameters: ${params.length} (max 65535)`)
+  w.start('B'); w.cstr(portal); w.cstr(statement)
+  w.int16(params.length)
+  for (const p of params) w.int16(Buffer.isBuffer(p) ? 1 : 0) // per-param format: 1 binary (Buffer), else 0 text
+  w.int16(params.length)
+  for (const p of params) writeParam(w, p)
+  w.int16(1); w.int16(resultFormat) // one result-format code applied to all columns
+  w.end()
+}
+
 export interface RawMessage { type: string; body: Buffer }
 
 /** Incremental parser: feed socket chunks, get back complete messages. */

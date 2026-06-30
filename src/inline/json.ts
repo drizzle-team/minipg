@@ -134,7 +134,8 @@ function valueSnippet(field: string | JsonMarker, v: string, type: 'json' | 'jso
 function objectSource(fn: string, spec: JsonSpec, type: 'json' | 'jsonb', emit: (m: JsonMarker, t: 'json' | 'jsonb') => string): string {
   const entries = Object.entries(spec)
   const order = wireOrder(entries, type)
-  const ret = '{ ' + entries.map(([k], i) => `${JSON.stringify(k)}: v${i}`).join(', ') + ' }'
+  // computed key for __proto__ so it becomes an own property, not the object's prototype
+  const ret = '{ ' + entries.map(([k], i) => (k === '__proto__' ? `["__proto__"]: v${i}` : `${JSON.stringify(k)}: v${i}`)).join(', ') + ' }'
   const note = type === 'jsonb' ? 'jsonb, wire key order: length,bytewise' : 'json, declared order'
   const lines = [
     `function ${fn}() { // ${note}`,

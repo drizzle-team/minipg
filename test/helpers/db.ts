@@ -1,8 +1,21 @@
 // Shared test harness: connection/pool factories + small assertion helpers.
 // Integration tests expect a running cluster from `bun run test:setup`
 // (override with PGTEST_* env vars).
-import { connect, createPool, PgError } from '../../src/index.ts'
+// Driver under test: the interpreted driver (src/) by default, or the codegen/JIT driver
+// (src/inline/) when MINIPG_VARIANT=jit. This lets the query/decode suite run unchanged against
+// BOTH implementations — `bun run test:query` (interpreted) and `test:query:jit` (codegen).
+import * as interpreted from '../../src/index.ts'
+import * as jit from '../../src/inline/index.ts'
 import type { ConnectConfig, PoolConfig } from '../../src/index.ts'
+
+export const VARIANT = process.env.MINIPG_VARIANT === 'jit' ? 'jit' : 'interpreted'
+const impl: typeof interpreted = VARIANT === 'jit' ? (jit as unknown as typeof interpreted) : interpreted
+const connect = impl.connect
+const createPool = impl.createPool
+// PgError is used both as a value (instanceof / throw) and a type (`e: PgError`) by tests, so
+// export both: the value tracks the active variant; the type comes from the (identical) class.
+export type PgError = interpreted.PgError
+export const PgError = impl.PgError
 
 export const TEST_CONFIG: ConnectConfig = {
   host: process.env.PGTEST_HOST ?? '127.0.0.1',
@@ -26,5 +39,3 @@ export async function caught(fn: () => Promise<unknown>): Promise<unknown> {
   try { await fn() } catch (e) { return e }
   throw new Error('expected the operation to reject, but it resolved')
 }
-
-export { PgError }

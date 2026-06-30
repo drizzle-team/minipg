@@ -425,7 +425,7 @@ describe('parameter count, mismatch & limit', () => {
     const c = await testConnect()
     try {
       const err = await caught(() => c.query('select 1', 'nope' as unknown as unknown[]))
-      expect((err as Error).message).toMatch(/map is not a function/)
+      expect((err as Error).message).toMatch(/params must be an array/)
       expect(cell0(await c.query('select 8::int4'))).toBe(8)
     } finally { await c.end() }
   })

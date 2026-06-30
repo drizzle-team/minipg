@@ -4,18 +4,18 @@ import net from 'node:net'
 import tls from 'node:tls'
 import os from 'node:os'
 import type { Duplex } from 'node:stream'
-import { W, Parser, parseRowDescription } from './protocol.ts'
+import { W, Writer, Parser, parseRowDescription, writeParse, writeDescribe, writeBind, writeExecute, writeSync, writeClose } from './protocol.ts'
 import { md5Password, scram, type Scram } from './auth.ts'
-import { buildDecoders, decoderFor, encodeParam } from './codec.ts'
+import { buildDecoders, decoderFor, type CellDecoder } from './codec.ts'
 import { PgError, parseErrorFields } from './errors.ts'
-import type { ConnectConfig, Decoder, Field, QueryOptions, QueryResult, ResultMode, StreamOptions } from './types.ts'
+import type { ConnectConfig, Field, QueryOptions, QueryResult, ResultMode, StreamOptions } from './types.ts'
 
 type ConnState = 'idle' | 'connecting' | 'ready' | 'reconnecting' | 'closed'
 
 interface NormalizedConfig {
   host: string; port: number; user: string; password: string; database: string
   ssl: Exclude<NonNullable<ConnectConfig['ssl']>, 'disable'> // 'disable' normalized to false
-  applicationName: string; connectTimeout: number; decoders: Map<number, Decoder>
+  applicationName: string; connectTimeout: number; decoders: Map<number, CellDecoder>
   reconnect: { enabled: boolean; base: number; max: number; maxRetries: number | null }
   socket?: () => Duplex | Promise<Duplex>
   path?: string // unix-domain socket path (e.g. /tmp/.s.PGSQL.5432); when set, host/port/SSL are ignored
@@ -58,7 +58,7 @@ interface Task {
   mode: ResultMode
   bodies: Buffer[] // non-stream: DataRow bodies buffered, then decoded into a pre-sized array at finish
   fields?: Field[]
-  decoders?: Decoder[] // per-column decoders, resolved once at RowDescription (no per-cell Map lookup)
+  decoders?: CellDecoder[] // per-column decoders, resolved once at RowDescription (no per-cell Map lookup)
   command?: string | null
   rowCount?: number | null
   error?: Error
@@ -100,23 +100,36 @@ const firstCstr = (buf: Buffer) => { const z = buf.indexOf(0); return buf.toStri
 // Decode one DataRow body straight into a JS row — fused parse+decode (no intermediate cells
 // array) using the per-column decoders resolved once at RowDescription time (no per-cell
 // Map lookup). The body starts with an Int16 column count, hence o = 2; each field is
-// [Int32 length][value bytes] and the value is a zero-copy subarray handed to the decoder.
-function decodeRow(body: Buffer, mode: ResultMode, fields: Field[], decoders: Decoder[]): unknown {
+// [Int32 length][value bytes]. The length is read as a manual signed-BE int32 straight from
+// the four bytes (faster than readInt32BE — a method call + bounds check; 0xFFFFFFFF -> -1 for
+// NULL), and the value is decoded in place by (buffer, offset, length) — no per-cell subarray.
+function decodeRow(body: Buffer, mode: ResultMode, fields: Field[], decoders: CellDecoder[]): unknown {
   if (mode === 'raw') return Buffer.from(body)
   const n = fields.length
   let o = 2
   if (mode === 'object') {
-    const row: Record<string, unknown> = Object.create(null) // null-proto: a column named __proto__ can't pollute
-    for (let i = 0; i < n; i++) { const l = body.readInt32BE(o); o += 4; if (l === -1) row[fields[i]!.name] = null; else { row[fields[i]!.name] = decoders[i]!(body.subarray(o, o + l)); o += l } }
+    // Plain {} (NOT Object.create(null)): V8 keeps a {}+consistent-keys object in fast
+    // hidden-class mode, but demotes a null-proto one to dictionary mode (~2.5x slower decode).
+    // A column literally named __proto__ is written via defineProperty so it can't pollute.
+    const row: Record<string, unknown> = {}
+    for (let i = 0; i < n; i++) {
+      const l = (body[o]! << 24) | (body[o + 1]! << 16) | (body[o + 2]! << 8) | body[o + 3]!; o += 4
+      const name = fields[i]!.name
+      let v: unknown = null
+      if (l !== -1) { v = decoders[i]!(body, o, l); o += l } // offset decode: no per-cell subarray
+      if (name === '__proto__') Object.defineProperty(row, name, { value: v, writable: true, enumerable: true, configurable: true })
+      else row[name] = v
+    }
     return row
   }
   if (mode === 'buffer') {
     const r = new Array(n)
-    for (let i = 0; i < n; i++) { const l = body.readInt32BE(o); o += 4; if (l === -1) r[i] = null; else { r[i] = Buffer.from(body.subarray(o, o + l)); o += l } }
+    // copy each cell into a fresh Buffer (detached from the socket chunk); no subarray view
+    for (let i = 0; i < n; i++) { const l = (body[o]! << 24) | (body[o + 1]! << 16) | (body[o + 2]! << 8) | body[o + 3]!; o += 4; if (l === -1) r[i] = null; else { const c = Buffer.allocUnsafe(l); body.copy(c, 0, o, o + l); r[i] = c; o += l } }
     return r
   }
   const r = new Array(n) // 'array'
-  for (let i = 0; i < n; i++) { const l = body.readInt32BE(o); o += 4; if (l === -1) r[i] = null; else { r[i] = decoders[i]!(body.subarray(o, o + l)); o += l } }
+  for (let i = 0; i < n; i++) { const l = (body[o]! << 24) | (body[o + 1]! << 16) | (body[o + 2]! << 8) | body[o + 3]!; o += 4; if (l === -1) r[i] = null; else { r[i] = decoders[i]!(body, o, l); o += l } }
   return r
 }
 
@@ -132,9 +145,10 @@ export class Connection {
 
   private socket: net.Socket | tls.TLSSocket | Duplex | null = null
   private parser = new Parser()
+  private writer = new Writer() // reused per query: one growable buffer, no per-message allocs
   private queue: Task[] = []
   private current: Task | null = null
-  private prepared = new Map<string, { sql: string; fields: Field[]; decoders: Decoder[] }>()
+  private prepared = new Map<string, { sql: string; fields: Field[]; decoders: CellDecoder[] }>()
   // query-builder fast path: a chunks array (from a tagged template / builder) is a stable
   // identity, so we cache its joined SQL + an auto-assigned prepared-statement name keyed by
   // the array. Reuse skips the join AND the Parse (Bind+Execute only). WeakMap => auto-GC.
@@ -329,18 +343,19 @@ export class Connection {
     // `this.current` once we have bytes to write, so a throw can't wedge the queue.
     let payload: Buffer
     try {
-      const enc = t.params.map(encodeParam)
       const name = t.name ?? ''
+      const w = this.writer; w.reset()
       let reuse = false
-      const msgs: Buffer[] = []
       if (t.name) {
         const cached = this.prepared.get(t.name)
         if (cached && cached.sql === t.sql) { reuse = true; t.fields = cached.fields; t.decoders = cached.decoders }
-        else if (cached) { msgs.push(W.close('S', t.name)); this.prepared.delete(t.name) }
+        else if (cached) { writeClose(w, 'S', t.name); this.prepared.delete(t.name) }
       }
-      if (!reuse) { msgs.push(W.parse(name, t.sql), W.describe('S', name)); if (t.name) t._cacheName = t.name }
-      msgs.push(W.bind('', name, enc, 0), W.execute('', 0), W.sync())
-      payload = Buffer.concat(msgs)
+      if (!reuse) { writeParse(w, name, t.sql); writeDescribe(w, 'S', name); if (t.name) t._cacheName = t.name }
+      writeBind(w, '', name, t.params, 0); writeExecute(w, '', 0); writeSync(w) // params encoded straight into the buffer
+      // Safe to hand the reusable slice to write(): one query is in flight at a time, so the
+      // buffer isn't reset until ReadyForQuery (i.e. after these bytes have flushed).
+      payload = w.slice()
     } catch (e) {
       if (t.stream) t.streamError?.(e as Error); else t.reject?.(e as Error)
       queueMicrotask(() => this.processQueue())

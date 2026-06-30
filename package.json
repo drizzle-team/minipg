@@ -11,6 +11,9 @@
     "test": "bun test",
     "test:unit": "bun test test/unit",
     "test:integration": "bun test test/integration",
+    "test:query": "bun test test/integration/results.test.ts test/integration/types-core.test.ts test/integration/types-advanced.test.ts test/integration/types-temporal-json.test.ts test/integration/parameters.test.ts test/integration/query-protocol.test.ts test/integration/prepared-statements.test.ts test/integration/regression.test.ts",
+    "test:query:jit": "MINIPG_VARIANT=jit bun run test:query",
+    "test:query:both": "bun run test:query && bun run test:query:jit",
     "test:smoke": "bun test/smoke.ts",
     "test:setup": "bash test/setup-pg.sh",
     "bench": "bun bench/drivers.bench.ts",
@@ -19,6 +22,7 @@
     "bench:json": "bun bench/json-decode.bench.ts",
     "demo:codegen": "bun codegen-demo.ts",
     "bench:decode-vs": "bun bench/decode-vs.bench.ts",
+    "bench:parity": "bun bench/decode-parity.ts",
     "bench:chunks": "bun bench/chunks.bench.ts"
   },
   "devDependencies": {

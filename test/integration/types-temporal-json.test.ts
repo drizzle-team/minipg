@@ -471,8 +471,10 @@ describe('json parser override / raw passthrough', () => {
   test('buildDecoders merges per-OID overrides without clobbering base map', () => {
     const id = (b: Buffer): unknown => b
     const m = buildDecoders({ 114: id, 3802: id })
-    expect(decoderFor(114, m)).toBe(id)
-    expect(decoderFor(3802, m)).toBe(id)
+    // overrides are applied (wrapped to the internal offset form), so they run instead of the
+    // default json decoder — verify by behavior rather than function identity.
+    expect((decoderFor(114, m)(Buffer.from('hi')) as Buffer).toString()).toBe('hi')
+    expect((decoderFor(3802, m)(Buffer.from('yo')) as Buffer).toString()).toBe('yo')
     // unrelated OIDs keep defaults: int4 still decodes to number
     expect(decoderFor(23, m)(Buffer.from('42'))).toBe(42)
     // and the base map itself is untouched

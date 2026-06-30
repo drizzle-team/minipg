@@ -1,68 +1,81 @@
-// Decode-isolated driver comparison: minipg vs node-postgres (pg) vs postgres.js, all over
-// loopback to the in-memory MockPgServer. The mock replies INSTANTLY with pre-serialized
-// responses (cacheResponses), so PostgreSQL's query-execution time is removed and the common
-// loopback round-trip cancels out in the comparison — what's left is each driver's CPU:
-// protocol framing + value decode + row building. This is where the interpreted-decode work
-// (cached decoders, fused parse+decode, int-from-bytes, pre-sized result array) shows up,
-// which the end-to-end bench/drivers.bench.ts hides under network RTT.
+// Real-DB driver comparison over a UNIX DOMAIN SOCKET. Every driver runs on a pool of the SAME
+// size and with PREPARED statements; each measured iteration runs ONE query (single-query latency,
+// not fan-out — a pool just gives each driver identical connection headroom). Hits the local test
+// cluster from `bun run test:setup` via its unix socket (/tmp/minipg_sock/.s.PGSQL.54329;
+// --auth-local=trust, so no password).
 //
-// mitata, do_not_optimize, inner_gc. All inputs are built at module scope — the timed fn only
-// issues the query.  bun bench/decode-vs.bench.ts   (or: bun run bench:decode-vs)
+// End-to-end (transport + server execution + decode + row build), not the old decode-isolated mock.
+// The unix socket removes TCP loopback and prepared statements remove parse/plan, so each driver's
+// CPU (framing + value decode + row build) is a large share of what's left — where minipg's
+// interpreted/JIT decode work shows up.
+//
+// mitata, do_not_optimize, inner gc. Pools + statements are warmed before timing.
+//   bun bench/decode-vs.bench.ts   (or: bun run bench:decode-vs)   -- needs `bun run test:setup`
 import { run, bench, group, summary, do_not_optimize } from 'mitata'
-import { Client } from 'pg'
+import { Pool as PgPool } from 'pg'
 import postgres from 'postgres'
 // import { SQL } from 'bun'
-import { connect } from '../src/index.ts'            // interpreted decode path (cached decoders + int-from-bytes + batch)
-import { connect as connectJit } from '../src/inline/index.ts' // JIT decode path (new Function row-builder codegen)
-import { MockPgServer } from '../test/mock/server.ts'
+import { createPool } from '../src/index.ts'                        // interpreted decode path
+import { createPool as createPoolJit } from '../src/inline/index.ts' // JIT/codegen decode path
 
-// rows: 3 int + 1 text + 1 bool  (exercises int-from-bytes, string, bool decode)
-const FIELDS = [{ name: 'id', oid: 23 }, { name: 'a', oid: 23 }, { name: 'b', oid: 23 }, { name: 'name', oid: 25 }, { name: 'ok', oid: 16 }]
-const mkRows = (n: number) => Array.from({ length: n }, (_, i) => [String(i + 1), String(i * 2), String(i * 3), 'name_' + i, i % 2 ? 't' : 'f'] as (string | null)[])
-const rows100 = mkRows(100), rows1000 = mkRows(1000)
-const mock = await MockPgServer.start({ onQuery: (sql) => ({ fields: FIELDS, rows: sql.includes('1000') ? rows1000 : rows100, command: 'SELECT' }) })
-mock.cacheResponses(true) // serialize each query once, then replay the bytes -> measure driver decode, not mock serialization
+const SOCK_DIR = '/tmp/minipg_sock'                 // PG unix_socket_directories (see test/setup-pg.sh)
+const SOCK_PATH = SOCK_DIR + '/.s.PGSQL.54329'      // the socket FILE minipg connects to via `path`
+const PORT = 54329, USER = 'postgres', DB = 'testdb'
+const POOL = 8                                       // identical pool size for every driver
 
-const host = '127.0.0.1', port = mock.port
-const mc = await connect({ host, port, user: 'mock', database: 'mock', password: '' })       // interpreted
-const mj = await connectJit({ host, port, user: 'mock', database: 'mock', password: '' })     // JIT/codegen
-const pgc = new Client({ host, port, user: 'mock', database: 'mock', password: '' }); await pgc.connect()
-const sql = postgres({ host, port, user: 'mock', database: 'mock', password: '', max: 1, prepare: false })
-// const bunsql = new SQL({ hostname: host, port, username: 'mock', database: 'mock' }) // Bun's built-in Postgres client
+// real rows: 3 int + text + bool (exercises int-from-bytes, string, bool decode)
+const mkSql = (n: number) => `select g::int4 as id, (g*2)::int4 as a, (g*3)::int4 as b, ('name_'||g) as name, (g%2=0) as ok from generate_series(1, ${n}) g`
+const SQL100 = mkSql(100), SQL1000 = mkSql(1000)
 
-// Per-connection SQL text so the (sql-keyed) response cache never serves an extended-protocol
-// blob (no RowDescription) to pg's simple-query path. Semantically identical; size is picked
-// by the '1000' substring. All inputs pre-built — no allocation in the timed fns.
-const M100 = 'select rows100 -- m', X100 = 'select rows100 -- mjit', P100 = 'select rows100 -- pg', J100 = 'select rows100 -- pgjs', B100 = 'select rows100 -- bun'
-const M1000 = 'select rows1000 -- m', X1000 = 'select rows1000 -- mjit', P1000 = 'select rows1000 -- pg', J1000 = 'select rows1000 -- pgjs', B1000 = 'select rows1000 -- bun'
+// pools (size POOL), prepared statements on. minipg connects to the socket FILE (path); pg/postgres.js
+// use the libpq convention host=<socket dir> + port -> <dir>/.s.PGSQL.<port>.
+const mc = createPool({ path: SOCK_PATH, user: USER, database: DB, password: '', max: POOL })
+const mj = createPoolJit({ path: SOCK_PATH, user: USER, database: DB, password: '', max: POOL }) as unknown as typeof mc
+const pgp = new PgPool({ host: SOCK_DIR, port: PORT, user: USER, database: DB, max: POOL })
+const sql = postgres({ host: SOCK_DIR, port: PORT, user: USER, database: DB, max: POOL, prepare: true })
+// const bunsql = new SQL({ adapter: 'postgres', path: SOCK_PATH, username: USER, database: DB, max: POOL, prepare: true }) // Bun.sql: `path` = unix socket FILE
+
 const EMPTY: never[] = []
-const MODE_OBJ = { mode: 'object' as const }
+// Bun.sql tagged template (sql``) — prepared + cached by template identity, faster than unsafe().
+// Literal queries (no interpolation) so they match exactly what the other drivers run.
+// const b100 = () => bunsql`select g::int4 as id, (g*2)::int4 as a, (g*3)::int4 as b, ('name_'||g) as name, (g%2=0) as ok from generate_series(1, 100) g`
+// const b1000 = () => bunsql`select g::int4 as id, (g*2)::int4 as a, (g*3)::int4 as b, ('name_'||g) as name, (g%2=0) as ok from generate_series(1, 1000) g`
 
-group('100 rows · 3int + text + bool (decode-isolated)', () => {
+// warm: prepare each statement on its driver before timing (mitata also warms each bench).
+// minipg: { name } enables server-side prepared-statement caching; pg: { name }; postgres.js: { prepare }.
+for (let i = 0; i < 5; i++) {
+  await mc.query(SQL100, EMPTY, { name: 'm100' }); await mc.query(SQL1000, EMPTY, { name: 'm1000' })
+  await mj.query(SQL100, EMPTY, { name: 'j100' }); await mj.query(SQL1000, EMPTY, { name: 'j1000' })
+  await pgp.query({ text: SQL100, name: 'pg100' }); await pgp.query({ text: SQL1000, name: 'pg1000' })
+  await sql.unsafe(SQL100, [], { prepare: true }); await sql.unsafe(SQL1000, [], { prepare: true })
+  // await b100(); await b1000()
+}
+
+group(`100 rows · 3int+text+bool · unix socket · pool(${POOL}) · prepared · 1 query/iter`, () => {
   summary(() => {
-    bench('minipg interp (object)', async () => { do_not_optimize(await mc.query(M100, EMPTY, MODE_OBJ)) }).gc('inner')
-    bench('minipg JIT (object)', async () => { do_not_optimize(await mj.query(X100, EMPTY, MODE_OBJ)) }).gc('inner')
-    bench('minipg interp (array)', async () => { do_not_optimize(await mc.query(M100)) }).gc('inner')
-    bench('minipg JIT (array)', async () => { do_not_optimize(await mj.query(X100)) }).gc('inner')
-    bench('pg (object)', async () => { do_not_optimize(await pgc.query(P100)) }).gc('inner')
-    bench('postgres.js (object)', async () => { do_not_optimize(await sql.unsafe(J100)) }).gc('inner')
-    // bench('Bun.sql (object)', async () => { do_not_optimize(await bunsql.unsafe(B100)) }).gc('inner')
+    bench('minipg interp (array)', async () => { do_not_optimize(await mc.query(SQL100, EMPTY, { name: 'm100' })) }).gc('inner')
+    bench('minipg interp (object)', async () => { do_not_optimize(await mc.query(SQL100, EMPTY, { name: 'm100', mode: 'object' })) }).gc('inner')
+    bench('minipg JIT (object)', async () => { do_not_optimize(await mj.query(SQL100, EMPTY, { name: 'j100', mode: 'object' })) }).gc('inner')
+    bench('minipg JIT (array)', async () => { do_not_optimize(await mj.query(SQL100, EMPTY, { name: 'j100' })) }).gc('inner')
+    bench('pg (object)', async () => { do_not_optimize(await pgp.query({ text: SQL100, name: 'pg100' })) }).gc('inner')
+    bench('postgres.js (object)', async () => { do_not_optimize(await sql.unsafe(SQL100, [], { prepare: true })) }).gc('inner')
+    // bench('Bun.sql (object)', async () => { do_not_optimize(await b100()) }).gc('inner')
   })
 })
 
-group('1000 rows · 3int + text + bool (decode-isolated)', () => {
+group(`1000 rows · 3int+text+bool · unix socket · pool(${POOL}) · prepared · 1 query/iter`, () => {
   summary(() => {
-    bench('minipg interp (object)', async () => { do_not_optimize(await mc.query(M1000, EMPTY, MODE_OBJ)) }).gc('inner')
-    bench('minipg JIT (object)', async () => { do_not_optimize(await mj.query(X1000, EMPTY, MODE_OBJ)) }).gc('inner')
-    bench('minipg interp (array)', async () => { do_not_optimize(await mc.query(M1000)) }).gc('inner')
-    bench('minipg JIT (array)', async () => { do_not_optimize(await mj.query(X1000)) }).gc('inner')
-    bench('pg (object)', async () => { do_not_optimize(await pgc.query(P1000)) }).gc('inner')
-    bench('postgres.js (object)', async () => { do_not_optimize(await sql.unsafe(J1000)) }).gc('inner')
-    // bench('Bun.sql (object)', async () => { do_not_optimize(await bunsql.unsafe(B1000)) }).gc('inner')
+    bench('minipg interp (array)', async () => { do_not_optimize(await mc.query(SQL1000, EMPTY, { name: 'm1000' })) }).gc('inner')
+    bench('minipg interp (object)', async () => { do_not_optimize(await mc.query(SQL1000, EMPTY, { name: 'm1000', mode: 'object' })) }).gc('inner')
+    bench('minipg JIT (object)', async () => { do_not_optimize(await mj.query(SQL1000, EMPTY, { name: 'j1000', mode: 'object' })) }).gc('inner')
+    bench('minipg JIT (array)', async () => { do_not_optimize(await mj.query(SQL1000, EMPTY, { name: 'j1000' })) }).gc('inner')
+    bench('pg (object)', async () => { do_not_optimize(await pgp.query({ text: SQL1000, name: 'pg1000' })) }).gc('inner')
+    bench('postgres.js (object)', async () => { do_not_optimize(await sql.unsafe(SQL1000, [], { prepare: true })) }).gc('inner')
+    // bench('Bun.sql (object)', async () => { do_not_optimize(await b1000()) }).gc('inner')
   })
 })
 
 await run()
-await mc.end(); await mj.end(); await pgc.end(); await sql.end({ timeout: 5 });
-//  await bunsql.end()
+await mc.end(); await mj.end(); await pgp.end(); await sql.end({ timeout: 5 }); 
+// await bunsql.end()
 process.exit(0)

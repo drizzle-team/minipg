@@ -20,6 +20,17 @@ const byteaAt: AtDecoder = (b, o, l) => { const s = b.toString('utf8', o, o + l)
 
 const DEBUG = !!process.env.MINIPG_CODEGEN_DEBUG
 
+// b.utf8Slice(o, e) is the primitive behind b.toString('utf8', o, e): it skips toString's
+// encoding-name lookup + argument coercion, so it's faster (~1.19x JSC / 1.08x V8 in the row
+// decoder). Present on Node and Bun; feature-detected so a Buffer shim lacking it still works.
+const HAS_UTF8_SLICE = typeof (Buffer.prototype as { utf8Slice?: unknown }).utf8Slice === 'function'
+const str = (from: string, to: string) => (HAS_UTF8_SLICE ? `b.utf8Slice(${from}, ${to})` : `b.toString('utf8', ${from}, ${to})`)
+
+// Read the int32 length prefix as a signed big-endian int straight from the four bytes instead
+// of b.readInt32BE(o) (a method call + a bounds check). PG field lengths are 0..2^31-1 or -1
+// (NULL), so the signed shift is exact: 0xFFFFFFFF -> -1. ~1.15x V8 / 1.08x JSC. Emitted per column.
+const readLen = 'l = (b[o] << 24) | (b[o + 1] << 16) | (b[o + 2] << 8) | b[o + 3]; o += 4;'
+
 // digit-parse straight from ASCII bytes -> JS number (no toString), for integer OIDs.
 const intFromBytes = (v: string) => `{ let p = o, s = false, x = 0; const e = o + l; if (b[p] === 45) { s = true; p++ } for (; p < e; p++) x = x * 10 + (b[p] - 48); ${v} = s ? -x : x }`
 
@@ -45,11 +56,11 @@ function inlineSnippet(oid: number, v: string, js?: JsTarget): [string, string] 
   switch (eff) {
     case 'number':
       if (INT_OIDS.has(oid)) return [intFromBytes(v), js ? 'int<-bytes :number' : 'int<-bytes']
-      return [`${v} = Number(b.toString('utf8', o, o + l))`, js ? 'number :number' : 'float']
-    case 'string': return [`${v} = b.toString('utf8', o, o + l)`, js ? 'string :string' : 'string']
+      return [`${v} = Number(${str('o', 'o + l')})`, js ? 'number :number' : 'float']
+    case 'string': return [`${v} = ${str('o', 'o + l')}`, js ? 'string :string' : 'string']
     case 'bool': return [`${v} = b[o] === 116`, 'bool']
-    case 'json': return [`${v} = JSON.parse(b.toString('utf8', o, o + l))`, 'json']
-    case 'bytea': return [`{ const s = b.toString('utf8', o, o + l); ${v} = s.charCodeAt(0) === 92 && s.charCodeAt(1) === 120 ? Buffer.from(s.slice(2), 'hex') : Buffer.from(s, 'utf8') }`, 'bytea']
+    case 'json': return [`${v} = JSON.parse(${str('o', 'o + l')})`, 'json']
+    case 'bytea': return [`{ const s = ${str('o', 'o + l')}; ${v} = s.charCodeAt(0) === 92 && s.charCodeAt(1) === 120 ? Buffer.from(s.slice(2), 'hex') : Buffer.from(s, 'utf8') }`, 'bytea']
     default: return null // helper closure (the `d` array)
   }
 }
@@ -77,7 +88,7 @@ function jsonPrep(cols: CodegenCol[]): { header: string; plan: Map<JsonMarker, J
   const markers = cols.filter((c) => c.json).map((c) => c.json!)
   if (!markers.length) return { header: '', plan: new Map() }
   const { decls, plan } = genJsonParsers(markers)
-  const header = decls.length ? `\n  // --- shaped JSON sub-parsers (positional) ---\n${JSON_RUNTIME}\n${decls.join('\n')}\n` : ''
+  const header = decls.length ? `\n${DEBUG ? '  // --- shaped JSON sub-parsers (positional) ---\n' : ''}${JSON_RUNTIME}\n${decls.join('\n')}\n` : ''
   return { header, plan }
 }
 
@@ -87,20 +98,26 @@ function columnLines(out: string[], col: CodegenCol, i: number, ind: string, hel
   const v = `v${i}`
   if (col.json) {
     const pl = plan.get(col.json)!
-    out.push(`${ind}// ${JSON.stringify(col.name)} (${pl.fast ? 'json fast: JSON.parse' : `json shaped: positional ${col.json.type}`})`)
-    out.push(`${ind}l = b.readInt32BE(o); o += 4; let ${v} = null;`)
+    if (DEBUG) out.push(`${ind}// ${JSON.stringify(col.name)} (${pl.fast ? 'json fast: JSON.parse' : `json shaped: positional ${col.json.type}`})`)
+    out.push(`${ind}${readLen} let ${v} = null;`)
     out.push(pl.fast
-      ? `${ind}if (l !== -1) { ${v} = JSON.parse(b.toString('utf8', o, o + l)); o += l }`
+      ? `${ind}if (l !== -1) { ${v} = JSON.parse(${str('o', 'o + l')}); o += l }`
       : `${ind}if (l !== -1) { jb = b; jp = o; je = o + l; ${v} = ${pl.call}; o += l }`)
     return
   }
   const inl = custom.has(col.oid) ? null : inlineSnippet(col.oid, v, col.js) // custom decoder -> helper, not inline
   const kind = inl ? inl[1] : 'helper'
-  out.push(`${ind}// ${JSON.stringify(col.name)} oid=${col.oid}${col.js ? ' :' + col.js : ''} (${kind})`)
-  out.push(`${ind}l = b.readInt32BE(o); o += 4; let ${v} = null;`)
+  if (DEBUG) out.push(`${ind}// ${JSON.stringify(col.name)} oid=${col.oid}${col.js ? ' :' + col.js : ''} (${kind})`)
+  out.push(`${ind}${readLen} let ${v} = null;`)
   if (inl) out.push(`${ind}if (l !== -1) { ${inl[0]}; o += l }`)
   else { const hi = helperOids.length; helperOids.push(col.oid); out.push(`${ind}if (l !== -1) { ${v} = d[${hi}](b, o, l); o += l }`) }
 }
+
+// Emit one `key: vN` pair for an object literal. A column literally named __proto__ MUST use a
+// computed key (`["__proto__"]: v`) — the plain/quoted form `__proto__: v` sets the object's
+// prototype instead of creating an own property (matches the interpreted path's defineProperty
+// guard). Only __proto__ is special; every other name is a normal own property.
+const objKey = (name: string, i: number) => (name === '__proto__' ? `["__proto__"]: v${i}` : `${JSON.stringify(name)}: v${i}`)
 
 export type RowBuilder = ((body: Buffer) => unknown) & { source: string }
 
@@ -111,9 +128,9 @@ export function rowBuilderSource(cols: CodegenCol[], mode: 'array' | 'object', c
   const lines = ['  let o = 2, l;']
   for (let i = 0; i < cols.length; i++) columnLines(lines, cols[i]!, i, '  ', helperOids, plan, custom)
   const ret = mode === 'object'
-    ? '  return { ' + cols.map((c, i) => `${JSON.stringify(c.name)}: v${i}`).join(', ') + ' };'
+    ? '  return { ' + cols.map((c, i) => objKey(c.name, i)).join(', ') + ' };'
     : '  return [' + cols.map((_, i) => `v${i}`).join(', ') + '];'
-  return { source: `function row(b) {${header}\n${lines.join('\n')}\n${ret}\n}`, helperOids }
+  return { source: `function row(b) {\n  "use strict";${header}\n${lines.join('\n')}\n${ret}\n}`, helperOids }
 }
 
 /** Build the source of a whole-result-set mapper: takes an array of DataRow bodies,
@@ -124,10 +141,11 @@ export function resultSetSource(cols: CodegenCol[], mode: 'array' | 'object', cu
   const decode: string[] = []
   for (let i = 0; i < cols.length; i++) columnLines(decode, cols[i]!, i, '    ', helperOids, plan, custom)
   const assign = mode === 'object'
-    ? '    res[i] = { ' + cols.map((c, i) => `${JSON.stringify(c.name)}: v${i}`).join(', ') + ' };'
+    ? '    res[i] = { ' + cols.map((c, i) => objKey(c.name, i)).join(', ') + ' };'
     : '    res[i] = [' + cols.map((_, i) => `v${i}`).join(', ') + '];'
   const source = [
     'function rows(arr) {',
+    '  "use strict";',
     '  const n = arr.length, res = new Array(n);',
     header,
     '  for (let i = 0; i < n; i++) {',
