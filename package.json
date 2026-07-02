@@ -1,16 +1,63 @@
 {
-  "name": "nodepg-postgresjs",
-  "module": "src/index.ts",
+  "name": "minipg",
+  "version": "0.1.0",
+  "description": "A minimal, dependency-free PostgreSQL driver for Node, Bun, Deno, and Cloudflare Workers.",
   "type": "module",
-  "private": true,
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/drizzle-team/minipg.git"
+  },
+  "homepage": "https://github.com/drizzle-team/minipg#readme",
+  "bugs": {
+    "url": "https://github.com/drizzle-team/minipg/issues"
+  },
+  "keywords": [
+    "postgres",
+    "postgresql",
+    "pg",
+    "database",
+    "driver",
+    "cloudflare-workers",
+    "hyperdrive",
+    "deno",
+    "bun",
+    "edge"
+  ],
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
   "exports": {
-    ".": "./src/index.ts",
-    "./node": "./src/node.ts",
-    "./deno": "./src/deno.ts",
-    "./cf": "./src/cf.ts",
-    "./telemetry": "./src/telemetry.ts"
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./node": {
+      "types": "./dist/node.d.ts",
+      "import": "./dist/node.js"
+    },
+    "./deno": {
+      "types": "./dist/deno.d.ts",
+      "import": "./dist/deno.js"
+    },
+    "./cf": {
+      "types": "./dist/cf.d.ts",
+      "import": "./dist/cf.js"
+    },
+    "./telemetry": {
+      "types": "./dist/telemetry.d.ts",
+      "import": "./dist/telemetry.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "engines": {
+    "node": ">=18"
   },
   "scripts": {
+    "build": "tsdown",
+    "prepublishOnly": "bun run typecheck && bun run build",
     "typecheck": "tsc --noEmit",
     "test": "bun test test/unit test/integration",
     "test:unit": "bun test test/unit",
@@ -29,12 +76,12 @@
     "demo:codegen": "bun codegen-demo.ts",
     "bench:decode-vs": "bun bench/decode-vs.bench.ts",
     "bench:parity": "bun bench/decode-parity.ts",
-    "bench:mapper": "bun bench/mapper.bench.ts",
     "bench:float": "bun bench/float-decode.bench.ts",
     "bench:temporal": "bun bench/temporal-decode.bench.ts",
     "bench:binary": "bun bench/binary-vs-text.bench.ts",
     "bench:pertype": "bun bench/per-type-decode.bench.ts",
-    "bench:chunks": "bun bench/chunks.bench.ts"
+    "bench:chunks": "bun bench/chunks.bench.ts",
+    "bench:mapper-dispatch": "bun bench/mapper-dispatch.bench.ts"
   },
   "devDependencies": {
     "@cloudflare/vitest-pool-workers": "^0.5.2",
@@ -47,6 +94,7 @@
     "pg": "^8.22.0",
     "postgres": "^3.4.9",
     "prettier": "^3.9.1",
+    "tsdown": "^0.22.3",
     "vitest": "~2.1.9",
     "wrangler": "^3.90.0"
   },

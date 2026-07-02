@@ -8,6 +8,7 @@ import { PgError, parseErrorFields } from './errors.ts'
 import type { ConnectConfig, Decoder, Field, QueryOptions, QueryResult, ResultMode, StreamOptions } from './types.ts'
 import type { CodegenCol } from './decode2.ts'
 import { buildMapperFactory, type RowMapper, type RowMapperFactory } from './mapper.ts'
+import { resolveUrl } from './url.ts'
 import type { Plugin, QueryInfo, QueryMetrics } from './plugin.ts'
 
 type ConnState = 'idle' | 'connecting' | 'ready' | 'reconnecting' | 'closed'
@@ -155,6 +156,7 @@ export class Connection {
   private instrumented = false // plugins present -> capture per-query timings + fire hooks
 
   constructor(config: ConnectConfig = {}) {
+    config = resolveUrl(config) // fold a `url` connection string into defaults (explicit fields still win)
     const user = config.user || process.env.PGUSER || defaultUser()
     const host = config.host || process.env.PGHOST || 'localhost'
     const port = config.port || Number(process.env.PGPORT) || 5432

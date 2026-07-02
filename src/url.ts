@@ -1,0 +1,69 @@
+// Connection-string (postgres:// | postgresql://) parsing. Uses the WHATWG URL (universal — no node dep)
+// so it works on every runtime. Turns a libpq-style URI into a partial ConnectConfig; `resolveUrl` then
+// layers the parsed values UNDER any explicit config fields (explicit always wins) and strips `url`.
+import type { ConnectConfig } from './types.ts'
+
+// Mask the password in a connection string so it can't leak into error messages / logs.
+const redactUrl = (url: string): string => url.replace(/(:\/\/[^:/?#@\s]*:)[^@/?#\s]*(@)/, '$1***$2')
+
+// decodeURIComponent, but a malformed percent-escape (e.g. a literal "%" in a password) becomes a
+// helpful error instead of the opaque "URI malformed" — this is the "needs re-encoding" case.
+function decodePart(s: string, what: string, url: string): string {
+  try {
+    return decodeURIComponent(s)
+  } catch {
+    throw new Error(`minipg: the ${what} in connection string ${redactUrl(url)} has an invalid percent-escape — write a literal "%" as "%25" and percent-encode other reserved characters`)
+  }
+}
+
+/** Parse `postgres://user:pass@host:port/db?sslmode=…` into a partial config. Supports the userinfo,
+ *  host/port, database, and the `sslmode`/`application_name`/`connect_timeout` params, plus a unix-socket
+ *  `?host=/path`. Percent-encoded userinfo/database are decoded; IPv6 brackets are stripped. */
+export function parseConnectionString(url: string): Partial<ConnectConfig> {
+  let u: URL
+  try {
+    u = new URL(url)
+  } catch {
+    if (!/^postgres(?:ql)?:\/\//i.test(url.trim())) {
+      throw new Error(`minipg: invalid connection string — it must start with "postgres://" or "postgresql://" (received: ${redactUrl(url)})`)
+    }
+    // scheme is fine but the rest is malformed — almost always a bad port or an un-encoded credential char
+    throw new Error(`minipg: could not parse connection string ${redactUrl(url)} — check the host/port, and percent-encode any reserved characters in the username/password ("@"→"%40", ":"→"%3A", "/"→"%2F")`)
+  }
+  if (u.protocol !== 'postgres:' && u.protocol !== 'postgresql:') {
+    throw new Error(`minipg: unsupported connection string scheme "${u.protocol}" — it must start with "postgres://" or "postgresql://" (received: ${redactUrl(url)})`)
+  }
+  const out: Partial<ConnectConfig> = {}
+  const q = u.searchParams
+  if (u.username) out.user = decodePart(u.username, 'username', url)
+  if (u.password) out.password = decodePart(u.password, 'password', url)
+  const unix = q.get('host') // ?host=/var/run/postgresql -> unix socket (takes precedence over any TCP host)
+  if (unix && unix.startsWith('/')) out.path = unix
+  else if (u.hostname) out.host = u.hostname.replace(/^\[|\]$/g, '') // strip IPv6 [..] for net.connect
+  if (u.port) out.port = Number(u.port)
+  const db = u.pathname.replace(/^\//, '')
+  if (db) out.database = decodePart(db, 'database', url)
+  const appName = q.get('application_name'); if (appName) out.applicationName = appName
+  const ct = q.get('connect_timeout'); if (ct) out.connectTimeout = Number(ct) * 1000 // libpq: seconds -> ms
+  const sslmode = q.get('sslmode') ?? q.get('ssl')
+  if (sslmode) {
+    if (sslmode === 'disable') out.ssl = false
+    else if (sslmode === 'verify-ca') out.ssl = 'verify-ca'
+    else if (sslmode === 'verify-full') out.ssl = 'verify-full'
+    else out.ssl = 'require' // allow | prefer | require | true -> encrypt (no hostname verification)
+  }
+  return out
+}
+
+/** If `config.url` is set, use the parsed connection string as DEFAULTS beneath the explicit fields, then
+ *  drop `url`. Idempotent (no `url` -> returned unchanged). Explicit config always overrides url-derived. */
+export function resolveUrl<T extends ConnectConfig>(config: T): T {
+  if (!config.url) return config
+  const out = { ...parseConnectionString(config.url) } as Record<string, unknown>
+  for (const k of Object.keys(config)) {
+    if (k === 'url') continue
+    const v = (config as Record<string, unknown>)[k]
+    if (v !== undefined) out[k] = v // explicit (defined) fields win over url-derived
+  }
+  return out as unknown as T
+}

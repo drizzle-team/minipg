@@ -5,6 +5,7 @@
 // recovering database. Dead idle connections are evicted on checkout; open transactions
 // are rolled back before reuse. In-flight queries are never silently replayed.
 import { Connection } from './connection.ts'
+import { resolveUrl } from './url.ts'
 import type { PoolConfig, QueryOptions, QueryResult } from './types.ts'
 
 interface Waiter { resolve: (c: Connection) => void; reject: (e: Error) => void }
@@ -42,16 +43,17 @@ export class Pool {
   private broken: Error | null = null // fatal, unrecoverable (e.g. auth)
   private recovered: (() => void)[] = [] // wake-ups for acquirers waiting on recovery
 
-  constructor(config: PoolConfig = {}) {
-    this.cfg = config
-    this.max = config.max ?? 10
-    const rc = config.reconnect
+  constructor(config: string | PoolConfig = {}) {
+    const cfg = resolveUrl(typeof config === 'string' ? { url: config } : config) // string / url -> config
+    this.cfg = cfg
+    this.max = cfg.max ?? 10
+    const rc = cfg.reconnect
     this.rcEnabled = rc !== false
     const o = rc && typeof rc === 'object' ? rc : {}
     this.base = o.baseMs ?? 50
     this.maxBackoff = o.maxMs ?? 2000
     this.acquireTimeout = o.acquireTimeoutMs ?? 30000
-    this.idleMs = config.idleTimeoutMillis ?? 0
+    this.idleMs = cfg.idleTimeoutMillis ?? 0
     this.options = { idleTimeoutMillis: this.idleMs } // detection surface for attachDatabasePool()
   }
 

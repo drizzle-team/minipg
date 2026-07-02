@@ -28,6 +28,10 @@ export interface QueryResult<Row = unknown[]> {
 }
 
 export interface ConnectConfig {
+  /** A `postgres://user:pass@host:port/db?sslmode=…` connection string. Its values are used as defaults;
+   *  any explicit field below overrides the matching part of the URL. Also accepted as `connect(url)` /
+   *  `createPool(url)`. Supports the sslmode/application_name/connect_timeout params + unix `?host=/path`. */
+  url?: string
   host?: string
   port?: number
   user?: string

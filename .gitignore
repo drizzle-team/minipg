@@ -8,3 +8,7 @@ issue-cache/*.jsonl
 
 # local test postgres
 test/.pgdata/
+
+# build output
+dist/
+*.tgz

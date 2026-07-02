@@ -5,19 +5,20 @@ import { Connection } from './connection.ts'
 import { Pool } from './pool.ts'
 import type { ConnectConfig, PoolConfig } from './types.ts'
 
-/** Open and authenticate a single connection. */
-export async function connect(config: ConnectConfig = {}): Promise<Connection> {
-  const conn = new Connection(config)
+/** Open and authenticate a single connection. Accepts a config or a `postgres://…` connection string. */
+export async function connect(config: string | ConnectConfig = {}): Promise<Connection> {
+  const conn = new Connection(typeof config === 'string' ? { url: config } : config)
   await conn.connect()
   return conn
 }
 
-/** Create a lazy connection pool. */
-export function createPool(config: PoolConfig = {}): Pool {
+/** Create a lazy connection pool. Accepts a config or a `postgres://…` connection string. */
+export function createPool(config: string | PoolConfig = {}): Pool {
   return new Pool(config)
 }
 
 export { Connection, Pool }
+export { parseConnectionString } from './url.ts'
 export { PgError } from './errors.ts'
 export { defaultDecoders } from './codec.ts'
 export { Shape } from './shape.ts'
