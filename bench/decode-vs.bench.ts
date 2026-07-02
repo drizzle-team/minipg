@@ -16,7 +16,7 @@ import { Pool as PgPool } from 'pg'
 import postgres from 'postgres'
 // import { SQL } from 'bun'
 import { createPool } from '../src/index.ts'                        // interpreted decode path
-import { createPool as createPoolJit } from '../src/inline/index.ts' // JIT/codegen decode path
+import { createPool as createPoolJit } from '../src/index.ts' // JIT/codegen decode path
 
 const SOCK_DIR = '/tmp/minipg_sock'                 // PG unix_socket_directories (see test/setup-pg.sh)
 const SOCK_PATH = SOCK_DIR + '/.s.PGSQL.54329'      // the socket FILE minipg connects to via `path`
@@ -29,8 +29,8 @@ const SQL100 = mkSql(100), SQL1000 = mkSql(1000)
 
 // pools (size POOL), prepared statements on. minipg connects to the socket FILE (path); pg/postgres.js
 // use the libpq convention host=<socket dir> + port -> <dir>/.s.PGSQL.<port>.
-const mc = createPool({ path: SOCK_PATH, user: USER, database: DB, password: '', max: POOL })
-const mj = createPoolJit({ path: SOCK_PATH, user: USER, database: DB, password: '', max: POOL }) as unknown as typeof mc
+const mc = createPool({ path: SOCK_PATH, user: USER, database: DB, password: '', max: POOL, decode: "interpreted" })
+const mj = createPoolJit({ path: SOCK_PATH, user: USER, database: DB, password: '', max: POOL, decode: "jit" }) as unknown as typeof mc
 const pgp = new PgPool({ host: SOCK_DIR, port: PORT, user: USER, database: DB, max: POOL })
 const sql = postgres({ host: SOCK_DIR, port: PORT, user: USER, database: DB, max: POOL, prepare: true })
 // const bunsql = new SQL({ adapter: 'postgres', path: SOCK_PATH, username: USER, database: DB, max: POOL, prepare: true }) // Bun.sql: `path` = unix socket FILE
@@ -76,6 +76,6 @@ group(`1000 rows · 3int+text+bool · unix socket · pool(${POOL}) · prepared �
 })
 
 await run()
-await mc.end(); await mj.end(); await pgp.end(); await sql.end({ timeout: 5 }); 
+await mc.end(); await mj.end(); await pgp.end(); await sql.end({ timeout: 5 });
 // await bunsql.end()
 process.exit(0)

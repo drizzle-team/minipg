@@ -1,4 +1,4 @@
-// MICRO-OPT exploration for the codegen row builder (src/inline/codegen.ts).
+// MICRO-OPT exploration for the codegen row builder (src/codegen.ts).
 // Goal: measure which generated-source micro-opts actually move the needle, on BOTH engines.
 //   node bench/codegen-microopt.bench.ts
 //   bun  bench/codegen-microopt.bench.ts

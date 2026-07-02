@@ -2,9 +2,9 @@
 // live server, and that the shipped otel()/sentry() plugins produce the right spans (checked with mock
 // SDKs — no real @opentelemetry/@sentry deps needed). Requires the local cluster (`bun run test:setup`).
 import { test, expect, describe, afterEach } from 'bun:test'
-import { connect } from '../../src/inline/index.ts'
-import { otel, sentry, collector } from '../../src/inline/telemetry.ts'
-import type { Plugin } from '../../src/inline/plugin.ts'
+import { connect } from '../../src/index.ts'
+import { otel, sentry, collector } from '../../src/telemetry.ts'
+import type { Plugin } from '../../src/plugin.ts'
 
 const CFG = { host: '127.0.0.1', port: 54329, user: 'postgres', password: 'postgres', database: 'testdb' }
 let open: Array<Awaited<ReturnType<typeof connect>>> = []

@@ -1,7 +1,7 @@
 // Idle-connection eviction + the attachDatabasePool() detection surface (options.idleTimeoutMillis +
 // 'release' event). Requires the local cluster (`bun run test:setup`).
 import { test, expect, describe, afterEach } from 'bun:test'
-import { createPool } from '../../src/inline/index.ts'
+import { createPool } from '../../src/index.ts'
 
 const CFG = { host: '127.0.0.1', port: 54329, user: 'postgres', password: 'postgres', database: 'testdb' }
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms))

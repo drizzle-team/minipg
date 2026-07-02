@@ -7,8 +7,8 @@
 // do_not_optimize per call, with inner_gc so mitata reports GC time + heap/iter.
 //   bun bench/json-decode.bench.ts   (or: bun run bench:json)
 import { run, bench, group, summary, do_not_optimize } from 'mitata'
-import { Shape, Json, JsonArray } from '../src/inline/index.ts'
-import { parseJsonBuffer } from '../src/inline/jsonparse.ts'
+import { Shape, Json, JsonArray } from '../src/index.ts'
+import { parseJsonBuffer } from '../src/jsonparse.ts'
 
 const a = '{"big": 12312312312312312}'
 

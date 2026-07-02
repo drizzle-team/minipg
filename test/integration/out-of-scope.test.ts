@@ -292,9 +292,10 @@ describe('pure net/tls/crypto surface (static-import audit of src/)', () => {
   const srcFiles = readdirSync(SRC_DIR).filter((f) => f.endsWith('.ts') && !f.endsWith('.d.ts') && !RUNTIME_ENTRIES.has(f))
 
   test('src/ core imports only node:net/tls/crypto/os — no pg-native/libpq/cloudflare/native addon', () => {
-    const forbidden = /(pg-native|libpq|cloudflare:sockets|require\(['"]net['"]\)|node-gyp|\.node['"])/
+    // match actual imports/native artifacts, not prose (comments may mention cloudflare:sockets etc.)
+    const forbidden = /(from ['"]pg-native|from ['"]libpq|from ['"]cloudflare:sockets|require\(['"]net['"]\)|node-gyp|\.node['"])/
     const nodeImport = /from\s+['"]node:([a-z_]+)['"]/g
-    const allowed = new Set(['net', 'tls', 'crypto', 'os', 'path', 'url', 'fs', 'assert'])
+    const allowed = new Set(['net', 'tls', 'crypto', 'os', 'stream', 'module', 'path', 'url', 'fs', 'assert'])
     const builtinsSeen = new Set<string>()
     for (const f of srcFiles) {
       const text = readFileSync(join(SRC_DIR, f), 'utf8')

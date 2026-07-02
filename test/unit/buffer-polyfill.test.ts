@@ -1,7 +1,7 @@
 // Verifies MiniBuffer (the edge/browser Buffer polyfill) is byte-for-byte faithful to native Buffer
 // across exactly the surface the driver uses. Run under Node/Bun where BOTH exist, comparing outputs.
 import { test, expect, describe } from 'bun:test'
-import { MiniBuffer } from '../../src/inline/buffer-polyfill.ts'
+import { MiniBuffer } from '../../src/buffer-polyfill.ts'
 
 const bytesEqual = (a: Uint8Array, b: Uint8Array) => { expect([...a]).toEqual([...b]) }
 

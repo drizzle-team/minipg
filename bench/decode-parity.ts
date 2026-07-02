@@ -9,7 +9,7 @@ import { Pool as PgPool } from 'pg'
 import postgres from 'postgres'
 import { SQL } from 'bun'
 import { connect } from '../src/index.ts'                 // interpreted decode path
-import { connect as connectJit } from '../src/inline/index.ts' // JIT/codegen decode path
+import { connect as connectJit } from '../src/index.ts' // JIT/codegen decode path
 
 const SOCK_DIR = '/tmp/minipg_sock', SOCK_PATH = SOCK_DIR + '/.s.PGSQL.54329'
 const PORT = 54329, USER = 'postgres', DB = 'testdb'

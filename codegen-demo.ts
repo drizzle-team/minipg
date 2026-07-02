@@ -3,7 +3,7 @@
 //   bun codegen-demo.ts        (or: bun run demo:codegen)
 import { highlight } from 'cli-highlight'
 import prettier from 'prettier'
-import { JsonArray, Shape, connect } from './src/inline/index.ts'
+import { JsonArray, Shape, connect } from './src/index.ts'
 
 const pretty = (src: string) => prettier.format(src, { parser: 'babel', semi: false, singleQuote: true, printWidth: 100 })
 const colorize = (src: string) => highlight(src, { language: 'javascript', ignoreIllegals: true })

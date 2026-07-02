@@ -1,25 +1,35 @@
 // A single PostgreSQL connection: transport (net/tls), auth, and the extended
 // query protocol. One query in flight at a time (queries queue). No LISTEN/NOTIFY.
-import net from 'node:net'
-import tls from 'node:tls'
-import os from 'node:os'
 import type { Duplex } from 'node:stream'
-import { W, Writer, Parser, parseRowDescription, writeParse, writeDescribe, writeBind, writeExecute, writeSync, writeClose } from './protocol.ts'
+import { W, Writer, writeParse, writeDescribe, writeBind, writeExecute, writeClose, writeSync, Parser, parseRowDescription, parseDataRow } from './protocol.ts'
 import { md5Password, scram, type Scram } from './auth.ts'
-import { buildDecoders, decoderFor, type CellDecoder } from './codec.ts'
-import { decodeRow, decodeRows } from './decode.ts'
+import { buildDecoders, decoderFor, encodeParam } from './codec.ts'
 import { PgError, parseErrorFields } from './errors.ts'
-import type { ConnectConfig, Field, QueryOptions, QueryResult, ResultMode, StreamOptions } from './types.ts'
+import type { ConnectConfig, Decoder, Field, QueryOptions, QueryResult, ResultMode, StreamOptions } from './types.ts'
+import type { CodegenCol } from './decode2.ts'
+import { buildMapperFactory, type RowMapper, type RowMapperFactory } from './mapper.ts'
+import type { Plugin, QueryInfo, QueryMetrics } from './plugin.ts'
 
 type ConnState = 'idle' | 'connecting' | 'ready' | 'reconnecting' | 'closed'
 
-interface NormalizedConfig {
+// The node:net/tls transport is registered here by the Node entry (minipg/node) so the core never
+// statically imports node:net/tls (which don't exist on workerd). Edge/Deno entries pass config.socket.
+type TransportFactory = (cfg: NormalizedConfig, signal: AbortSignal) => Promise<Duplex>
+type CancelFn = (cfg: NormalizedConfig, key: { pid: number; secret: number }) => void
+let defaultTransport: TransportFactory | null = null
+let defaultCancel: CancelFn | null = null
+export function registerDefaultTransport(transport: TransportFactory, cancel: CancelFn): void {
+  defaultTransport = transport; defaultCancel = cancel
+}
+
+export interface NormalizedConfig {
   host: string; port: number; user: string; password: string; database: string
   ssl: Exclude<NonNullable<ConnectConfig['ssl']>, 'disable'> // 'disable' normalized to false
-  applicationName: string; connectTimeout: number; decoders: Map<number, CellDecoder>
+  applicationName: string; connectTimeout: number; decoders: Map<number, Decoder>
   reconnect: { enabled: boolean; base: number; max: number; maxRetries: number | null }
   socket?: () => Duplex | Promise<Duplex>
-  path?: string // unix-domain socket path (e.g. /tmp/.s.PGSQL.5432); when set, host/port/SSL are ignored
+  path?: string
+  plugins: Plugin[]
 }
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms))
@@ -30,42 +40,29 @@ function isFatalAuth(err: unknown): boolean {
   return !!(err as { fatal?: boolean } | null)?.fatal
 }
 
-type TlsSsl = true | 'require' | 'verify-ca' | 'verify-full' | tls.ConnectionOptions
-/** Resolve an sslmode string (or tls.ConnectionOptions) into options for tls.connect
- *  (the caller adds `socket`). 'require'/true encrypt without verifying; 'verify-ca' verifies
- *  the chain but not the hostname; 'verify-full' verifies both; an object verifies by default
- *  and lets you override (ca/cert/key/rejectUnauthorized/servername) — e.g. a custom CA or mTLS. */
-export function tlsOptions(ssl: TlsSsl, host: string): tls.ConnectionOptions {
-  // SNI must be a hostname, not an IP (RFC 6066) -> servername only for non-IP hosts.
-  const isIP = !!net.isIP(host)
-  const servername = isIP ? undefined : host
-  let o: tls.ConnectionOptions
-  if (ssl === true || ssl === 'require') o = { servername, rejectUnauthorized: false }     // encrypt, no verification
-  else if (ssl === 'verify-ca') o = { servername, rejectUnauthorized: true, checkServerIdentity: () => undefined } // chain only
-  else if (ssl === 'verify-full') o = { servername, rejectUnauthorized: true }             // chain + identity
-  else o = { servername, rejectUnauthorized: true, ...ssl }                                // object: verify by default, fully overridable
-  // Connecting by IP with verification on and no servername/identity override: the default
-  // (servername-based) check can't run and tls can't derive the host (we upgrade an existing
-  // socket), so verify the IP against the cert's IP SANs explicitly.
-  if (o.rejectUnauthorized !== false && isIP && !o.servername && !o.checkServerIdentity)
-    o.checkServerIdentity = (_s: string, cert: tls.PeerCertificate) => tls.checkServerIdentity(host, cert)
-  return o
-}
+// per-query timing accumulator, attached only when instrumented (plugins present) or metrics requested
+interface TaskPerf { t0: number; tStart?: number; tWrite?: number; tFirst?: number; decodeMs: number; sent: number; recv: number; states?: unknown[]; metrics?: QueryMetrics }
 
 interface Task {
   sql: string
   params: unknown[]
   name?: string | undefined
   mode: ResultMode
-  bodies: Buffer[] // non-stream: DataRow bodies buffered, then decoded into a pre-sized array at finish
+  rows: unknown[]
+  perf?: TaskPerf
+  info?: QueryInfo
+  wantMetrics?: boolean
+  _instrDone?: boolean // guard so onQueryEnd/Error fires exactly once across the settle paths
   fields?: Field[]
-  decoders?: CellDecoder[] // per-column decoders, resolved once at RowDescription (no per-cell Map lookup)
+  mapper?: RowMapper
   command?: string | null
   rowCount?: number | null
   error?: Error
   cancelled?: boolean
   stream?: boolean
   _cacheName?: string
+  resultFormat?: number | number[] // result-format code(s) for Bind (ORM binary flow)
+  _typed?: boolean // builder came from a caller-supplied column plan — don't override from RowDescription
   timeout?: number
   signal?: AbortSignal
   timer?: ReturnType<typeof setTimeout>
@@ -79,17 +76,15 @@ interface Task {
   reject?: (e: Error) => void
 }
 
-// Join builder chunks into a $1/$2/… parameterized SQL string. One .join-equivalent pass
-// (V8 cons-strings make concat cheap); benchmarked faster than writing chunks to the wire
-// buffer piece-by-piece, since each Buffer.write is a native call with fixed overhead.
+function defaultUser(): string {
+  // env-derived so the core needs no node:os (absent on workerd); Node/Bun always set one of these.
+  return process.env.USER || process.env.USERNAME || process.env.LOGNAME || 'postgres'
+}
+// Join builder chunks into a $1/$2/… parameterized SQL string (V8 cons-strings make concat cheap).
 function buildChunkSql(chunks: readonly string[]): string {
   let s = chunks[0] ?? ''
   for (let i = 1; i < chunks.length; i++) s += '$' + i + chunks[i]
   return s
-}
-
-function defaultUser(): string {
-  try { return os.userInfo().username } catch { return process.env.USER || process.env.USERNAME || 'postgres' }
 }
 function readCstrings(buf: Buffer): string[] {
   const out: string[] = []; let i = 0
@@ -97,6 +92,23 @@ function readCstrings(buf: Buffer): string[] {
   return out
 }
 const firstCstr = (buf: Buffer) => { const z = buf.indexOf(0); return buf.toString('utf8', 0, z === -1 ? buf.length : z) }
+
+function makeRow(cells: (Buffer | null)[], body: Buffer, mode: ResultMode, fields: Field[], decoders: Map<number, Decoder>): unknown {
+  switch (mode) {
+    case 'raw': return Buffer.from(body)
+    case 'buffer': return cells.map((c) => (c == null ? null : Buffer.from(c)))
+    case 'object': {
+      const o: Record<string, unknown> = Object.create(null) // null-proto: a column named __proto__ can't pollute
+      for (let i = 0; i < fields.length; i++) { const f = fields[i]!; const c = cells[i]; o[f.name] = c == null ? null : decoderFor(f.dataTypeOid, decoders)(c) }
+      return o
+    }
+    default: { // 'array'
+      const r = new Array(fields.length)
+      for (let i = 0; i < fields.length; i++) { const f = fields[i]!; const c = cells[i]; r[i] = c == null ? null : decoderFor(f.dataTypeOid, decoders)(c) }
+      return r
+    }
+  }
+}
 
 export class Connection {
   readonly cfg: NormalizedConfig
@@ -108,26 +120,29 @@ export class Connection {
   /** True if the connection is inside (or in a failed) transaction. */
   get inTransaction(): boolean { return this.txStatus === 'T' || this.txStatus === 'E' }
 
-  private socket: net.Socket | tls.TLSSocket | Duplex | null = null
+  private socket: Duplex | null = null
   private parser = new Parser()
-  private writer = new Writer() // reused per query: one growable buffer, no per-message allocs
+  private writer = new Writer() // reused per task: one growable buffer, no per-message allocs
   private queue: Task[] = []
   private current: Task | null = null
-  private prepared = new Map<string, { sql: string; fields: Field[]; decoders: CellDecoder[] }>()
-  // query-builder fast path: a chunks array (from a tagged template / builder) is a stable
-  // identity, so we cache its joined SQL + an auto-assigned prepared-statement name keyed by
-  // the array. Reuse skips the join AND the Parse (Bind+Execute only). WeakMap => auto-GC.
+  private prepared = new Map<string, { sql: string; fields: Field[] }>()
+  private mapperCache = new Map<string, RowMapper>() // per-shape row mappers (standard + typed queries)
+  private mapperFactory: RowMapperFactory            // interpreted or jit, chosen once from config.decode
+  // query-builder fast path: a chunks array (tagged template / builder) has stable identity, so cache
+  // its joined SQL + an auto-assigned prepared-statement name keyed by the array. WeakMap => auto-GC.
   private chunkCache = new WeakMap<readonly string[], { name: string; sql: string }>()
   private chunkSeq = 0
   private scramState?: Scram
 
   private connecting = false
+  private connectAbort?: AbortController // aborted on failAttempt so a pending transport tears down its socket
   private connTimer?: ReturnType<typeof setTimeout>
   private connectPromise?: Promise<this>
   private attemptResolve?: () => void
   private attemptReject?: (e: Error) => void
   private ended = false
   private everConnected = false
+  private instrumented = false // plugins present -> capture per-query timings + fire hooks
 
   constructor(config: ConnectConfig = {}) {
     const user = config.user || process.env.PGUSER || defaultUser()
@@ -140,16 +155,55 @@ export class Connection {
       ssl: config.ssl && config.ssl !== 'disable' ? config.ssl : false, // 'disable'/falsy -> no TLS
       applicationName: config.applicationName || 'minipg',
       connectTimeout: config.connectTimeout ?? 30000,
-      decoders: buildDecoders(config.types),
+      decoders: buildDecoders(config.types, config.jsonBigints),
       reconnect: ((rc) => {
         const o = rc && typeof rc === 'object' ? rc : {}
         return { enabled: rc === true || (rc != null && typeof rc === 'object'), base: o.baseMs ?? 100, max: o.maxMs ?? 5000, maxRetries: o.maxRetries ?? null }
       })(config.reconnect),
       socket: config.socket,
       path: config.path,
+      plugins: config.plugins ?? [],
     }
+    this.instrumented = this.cfg.plugins.length > 0
+    this.mapperFactory = buildMapperFactory(config.decode) // 'auto' (default): jit where eval available, else interpreted
     // keep the password out of console.log / JSON / inspection of the connection
     Object.defineProperty(this.cfg, 'password', { value: this.cfg.password, enumerable: false, writable: true, configurable: true })
+  }
+
+  // ---- telemetry helpers (no-ops unless instrumented / metrics requested) ----
+  private beginPerf(t: Task, params: unknown[], wantMetrics: boolean): void {
+    if (!this.instrumented && !wantMetrics) return
+    t.wantMetrics = wantMetrics
+    t.perf = { t0: performance.now(), decodeMs: 0, sent: 0, recv: 0 }
+    t.info = { sql: t.sql, statementName: t.name, paramCount: Array.isArray(params) ? params.length : 0, database: this.cfg.database, host: this.cfg.host, prepared: false }
+  }
+  private fireStart(t: Task): void {
+    const p = t.perf; if (!p) return
+    if (t.info) { t.info.backendPid = this.backendKey?.pid; }
+    if (this.instrumented) p.states = this.cfg.plugins.map((pl) => pl.onQueryStart?.(t.info!))
+  }
+  // Compute metrics + fire onQueryEnd/onQueryError exactly once. Returns the metrics (for result attach).
+  private fireEnd(t: Task, err?: Error): QueryMetrics | undefined {
+    const p = t.perf; if (!p || t._instrDone) return p?.metrics
+    t._instrDone = true
+    const end = performance.now()
+    const start = p.tStart ?? p.t0, wrote = p.tWrite ?? start
+    const m: QueryMetrics = {
+      queueWaitMs: start - p.t0, writeMs: wrote - start,
+      ttfbMs: p.tFirst !== undefined ? p.tFirst - wrote : 0,
+      downloadMs: p.tFirst !== undefined ? end - p.tFirst : 0,
+      decodeMs: p.decodeMs, totalMs: end - p.t0,
+      bytesSent: p.sent, bytesReceived: p.recv,
+      rowCount: t.rowCount ?? (t.rows ? t.rows.length : null), columnCount: t.fields?.length ?? 0,
+      command: t.command ?? null, ...(err ? { error: err } : {}),
+    }
+    p.metrics = m
+    const info = t.info!
+    for (let i = 0; i < this.cfg.plugins.length; i++) {
+      const pl = this.cfg.plugins[i]!, st = p.states?.[i]
+      try { if (err) pl.onQueryError?.(st, info, err, m); else pl.onQueryEnd?.(st, info, m) } catch { /* plugin errors never break the query */ }
+    }
+    return m
   }
 
   connect(): Promise<this> {
@@ -169,50 +223,26 @@ export class Connection {
       this.connecting = true; this.state = this.everConnected ? 'reconnecting' : 'connecting'
       this.parser = new Parser(); this.scramState = undefined // fresh per attempt
       this.connTimer = setTimeout(() => this.failAttempt(new Error(`connect timeout after ${this.cfg.connectTimeout}ms`)), this.cfg.connectTimeout)
-      if (this.cfg.socket) { // custom transport: a duplex (no net.connect / SSL). May be returned
-        // synchronously OR as a Promise (e.g. an async SSH forwardOut), and is re-invoked per
-        // (re)connect, so async transports survive reconnection.
-        Promise.resolve(this.cfg.socket()).then(
-          (sock) => {
-            if (!this.connecting) { try { sock.destroy() } catch { /* */ } return } // attempt already timed out / ended
-            this.socket = sock
-            this.attachSocket(sock)
-            this.afterTransport()
-          },
-          (err: Error) => this.failAttempt(err),
-        )
-        return
-      }
-      // unix-domain socket (cfg.path) bypasses host/port and SSL; otherwise TCP
-      const sock = this.cfg.path ? net.connect({ path: this.cfg.path }) : net.connect({ host: this.cfg.host, port: this.cfg.port })
-      this.socket = sock
-      this.attachSocket(sock)
-      sock.once('connect', () => (this.cfg.ssl && !this.cfg.path ? this.startSSL() : this.afterTransport()))
+      // One transport path for all runtimes: config.socket (Deno/CF/WS/unix/custom) or the node:net/tls
+      // transport the Node entry registered. The factory returns an already-connected (TLS-negotiated) duplex.
+      const ac = new AbortController(); this.connectAbort = ac // failAttempt() aborts -> transport destroys its pending socket
+      const factory = this.cfg.socket ?? (defaultTransport ? () => defaultTransport!(this.cfg, ac.signal) : null)
+      if (!factory) return this.failAttempt(Object.assign(new Error('no transport: import from minipg/node (net/tls) or pass config.socket'), { fatal: true }))
+      Promise.resolve(factory()).then((sock) => {
+        if (!this.connecting) { try { sock.destroy() } catch { /* superseded/aborted while connecting */ } return }
+        this.socket = sock
+        this.attachSocket(sock)
+        this.afterTransport()
+      }, (e) => this.failAttempt(e as Error))
     })
   }
 
   // 'close' fires exactly once per socket; 'error' is captured (prevents an uncaught
   // throw) and surfaced via close. Guard on identity so a superseded socket is ignored.
-  private attachSocket(sock: net.Socket | tls.TLSSocket | Duplex): void {
+  private attachSocket(sock: Duplex): void {
     let lastErr: Error | undefined
     sock.on('error', (e: Error) => { lastErr = e })
     sock.on('close', () => { if (sock === this.socket) this.onSocketDown(lastErr ?? new Error('connection terminated unexpectedly')) })
-  }
-
-  private startSSL(): void {
-    const sock = this.socket as net.Socket
-    sock.write(W.sslRequest())
-    sock.once('data', (buf: Buffer) => {
-      const res = String.fromCharCode(buf[0]!)
-      if (res === 'S') {
-        const tlsSock = tls.connect({ socket: sock, ...tlsOptions(this.cfg.ssl as TlsSsl, this.cfg.host) }, () => this.afterTransport())
-        this.socket = tlsSock
-        this.attachSocket(tlsSock)
-      } else if (res === 'N') {
-        // TLS was requested but the server declined — never silently downgrade to plaintext.
-        return this.failAttempt(Object.assign(new Error('server does not support TLS, but ssl was requested'), { fatal: true }))
-      } else return this.failAttempt(Object.assign(new Error('unexpected SSL response byte: ' + res), { fatal: true }))
-    })
   }
 
   private afterTransport(): void {
@@ -221,9 +251,12 @@ export class Connection {
     sock.write(W.startup({ user: this.cfg.user, database: this.cfg.database, application_name: this.cfg.applicationName, client_encoding: 'UTF8' }))
   }
 
-  private onData(chunk: Buffer): void {
+  private onData(chunk: Buffer | Uint8Array): void {
+    // Web-stream transports (Deno/Cloudflare) deliver Uint8Array; wrap as a Buffer view (no copy).
+    const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk.buffer, chunk.byteOffset, chunk.byteLength)
+    const p = this.current?.perf; if (p) { if (p.tFirst === undefined) p.tFirst = performance.now(); p.recv += buf.length }
     let messages
-    try { messages = this.parser.push(chunk) } catch (e) { return this.onSocketDown(e as Error) }
+    try { messages = this.parser.push(buf) } catch (e) { return this.onSocketDown(e as Error) }
     // A throw in a handler (protocol desync) tears down the socket; recoverable per-row
     // decode errors are caught inside dataRow() and never reach here.
     for (const m of messages) {
@@ -241,8 +274,8 @@ export class Connection {
       // replies ErrorResponse); the trailing Sync guarantees a ReadyForQuery, since
       // the Sync we already sent was swallowed by copy-in mode.
       case 'G': case 'W': { try { this.socket?.write(Buffer.concat([W.copyFail('COPY is not supported by minipg'), W.sync()])) } catch { /* */ } return }
-      case 'T': if (this.current) { const fields = parseRowDescription(body); const decoders = fields.map((f) => decoderFor(f.dataTypeOid, this.cfg.decoders)); this.current.fields = fields; this.current.decoders = decoders; if (this.current._cacheName) this.prepared.set(this.current._cacheName, { sql: this.current.sql, fields, decoders }) } return
-      case 'n': if (this.current) { this.current.fields = []; this.current.decoders = []; if (this.current._cacheName) this.prepared.set(this.current._cacheName, { sql: this.current.sql, fields: [], decoders: [] }) } return
+      case 'T': if (this.current) { this.current.fields = parseRowDescription(body); if (!this.current._typed) this.current.mapper = this.getMapper(this.current.fields.map((f) => ({ name: f.name, oid: f.dataTypeOid })), this.current.mode); if (this.current._cacheName) this.prepared.set(this.current._cacheName, { sql: this.current.sql, fields: this.current.fields }) } return
+      case 'n': if (this.current) { this.current.fields = []; if (this.current._cacheName) this.prepared.set(this.current._cacheName, { sql: this.current.sql, fields: [] }) } return
       case 'D': return this.dataRow(body)
       case 'C': if (this.current) { const tag = firstCstr(body); this.current.command = tag.split(' ')[0]; const m = tag.match(/(\d+)\s*$/); this.current.rowCount = m ? parseInt(m[1]!, 10) : null } return
       case 'E': { const err = new PgError(parseErrorFields(body)); if (this.connecting) return this.failAttempt(err); if (this.current) this.current.error = err; return }
@@ -275,6 +308,8 @@ export class Connection {
     this.txStatus = body.length ? String.fromCharCode(body[0]!) : 'I' // 'I' idle | 'T' in tx | 'E' failed tx
     if (this.connecting) {
       this.connecting = false; this.everConnected = true; this.state = 'ready'; clearTimeout(this.connTimer)
+      this.connectAbort = undefined // connected: the socket is live, don't abort it
+      if (this.instrumented) for (const pl of this.cfg.plugins) try { pl.onConnect?.({ database: this.cfg.database, host: this.cfg.host, backendPid: this.backendKey?.pid }) } catch { /* */ }
       const r = this.attemptResolve; this.attemptResolve = this.attemptReject = undefined
       r?.(); this.processQueue() // queued tasks (incl. ones enqueued while reconnecting) now run
     } else {
@@ -282,20 +317,28 @@ export class Connection {
     }
   }
 
+  // Build (cached) the row mapper for a shape. array/object only; buffer/raw fall through to makeRow.
+  // Serves BOTH the standard path (cols from RowDescription fields) and queryTyped (cols from caller).
+  private getMapper(cols: CodegenCol[], mode: ResultMode): RowMapper | undefined {
+    if (mode !== 'array' && mode !== 'object') return undefined
+    const key = mode + '|' + cols.map((c) => `${c.name}:${c.oid}:${c.format ?? 't'}:${c.js ?? ''}:${c.json ? 'j' : ''}`).join(',')
+    let m = this.mapperCache.get(key)
+    if (!m) { m = this.mapperFactory(cols, mode, this.cfg.decoders); this.mapperCache.set(key, m) }
+    return m
+  }
+
   private dataRow(body: Buffer): void {
     const t = this.current
     if (!t || t.cancelled || t.error || t.settled) return
-    // Streaming: decode now and hand off (backpressure). Non-stream: buffer the body (a
-    // zero-copy view) and decode the whole result set into a pre-sized array at finish.
-    if (t.stream) {
-      let row: unknown
-      // A decoder (built-in or user-supplied via config.types) can throw; capture it as the
-      // task error so the query rejects on ReadyForQuery — never an uncaught crash.
-      try { row = decodeRow(body, t.mode, t.fields ?? [], t.decoders ?? []) } catch (e) { t.error = e as Error; return }
-      t.onRow!(row)
-    } else {
-      t.bodies.push(body)
-    }
+    let row: unknown
+    const p = t.perf
+    // A decoder (built-in or user-supplied via config.types) can throw; capture it
+    // as the task error so the query rejects on ReadyForQuery — never an uncaught crash.
+    try {
+      if (p) { const s = performance.now(); row = t.mapper ? t.mapper(body) : makeRow(parseDataRow(body), body, t.mode, t.fields ?? [], this.cfg.decoders); p.decodeMs += performance.now() - s }
+      else row = t.mapper ? t.mapper(body) : makeRow(parseDataRow(body), body, t.mode, t.fields ?? [], this.cfg.decoders)
+    } catch (e) { t.error = e as Error; return }
+    if (t.onRow) t.onRow(row); else t.rows.push(row)
   }
 
   private processQueue(): void {
@@ -307,20 +350,26 @@ export class Connection {
     // Serialize first: param/SQL encoding can throw (e.g. NUL bytes). Only commit
     // `this.current` once we have bytes to write, so a throw can't wedge the queue.
     let payload: Buffer
+    if (t.perf) t.perf.tStart = performance.now() // execution begins (queue wait ends here)
     try {
+      if (!Array.isArray(t.params)) throw new TypeError('params must be an array')
+      const enc = t.params.map(encodeParam)
       const name = t.name ?? ''
-      const w = this.writer; w.reset()
       let reuse = false
+      const w = this.writer
+      w.reset()
       if (t.name) {
         const cached = this.prepared.get(t.name)
-        if (cached && cached.sql === t.sql) { reuse = true; t.fields = cached.fields; t.decoders = cached.decoders }
+        if (cached && cached.sql === t.sql) { reuse = true; t.fields = cached.fields; t.mapper = this.getMapper(cached.fields.map((f) => ({ name: f.name, oid: f.dataTypeOid })), t.mode) }
         else if (cached) { writeClose(w, 'S', t.name); this.prepared.delete(t.name) }
       }
       if (!reuse) { writeParse(w, name, t.sql); writeDescribe(w, 'S', name); if (t.name) t._cacheName = t.name }
-      writeBind(w, '', name, t.params, 0); writeExecute(w, '', 0); writeSync(w) // params encoded straight into the buffer
-      // Safe to hand the reusable slice to write(): one query is in flight at a time, so the
-      // buffer isn't reset until ReadyForQuery (i.e. after these bytes have flushed).
+      if (t.info) t.info.prepared = reuse
+      writeBind(w, '', name, enc, t.resultFormat ?? 0); writeExecute(w, '', 0); writeSync(w)
+      // Safe to hand the reusable slice to write(): one query is in flight at a time,
+      // so the buffer isn't reset until ReadyForQuery (i.e. after the bytes flushed).
       payload = w.slice()
+      if (t.perf) t.perf.sent = payload.length
     } catch (e) {
       if (t.stream) t.streamError?.(e as Error); else t.reject?.(e as Error)
       queueMicrotask(() => this.processQueue())
@@ -329,6 +378,7 @@ export class Connection {
     this.current = t
     if (t.timeout != null) t.timer = setTimeout(() => this.cancelTask(t, Object.assign(new Error(`query timed out after ${t.timeout}ms`), { code: 'QUERY_TIMEOUT' })), t.timeout)
     this.socket!.write(payload)
+    if (t.perf) { t.perf.tWrite = performance.now(); this.fireStart(t) } // query now in flight
   }
 
   // Arm an AbortSignal on a task. Returns true if it was already aborted (and settled now).
@@ -350,6 +400,7 @@ export class Connection {
     task.settled = true
     if (task.timer) clearTimeout(task.timer)
     if (this.current === task) {
+      this.fireEnd(task, reason)
       if (task.stream) task.streamError?.(reason); else task.reject?.(reason)
       this.sendCancelRequest()
       task.graceTimer = setTimeout(() => { try { this.socket?.destroy() } catch { /* */ } }, 5000) // dead-network fallback
@@ -360,22 +411,12 @@ export class Connection {
     }
   }
 
-  // Open a throwaway connection and send CancelRequest for our backend (mirrors SSL).
+  // Best-effort out-of-band CancelRequest. The node transport registers nodeCancel; transports without
+  // a registered canceller (e.g. cloudflare:sockets) rely on the grace-timer socket.destroy() fallback.
   private sendCancelRequest(): void {
     const key = this.backendKey
     if (!key) return
-    const cancel = W.cancelRequest(key.pid, key.secret)
-    const send = (s: net.Socket | tls.TLSSocket) => { try { s.write(cancel); s.end() } catch { /* */ } }
-    const plain = net.connect({ host: this.cfg.host, port: this.cfg.port }, () => {
-      if (!this.cfg.ssl) return send(plain)
-      plain.write(W.sslRequest())
-      plain.once('data', (b: Buffer) => {
-        if (String.fromCharCode(b[0]!) === 'S') {
-          const t = tls.connect({ socket: plain, ...tlsOptions(this.cfg.ssl as TlsSsl, this.cfg.host) }, () => send(t)); t.on('error', () => { /* */ })
-        } else send(plain) // server declined SSL; try plaintext cancel
-      })
-    })
-    plain.on('error', () => { /* best-effort */ })
+    defaultCancel?.(this.cfg, key)
   }
 
   private finishTask(): void {
@@ -385,15 +426,13 @@ export class Connection {
       if (t.graceTimer) clearTimeout(t.graceTimer)
       t.signalCleanup?.()
       if (!t.settled) { // a timed-out/aborted task was already settled by the caller
-        if (t.error) { if (t.stream) t.streamError?.(t.error); else t.reject?.(t.error) }
-        else if (t.stream) t.streamEnd?.({ command: t.command, rowCount: t.rowCount })
+        if (t.error) { this.fireEnd(t, t.error); if (t.stream) t.streamError?.(t.error); else t.reject?.(t.error) }
+        else if (t.stream) { this.fireEnd(t); t.streamEnd?.({ command: t.command, rowCount: t.rowCount }) }
         else {
-          // decode the whole result set into a pre-sized array (shared mapper)
-          try {
-            const fields = t.fields ?? []
-            const rows = decodeRows(t.bodies, t.mode, fields, t.decoders ?? [])
-            t.resolve?.({ rows: rows as never[], columns: fields.map((f) => f.name), rowCount: t.rowCount ?? null, command: t.command ?? null })
-          } catch (e) { t.reject?.(e as Error) }
+          const m = this.fireEnd(t)
+          const res: QueryResult<never> = { rows: t.rows as never[], columns: (t.fields ?? []).map((f) => f.name), rowCount: t.rowCount ?? null, command: t.command ?? null }
+          if (t.wantMetrics && m) res.metrics = m
+          t.resolve?.(res)
         }
       }
     }
@@ -405,7 +444,7 @@ export class Connection {
   private settlePending(e: Error): void {
     // Prefer an informative server error already received for the in-flight query
     // (e.g. a FATAL 57P01 admin_shutdown that arrives just before the socket closes).
-    if (this.current) { const t = this.current; this.current = null; if (t.timer) clearTimeout(t.timer); if (t.graceTimer) clearTimeout(t.graceTimer); t.signalCleanup?.(); if (!t.settled) { const reason = t.error ?? e; if (t.stream) t.streamError?.(reason); else t.reject?.(reason) } }
+    if (this.current) { const t = this.current; this.current = null; if (t.timer) clearTimeout(t.timer); if (t.graceTimer) clearTimeout(t.graceTimer); t.signalCleanup?.(); if (!t.settled) { const reason = t.error ?? e; this.fireEnd(t, reason); if (t.stream) t.streamError?.(reason); else t.reject?.(reason) } }
     while (this.queue.length) { const t = this.queue.shift()!; t.signalCleanup?.(); if (!t.settled) { if (t.stream) t.streamError?.(e); else t.reject?.(e) } }
   }
 
@@ -418,6 +457,8 @@ export class Connection {
   private failAttempt(err: Error): void {
     if (!this.connecting) return
     this.connecting = false; clearTimeout(this.connTimer)
+    try { this.connectAbort?.abort() } catch { /* */ } // tear down a pending transport socket (stalled handshake)
+    this.connectAbort = undefined
     const dead = this.socket; this.socket = null
     try { dead?.destroy() } catch { /* */ }
     const rj = this.attemptReject; this.attemptResolve = this.attemptReject = undefined
@@ -432,7 +473,7 @@ export class Connection {
     const dead = this.socket; this.socket = null // claim the death; further events from `dead` are ignored
     try { dead?.destroy() } catch { /* */ }
     const t = this.current; this.current = null
-    if (t) { if (t.timer) clearTimeout(t.timer); if (t.graceTimer) clearTimeout(t.graceTimer); t.signalCleanup?.(); if (!t.settled) { const reason = t.error ?? err; if (t.stream) t.streamError?.(reason); else t.reject?.(reason) } }
+    if (t) { if (t.timer) clearTimeout(t.timer); if (t.graceTimer) clearTimeout(t.graceTimer); t.signalCleanup?.(); if (!t.settled) { const reason = t.error ?? err; this.fireEnd(t, reason); if (t.stream) t.streamError?.(reason); else t.reject?.(reason) } }
     if (this.cfg.reconnect.enabled && !this.ended) {
       this.state = 'reconnecting'
       this.prepared.clear() // server-side prepared statements are gone after a drop/restart
@@ -451,19 +492,17 @@ export class Connection {
       if (maxRetries != null && attempt >= maxRetries) { this.state = 'closed'; this.rejectQueue(new Error(`reconnect failed after ${attempt} attempts: ${lastErr.message}`)); return }
       await sleep(Math.min(max, base * 2 ** attempt) * (0.5 + Math.random() * 0.5))
       if (this.ended || (this.state as string) === 'closed') return // end() may have run during the backoff
+      if (this.instrumented) for (const pl of this.cfg.plugins) try { pl.onReconnect?.({ attempt, error: lastErr }) } catch { /* */ }
       try { await this.establish(); return } // success -> ready() flips to 'ready' and drains the queue
       catch (e) { lastErr = e as Error; if (isFatalAuth(e)) { this.state = 'closed'; this.rejectQueue(e as Error); return } }
     }
   }
 
   // ---- public query API ----
-  // `sql` may be a plain SQL string, or an array of static chunks (from a query builder /
-  // tagged template) interleaved with $1/$2/… for `params`. Passing the SAME chunks array on
-  // repeat calls auto-reuses a prepared statement keyed by the array's identity (no name needed).
-  query(sql: string | readonly string[], params?: unknown[], opts?: { name?: string; mode?: 'array'; timeout?: number; signal?: AbortSignal }): Promise<QueryResult<unknown[]>>
-  query(sql: string | readonly string[], params: unknown[], opts: { name?: string; mode: 'object'; timeout?: number; signal?: AbortSignal }): Promise<QueryResult<Record<string, unknown>>>
-  query(sql: string | readonly string[], params: unknown[], opts: { name?: string; mode: 'buffer'; timeout?: number; signal?: AbortSignal }): Promise<QueryResult<(Buffer | null)[]>>
-  query(sql: string | readonly string[], params: unknown[], opts: { name?: string; mode: 'raw'; timeout?: number; signal?: AbortSignal }): Promise<QueryResult<Buffer>>
+  query(sql: string | readonly string[], params?: unknown[], opts?: { name?: string; mode?: 'array'; metrics?: boolean; timeout?: number; signal?: AbortSignal }): Promise<QueryResult<unknown[]>>
+  query(sql: string | readonly string[], params: unknown[], opts: { name?: string; mode: 'object'; metrics?: boolean; timeout?: number; signal?: AbortSignal }): Promise<QueryResult<Record<string, unknown>>>
+  query(sql: string | readonly string[], params: unknown[], opts: { name?: string; mode: 'buffer'; metrics?: boolean; timeout?: number; signal?: AbortSignal }): Promise<QueryResult<(Buffer | null)[]>>
+  query(sql: string | readonly string[], params: unknown[], opts: { name?: string; mode: 'raw'; metrics?: boolean; timeout?: number; signal?: AbortSignal }): Promise<QueryResult<Buffer>>
   query(sql: string | readonly string[], params: unknown[] = [], opts: QueryOptions = {}): Promise<QueryResult<never>> {
     return new Promise<QueryResult<never>>((resolve, reject) => {
       if (this.state === 'closed') return reject(new Error('connection is closed'))
@@ -474,7 +513,27 @@ export class Connection {
         if (!e) { e = { name: '_c' + (this.chunkSeq++), sql: buildChunkSql(sql) }; this.chunkCache.set(sql, e) }
         text = e.sql; name = e.name
       }
-      const task: Task = { sql: text, params, name, mode: opts.mode ?? 'array', bodies: [], resolve, reject, timeout: opts.timeout, signal: opts.signal }
+      const task: Task = { sql: text, params, name, mode: opts.mode ?? 'array', rows: [], resolve, reject, timeout: opts.timeout, signal: opts.signal }
+      this.beginPerf(task, params, !!opts.metrics)
+      if (this.armSignal(task)) return
+      this.queue.push(task)
+      this.processQueue()
+    })
+  }
+
+  /** Run a query whose result columns are declared upfront (name + wire OID + per-column format/target).
+   *  Requests the given wire formats from the server (binary for `format:'binary'` columns) and decodes
+   *  with a typed mapper — enabling the binary result format for supported types without a Describe round
+   *  trip. `columns` MUST match the SELECT's result columns (count + order). */
+  queryTyped(sql: string, params: unknown[], columns: CodegenCol[], opts: { mode?: 'array' | 'object'; metrics?: boolean; timeout?: number; signal?: AbortSignal } = {}): Promise<QueryResult<never>> {
+    return new Promise<QueryResult<never>>((resolve, reject) => {
+      if (this.state === 'closed') return reject(new Error('connection is closed'))
+      const mode = opts.mode ?? 'object'
+      const task: Task = {
+        sql, params, mode, rows: [], resolve, reject, timeout: opts.timeout, signal: opts.signal,
+        mapper: this.getMapper(columns, mode), resultFormat: columns.map((c) => (c.format === 'binary' ? 1 : 0)), _typed: true,
+      }
+      this.beginPerf(task, params, !!opts.metrics)
       if (this.armSignal(task)) return
       this.queue.push(task)
       this.processQueue()
@@ -488,7 +547,7 @@ export class Connection {
     let done = false, err: Error | null = null, paused = false
     const HWM = opts.highWaterMark ?? 200
     const t: Task = {
-      sql, params, name: opts.name, mode: opts.mode ?? 'array', stream: true, bodies: [], timeout: opts.timeout, signal: opts.signal,
+      sql, params, name: opts.name, mode: opts.mode ?? 'array', stream: true, rows: [], timeout: opts.timeout, signal: opts.signal,
       onRow(row) {
         buf.push(row as Row)
         if (waiting) { const w = waiting; waiting = null; w.resolve({ value: buf.shift()!, done: false }) }

@@ -41,7 +41,7 @@ const ASCII_EXTRA = [
   3904, 3906, 3908, 3910, 3912, 3926, // ranges: int4, num, ts, tstz, date, int8
   4451, 4532, 4533, 4534, 4535, 4536, // multiranges: int4, num, ts, tstz, date, int8
 ]
-const ASCII_SAFE = new Set([...ASCII_COMMON, ...ASCII_EXTRA])
+export const ASCII_SAFE = new Set([...ASCII_COMMON, ...ASCII_EXTRA])
 
 // Read the int32 length prefix as a signed big-endian int straight from the four bytes.
 const readLen = 'l = (b[o] << 24) | (b[o + 1] << 16) | (b[o + 2] << 8) | b[o + 3]; o += 4;'
@@ -85,7 +85,7 @@ const f64FromBytes = (v: string) => `{ let p = o; const e = o + l; const c0 = b[
 // (no-offset) values are treated as UTC, timestamptz applies its offset. Direct field parse from
 // bytes -> Date.UTC (2-4x faster than new Date(text) AND correct — new Date parses no-tz as LOCAL).
 // ms = first 3 fractional digits (micros truncated; Date is ms-only). Years < 100 / BC: use string.
-const INSTANT_OIDS = new Set([1082, 1114, 1184]) // date, timestamp, timestamptz
+export const INSTANT_OIDS = new Set([1082, 1114, 1184]) // date, timestamp, timestamptz
 const tsFromBytes = (v: string, kind: 'date' | 'epoch') => `{ let p = o; const e = o + l;
       let Y = 0; for (; p < e; p++) { const c = b[p]; if (c < 48 || c > 57) break; Y = Y * 10 + (c - 48) } p++;
       const Mo = (b[p] - 48) * 10 + (b[p + 1] - 48); p += 3;
@@ -101,7 +101,7 @@ const tsFromBytes = (v: string, kind: 'date' | 'epoch') => `{ let p = o; const e
       const ems = Date.UTC(Y, Mo - 1, D, H, Mi, S, ms) - off; ${kind === 'date' ? `${v} = new Date(ems)` : `${v} = ems`} }`
 
 // The natural JS target for a wire OID (before any per-column override).
-function defaultJs(oid: number): 'number' | 'string' | 'bool' | 'json' | 'bytea' | 'helper' {
+export function defaultJs(oid: number): 'number' | 'string' | 'bool' | 'json' | 'bytea' | 'helper' {
   switch (oid) {
     case 16: return 'bool'
     case 17: return 'bytea'
@@ -114,7 +114,7 @@ function defaultJs(oid: number): 'number' | 'string' | 'bool' | 'json' | 'bytea'
     default: return ASCII_SAFE.has(oid) ? 'string' : 'helper'
   }
 }
-const INT_OIDS = new Set([20, 21, 23, 26]) // int8/int2/int4/oid — digit-parseable straight to a number
+export const INT_OIDS = new Set([20, 21, 23, 26]) // int8/int2/int4/oid — digit-parseable straight to a number
 
 // Inline decode expression for a column. ASCII-safe types use latin1; unicode-capable ones utf8.
 // float4/float8 (and the numeric:number target) decode via the exact Clinger fast path (f64FromBytes).

@@ -8,7 +8,7 @@
     "./node": "./src/node.ts",
     "./deno": "./src/deno.ts",
     "./cf": "./src/cf.ts",
-    "./telemetry": "./src/inline/telemetry.ts"
+    "./telemetry": "./src/telemetry.ts"
   },
   "scripts": {
     "typecheck": "tsc --noEmit",
@@ -17,8 +17,8 @@
     "test:integration": "bun test test/integration",
     "test:cf": "vitest run --config test/cf/vitest.config.ts",
     "test:query": "bun test test/integration/results.test.ts test/integration/types-core.test.ts test/integration/types-advanced.test.ts test/integration/types-temporal-json.test.ts test/integration/parameters.test.ts test/integration/query-protocol.test.ts test/integration/prepared-statements.test.ts test/integration/regression.test.ts",
-    "test:query:jit": "MINIPG_VARIANT=jit bun run test:query",
-    "test:query:both": "bun run test:query && bun run test:query:jit",
+    "test:query:interp": "MINIPG_VARIANT=interpreted bun run test:query",
+    "test:query:both": "bun run test:query && bun run test:query:interp",
     "test:smoke": "bun test/smoke.ts",
     "test:setup": "bash test/setup-pg.sh",
     "bench": "bun bench/drivers.bench.ts",

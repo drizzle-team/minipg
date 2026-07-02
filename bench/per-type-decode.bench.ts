@@ -3,9 +3,9 @@
 // Both paths use the same js target so outputs are identical (parity-asserted). No socket.
 //   bun bench/per-type-decode.bench.ts   (or: bun run bench:pertype)   — run node too (V8 vs JSC differ)
 import { run, bench, group, summary, do_not_optimize } from 'mitata'
-import { compileResultSet } from '../src/inline/decode2.ts'
-import type { CodegenCol, Target } from '../src/inline/decode2.ts'
-import { buildDecoders } from '../src/inline/codec.ts'
+import { compileResultSet } from '../src/decode2.ts'
+import type { CodegenCol, Target } from '../src/decode2.ts'
+import { buildDecoders } from '../src/codec.ts'
 import * as wire from '../test/helpers/wire.ts'
 
 const map = buildDecoders()

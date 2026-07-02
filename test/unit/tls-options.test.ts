@@ -1,7 +1,7 @@
 // Pure unit tests for tlsOptions(): the sslmode -> tls.connect option resolution. No network.
 import { describe, test, expect } from 'bun:test'
 import tls from 'node:tls'
-import { tlsOptions } from '../../src/connection.ts'
+import { tlsOptions } from '../../src/transport-node.ts'
 
 describe('tlsOptions: sslmode -> tls.connect options', () => {
   test("'require' / true: encrypt, no verification", () => {

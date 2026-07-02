@@ -1,9 +1,9 @@
 // minipg for Deno — `import { connect, createPool } from 'minipg/deno'`.
 // Same driver, Deno's TCP transport: Deno.connect / Deno.connectTls give WHATWG streams, bridged to
 // the Node Duplex the core uses. (node:stream + node:crypto come from Deno's Node-compat layer.)
-import { connect as coreConnect, createPool as corePool, Connection, Pool, PgError, defaultDecoders } from './inline/core.ts'
-import type { ConnectConfig, PoolConfig } from './inline/types.ts'
-import { duplexFromWeb } from './inline/webstream.ts'
+import { connect as coreConnect, createPool as corePool, Connection, Pool, PgError, defaultDecoders } from './core.ts'
+import type { ConnectConfig, PoolConfig } from './types.ts'
+import { duplexFromWeb } from './webstream.ts'
 
 function denoSocket(c: ConnectConfig) {
   return async () => {
