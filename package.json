@@ -4,13 +4,18 @@
   "type": "module",
   "private": true,
   "exports": {
-    ".": "./src/index.ts"
+    ".": "./src/index.ts",
+    "./node": "./src/node.ts",
+    "./deno": "./src/deno.ts",
+    "./cf": "./src/cf.ts",
+    "./telemetry": "./src/inline/telemetry.ts"
   },
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "test": "bun test",
+    "test": "bun test test/unit test/integration",
     "test:unit": "bun test test/unit",
     "test:integration": "bun test test/integration",
+    "test:cf": "vitest run --config test/cf/vitest.config.ts",
     "test:query": "bun test test/integration/results.test.ts test/integration/types-core.test.ts test/integration/types-advanced.test.ts test/integration/types-temporal-json.test.ts test/integration/parameters.test.ts test/integration/query-protocol.test.ts test/integration/prepared-statements.test.ts test/integration/regression.test.ts",
     "test:query:jit": "MINIPG_VARIANT=jit bun run test:query",
     "test:query:both": "bun run test:query && bun run test:query:jit",
@@ -32,6 +37,7 @@
     "bench:chunks": "bun bench/chunks.bench.ts"
   },
   "devDependencies": {
+    "@cloudflare/vitest-pool-workers": "^0.5.2",
     "@mitata/counters": "^0.0.8",
     "@types/bun": "latest",
     "@types/pg": "^8.20.0",
@@ -40,7 +46,9 @@
     "mitata": "^1.0.34",
     "pg": "^8.22.0",
     "postgres": "^3.4.9",
-    "prettier": "^3.9.1"
+    "prettier": "^3.9.1",
+    "vitest": "~2.1.9",
+    "wrangler": "^3.90.0"
   },
   "peerDependencies": {
     "typescript": "^5"

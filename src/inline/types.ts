@@ -1,5 +1,6 @@
 import type * as tls from 'node:tls'
 import type { Duplex } from 'node:stream'
+import type { Plugin, QueryMetrics } from './plugin.ts'
 
 /** Row-shape of a query result. */
 export type ResultMode = 'array' | 'object' | 'buffer' | 'raw'
@@ -22,6 +23,8 @@ export interface QueryResult<Row = unknown[]> {
   columns: string[]
   rowCount: number | null
   command: string | null
+  /** Per-query timings + sizes, present only when the query opted in with `{ metrics: true }`. */
+  metrics?: QueryMetrics
 }
 
 export interface ConnectConfig {
@@ -50,13 +53,18 @@ export interface ConnectConfig {
   reconnect?: boolean | { baseMs?: number; maxMs?: number; maxRetries?: number }
   /** Custom transport: return an already-connected duplex stream (bypasses net.connect
    *  and SSL). Enables unix sockets, alternative runtimes, and in-process testing. */
-  socket?: () => Duplex
+  socket?: () => Duplex | Promise<Duplex>
+  /** Telemetry/observability plugins (e.g. otel()/sentry() from 'minipg/telemetry'). They subscribe
+   *  to query + connection lifecycle hooks; enabling any plugin turns on per-query timing capture. */
+  plugins?: Plugin[]
 }
 
 export interface QueryOptions {
   /** Reuse a server-side prepared statement under this name (parse once, bind many). */
   name?: string
   mode?: ResultMode
+  /** Attach per-query timings/sizes to the result as `.metrics` (works with or without plugins). */
+  metrics?: boolean
   /** Cancel the query (out-of-band CancelRequest) after this many milliseconds. */
   timeout?: number
   /** Cancel the query when this AbortSignal fires. */

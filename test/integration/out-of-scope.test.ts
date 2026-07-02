@@ -285,9 +285,13 @@ describe('runtime parity — Bun (primary)', () => {
 })
 
 describe('pure net/tls/crypto surface (static-import audit of src/)', () => {
-  const srcFiles = readdirSync(SRC_DIR).filter((f) => f.endsWith('.ts'))
+  // The opt-in per-runtime adapters (minipg/node|deno|cf) are the SANCTIONED boundary for
+  // runtime-specific transports (the Deno global, cloudflare:sockets), so they're excluded from the
+  // core-purity audit; .d.ts files hold only erased type declarations.
+  const RUNTIME_ENTRIES = new Set(['node.ts', 'deno.ts', 'cf.ts'])
+  const srcFiles = readdirSync(SRC_DIR).filter((f) => f.endsWith('.ts') && !f.endsWith('.d.ts') && !RUNTIME_ENTRIES.has(f))
 
-  test('src/ imports only node:net/tls/crypto/os — no pg-native/libpq/cloudflare/native addon', () => {
+  test('src/ core imports only node:net/tls/crypto/os — no pg-native/libpq/cloudflare/native addon', () => {
     const forbidden = /(pg-native|libpq|cloudflare:sockets|require\(['"]net['"]\)|node-gyp|\.node['"])/
     const nodeImport = /from\s+['"]node:([a-z_]+)['"]/g
     const allowed = new Set(['net', 'tls', 'crypto', 'os', 'path', 'url', 'fs', 'assert'])
