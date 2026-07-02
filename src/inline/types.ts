@@ -78,6 +78,10 @@ export interface StreamOptions extends QueryOptions {
 
 export interface PoolConfig extends ConnectConfig {
   max?: number
+  /** Close a connection that has sat idle in the pool for this many ms (0/omitted = never evict).
+   *  Also surfaced as `pool.options.idleTimeoutMillis` + a `'release'` event so Vercel's
+   *  attachDatabasePool() can keep the function instance alive long enough to drain idle connections. */
+  idleTimeoutMillis?: number
   /** Single-flight reconnect on connection failure. `false` disables it (fail fast).
    *  Object tunes backoff (baseMs/maxMs) and how long an acquire waits for recovery. */
   reconnect?: boolean | { baseMs?: number; maxMs?: number; acquireTimeoutMs?: number }

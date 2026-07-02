@@ -26,6 +26,13 @@ export class Pool {
   private waiters: Waiter[] = [] // waiting because the pool is at max
   private closed = false
 
+  // Idle-connection eviction + a minimal EventEmitter surface, so `pool.options.idleTimeoutMillis` and
+  // the `'release'` event let Vercel's attachDatabasePool() drive Fluid-compute connection draining.
+  private idleMs: number
+  private idleTimers = new Map<Connection, ReturnType<typeof setTimeout>>()
+  private listeners = new Map<string, Array<(...args: unknown[]) => void>>()
+  readonly options: { idleTimeoutMillis: number }
+
   // reconnect / circuit breaker
   private rcEnabled: boolean
   private base: number
@@ -44,12 +51,32 @@ export class Pool {
     this.base = o.baseMs ?? 50
     this.maxBackoff = o.maxMs ?? 2000
     this.acquireTimeout = o.acquireTimeoutMs ?? 30000
+    this.idleMs = config.idleTimeoutMillis ?? 0
+    this.options = { idleTimeoutMillis: this.idleMs } // detection surface for attachDatabasePool()
   }
 
   get size(): number { return this.all.size }
   get idleCount(): number { return this.idle.length }
   get waiting(): number { return this.waiters.length }
   get isDown(): boolean { return this.down }
+
+  /** EventEmitter-style subscription (only `'release'` is emitted). Present so attachDatabasePool()
+   *  recognizes the pool and can extend the instance lifetime on release. */
+  on(event: string, listener: (...args: unknown[]) => void): this {
+    const arr = this.listeners.get(event) ?? []; arr.push(listener); this.listeners.set(event, arr); return this
+  }
+  private emit(event: string): void { const arr = this.listeners.get(event); if (arr) for (const l of arr) try { l() } catch { /* listener errors never break the pool */ } }
+
+  // idle eviction: a connection sitting in `idle` past idleMs is closed and dropped
+  private armIdleTimer(conn: Connection): void {
+    if (this.idleMs <= 0) return
+    this.idleTimers.set(conn, setTimeout(() => {
+      this.idleTimers.delete(conn)
+      const i = this.idle.indexOf(conn); if (i < 0) return // checked out again meanwhile
+      this.idle.splice(i, 1); this.all.delete(conn); void conn.end()
+    }, this.idleMs))
+  }
+  private clearIdleTimer(conn: Connection): void { const t = this.idleTimers.get(conn); if (t) { clearTimeout(t); this.idleTimers.delete(conn) } }
 
   async acquire(): Promise<Connection> {
     if (this.closed) throw new Error('pool is closed')
@@ -58,6 +85,7 @@ export class Pool {
     // reuse a live idle connection (evict dead ones that died while idle)
     while (this.idle.length) {
       const c = this.idle.pop()!
+      this.clearIdleTimer(c) // no longer idle
       if (c.state === 'closed') { this.all.delete(c); continue }
       this.out.add(c)
       return c
@@ -103,7 +131,7 @@ export class Pool {
         if (!this.down || this.closed) return
         try {
           const c = await this.open()
-          this.idle.push(c) // the probe connection becomes the first reusable one
+          this.idle.push(c); this.armIdleTimer(c) // the probe connection becomes the first reusable one
           this.settleBreaker() // recovered -> release the herd
           return
         } catch (e) {
@@ -146,6 +174,7 @@ export class Pool {
   release(conn: Connection): void {
     if (!this.out.has(conn)) return // double-release / foreign connection
     this.out.delete(conn)
+    this.emit('release') // signal to attachDatabasePool() that a client returned (extends instance life)
     if (conn.state === 'closed') { this.all.delete(conn); this.refill(); return }
     if (this.closed) { this.all.delete(conn); void conn.end(); return }
     if (conn.inTransaction) { // never leak tx state across checkouts
@@ -157,9 +186,9 @@ export class Pool {
 
   private checkin(conn: Connection): void {
     // A live connection returning during an outage proves the server is back.
-    if (this.down) { this.idle.push(conn); this.settleBreaker(); return }
+    if (this.down) { this.idle.push(conn); this.armIdleTimer(conn); this.settleBreaker(); return }
     const w = this.waiters.shift()
-    if (w) { this.out.add(conn); w.resolve(conn) } else this.idle.push(conn)
+    if (w) { this.out.add(conn); w.resolve(conn) } else { this.idle.push(conn); this.armIdleTimer(conn) }
   }
 
   private refill(): void {
@@ -194,6 +223,7 @@ export class Pool {
     const err = new Error('pool ended')
     this.failWaiters(err)
     for (const w of this.recovered.splice(0)) w() // wake recovery-waiters -> they reject (closed)
+    for (const t of this.idleTimers.values()) clearTimeout(t); this.idleTimers.clear()
     const conns = [...this.all]
     this.all.clear(); this.idle = []; this.out.clear()
     await Promise.all(conns.map((c) => c.end()))
