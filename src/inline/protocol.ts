@@ -93,7 +93,7 @@ export function writeParse(w: Writer, name: string, sql: string): void {
 export function writeDescribe(w: Writer, kind: 'S' | 'P', name: string): void {
   w.start('D'); w.byte(kind.charCodeAt(0)); w.cstr(name); w.end()
 }
-export function writeBind(w: Writer, portal: string, statement: string, params: EncodedParam[], resultFormat = 0): void {
+export function writeBind(w: Writer, portal: string, statement: string, params: EncodedParam[], resultFormat: number | number[] = 0): void {
   if (params.length > 65535) throw new Error(`too many bind parameters: ${params.length} (max 65535)`)
   w.start('B'); w.cstr(portal); w.cstr(statement)
   w.int16(params.length)
@@ -103,7 +103,9 @@ export function writeBind(w: Writer, portal: string, statement: string, params: 
     if (p.bytes == null) w.int32(-1)
     else { w.int32(p.bytes.length); w.bytes(p.bytes) }
   }
-  w.int16(1); w.int16(resultFormat) // one result-format code applied to all columns
+  // result-format codes: one code applied to all columns, or one PER column (the ORM binary flow)
+  if (Array.isArray(resultFormat)) { w.int16(resultFormat.length); for (const f of resultFormat) w.int16(f) }
+  else { w.int16(1); w.int16(resultFormat) }
   w.end()
 }
 export function writeExecute(w: Writer, portal: string, maxRows = 0): void {

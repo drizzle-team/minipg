@@ -10,6 +10,7 @@ import { buildDecoders, decoderFor, encodeParam } from './codec.ts'
 import { PgError, parseErrorFields } from './errors.ts'
 import type { ConnectConfig, Decoder, Field, QueryOptions, QueryResult, ResultMode, StreamOptions } from './types.ts'
 import { compileRow, type RowBuilder } from './codegen.ts'
+import { compileRow as compileRowTyped, type CodegenCol } from './decode2.ts'
 
 type ConnState = 'idle' | 'connecting' | 'ready' | 'reconnecting' | 'closed'
 
@@ -44,6 +45,8 @@ interface Task {
   cancelled?: boolean
   stream?: boolean
   _cacheName?: string
+  resultFormat?: number | number[] // result-format code(s) for Bind (ORM binary flow)
+  _typed?: boolean // builder came from a caller-supplied column plan — don't override from RowDescription
   timeout?: number
   signal?: AbortSignal
   timer?: ReturnType<typeof setTimeout>
@@ -218,7 +221,7 @@ export class Connection {
       // replies ErrorResponse); the trailing Sync guarantees a ReadyForQuery, since
       // the Sync we already sent was swallowed by copy-in mode.
       case 'G': case 'W': { try { this.socket?.write(Buffer.concat([W.copyFail('COPY is not supported by minipg'), W.sync()])) } catch { /* */ } return }
-      case 'T': if (this.current) { this.current.fields = parseRowDescription(body); this.current.builder = this.builderFor(this.current.fields, this.current.mode); if (this.current._cacheName) this.prepared.set(this.current._cacheName, { sql: this.current.sql, fields: this.current.fields }) } return
+      case 'T': if (this.current) { this.current.fields = parseRowDescription(body); if (!this.current._typed) this.current.builder = this.builderFor(this.current.fields, this.current.mode); if (this.current._cacheName) this.prepared.set(this.current._cacheName, { sql: this.current.sql, fields: this.current.fields }) } return
       case 'n': if (this.current) { this.current.fields = []; if (this.current._cacheName) this.prepared.set(this.current._cacheName, { sql: this.current.sql, fields: [] }) } return
       case 'D': return this.dataRow(body)
       case 'C': if (this.current) { const tag = firstCstr(body); this.current.command = tag.split(' ')[0]; const m = tag.match(/(\d+)\s*$/); this.current.rowCount = m ? parseInt(m[1]!, 10) : null } return
@@ -301,7 +304,7 @@ export class Connection {
         else if (cached) { writeClose(w, 'S', t.name); this.prepared.delete(t.name) }
       }
       if (!reuse) { writeParse(w, name, t.sql); writeDescribe(w, 'S', name); if (t.name) t._cacheName = t.name }
-      writeBind(w, '', name, enc, 0); writeExecute(w, '', 0); writeSync(w)
+      writeBind(w, '', name, enc, t.resultFormat ?? 0); writeExecute(w, '', 0); writeSync(w)
       // Safe to hand the reusable slice to write(): one query is in flight at a time,
       // so the buffer isn't reset until ReadyForQuery (i.e. after the bytes flushed).
       payload = w.slice()
@@ -443,6 +446,33 @@ export class Connection {
     return new Promise<QueryResult<never>>((resolve, reject) => {
       if (this.state === 'closed') return reject(new Error('connection is closed'))
       const task: Task = { sql, params, name: opts.name, mode: opts.mode ?? 'array', rows: [], resolve, reject, timeout: opts.timeout, signal: opts.signal }
+      if (this.armSignal(task)) return
+      this.queue.push(task)
+      this.processQueue()
+    })
+  }
+
+  // ---- ORM binary flow: columns known upfront ----
+  private typedCache = new Map<string, RowBuilder>()
+  private typedBuilder(cols: CodegenCol[], mode: 'array' | 'object'): RowBuilder {
+    const key = mode + '|' + cols.map((c) => `${c.name}:${c.oid}:${c.format ?? 't'}:${c.js ?? ''}:${c.json ? 'j' : ''}`).join(',')
+    let b = this.typedCache.get(key)
+    if (!b) { b = compileRowTyped(cols, mode, this.cfg.decoders) as unknown as RowBuilder; this.typedCache.set(key, b) }
+    return b
+  }
+
+  /** Run a query whose result columns are declared upfront (name + wire OID + per-column format/target).
+   *  Requests the given wire formats from the server (binary for `format:'binary'` columns) and decodes
+   *  with a typed mapper — enabling the binary result format for supported types without a Describe round
+   *  trip. `columns` MUST match the SELECT's result columns (count + order). */
+  queryTyped(sql: string, params: unknown[], columns: CodegenCol[], opts: { mode?: 'array' | 'object'; timeout?: number; signal?: AbortSignal } = {}): Promise<QueryResult<never>> {
+    return new Promise<QueryResult<never>>((resolve, reject) => {
+      if (this.state === 'closed') return reject(new Error('connection is closed'))
+      const mode = opts.mode ?? 'object'
+      const task: Task = {
+        sql, params, mode, rows: [], resolve, reject, timeout: opts.timeout, signal: opts.signal,
+        builder: this.typedBuilder(columns, mode), resultFormat: columns.map((c) => (c.format === 'binary' ? 1 : 0)), _typed: true,
+      }
       if (this.armSignal(task)) return
       this.queue.push(task)
       this.processQueue()

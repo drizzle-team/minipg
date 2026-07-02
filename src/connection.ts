@@ -7,6 +7,7 @@ import type { Duplex } from 'node:stream'
 import { W, Writer, Parser, parseRowDescription, writeParse, writeDescribe, writeBind, writeExecute, writeSync, writeClose } from './protocol.ts'
 import { md5Password, scram, type Scram } from './auth.ts'
 import { buildDecoders, decoderFor, type CellDecoder } from './codec.ts'
+import { decodeRow, decodeRows } from './decode.ts'
 import { PgError, parseErrorFields } from './errors.ts'
 import type { ConnectConfig, Field, QueryOptions, QueryResult, ResultMode, StreamOptions } from './types.ts'
 
@@ -96,42 +97,6 @@ function readCstrings(buf: Buffer): string[] {
   return out
 }
 const firstCstr = (buf: Buffer) => { const z = buf.indexOf(0); return buf.toString('utf8', 0, z === -1 ? buf.length : z) }
-
-// Decode one DataRow body straight into a JS row — fused parse+decode (no intermediate cells
-// array) using the per-column decoders resolved once at RowDescription time (no per-cell
-// Map lookup). The body starts with an Int16 column count, hence o = 2; each field is
-// [Int32 length][value bytes]. The length is read as a manual signed-BE int32 straight from
-// the four bytes (faster than readInt32BE — a method call + bounds check; 0xFFFFFFFF -> -1 for
-// NULL), and the value is decoded in place by (buffer, offset, length) — no per-cell subarray.
-function decodeRow(body: Buffer, mode: ResultMode, fields: Field[], decoders: CellDecoder[]): unknown {
-  if (mode === 'raw') return Buffer.from(body)
-  const n = fields.length
-  let o = 2
-  if (mode === 'object') {
-    // Plain {} (NOT Object.create(null)): V8 keeps a {}+consistent-keys object in fast
-    // hidden-class mode, but demotes a null-proto one to dictionary mode (~2.5x slower decode).
-    // A column literally named __proto__ is written via defineProperty so it can't pollute.
-    const row: Record<string, unknown> = {}
-    for (let i = 0; i < n; i++) {
-      const l = (body[o]! << 24) | (body[o + 1]! << 16) | (body[o + 2]! << 8) | body[o + 3]!; o += 4
-      const name = fields[i]!.name
-      let v: unknown = null
-      if (l !== -1) { v = decoders[i]!(body, o, l); o += l } // offset decode: no per-cell subarray
-      if (name === '__proto__') Object.defineProperty(row, name, { value: v, writable: true, enumerable: true, configurable: true })
-      else row[name] = v
-    }
-    return row
-  }
-  if (mode === 'buffer') {
-    const r = new Array(n)
-    // copy each cell into a fresh Buffer (detached from the socket chunk); no subarray view
-    for (let i = 0; i < n; i++) { const l = (body[o]! << 24) | (body[o + 1]! << 16) | (body[o + 2]! << 8) | body[o + 3]!; o += 4; if (l === -1) r[i] = null; else { const c = Buffer.allocUnsafe(l); body.copy(c, 0, o, o + l); r[i] = c; o += l } }
-    return r
-  }
-  const r = new Array(n) // 'array'
-  for (let i = 0; i < n; i++) { const l = (body[o]! << 24) | (body[o + 1]! << 16) | (body[o + 2]! << 8) | body[o + 3]!; o += 4; if (l === -1) r[i] = null; else { r[i] = decoders[i]!(body, o, l); o += l } }
-  return r
-}
 
 export class Connection {
   readonly cfg: NormalizedConfig
@@ -423,11 +388,10 @@ export class Connection {
         if (t.error) { if (t.stream) t.streamError?.(t.error); else t.reject?.(t.error) }
         else if (t.stream) t.streamEnd?.({ command: t.command, rowCount: t.rowCount })
         else {
-          // decode the whole result set in one tight loop into a pre-sized array
+          // decode the whole result set into a pre-sized array (shared mapper)
           try {
-            const fields = t.fields ?? [], decoders = t.decoders ?? [], bodies = t.bodies, n = bodies.length
-            const rows = new Array(n)
-            for (let i = 0; i < n; i++) rows[i] = decodeRow(bodies[i]!, t.mode, fields, decoders)
+            const fields = t.fields ?? []
+            const rows = decodeRows(t.bodies, t.mode, fields, t.decoders ?? [])
             t.resolve?.({ rows: rows as never[], columns: fields.map((f) => f.name), rowCount: t.rowCount ?? null, command: t.command ?? null })
           } catch (e) { t.reject?.(e as Error) }
         }

@@ -20,9 +20,15 @@
     "bench:micro": "bun bench/micro.bench.ts",
     "bench:overhead": "bun bench/overhead.bench.ts",
     "bench:json": "bun bench/json-decode.bench.ts",
+    "bench:json-shape": "bun bench/json-shape.bench.ts",
     "demo:codegen": "bun codegen-demo.ts",
     "bench:decode-vs": "bun bench/decode-vs.bench.ts",
     "bench:parity": "bun bench/decode-parity.ts",
+    "bench:mapper": "bun bench/mapper.bench.ts",
+    "bench:float": "bun bench/float-decode.bench.ts",
+    "bench:temporal": "bun bench/temporal-decode.bench.ts",
+    "bench:binary": "bun bench/binary-vs-text.bench.ts",
+    "bench:pertype": "bun bench/per-type-decode.bench.ts",
     "bench:chunks": "bun bench/chunks.bench.ts"
   },
   "devDependencies": {
