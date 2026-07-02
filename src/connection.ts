@@ -26,6 +26,7 @@ export interface NormalizedConfig {
   host: string; port: number; user: string; password: string; database: string
   ssl: Exclude<NonNullable<ConnectConfig['ssl']>, 'disable'> // 'disable' normalized to false
   applicationName: string; connectTimeout: number; decoders: Map<number, Decoder>
+  prepare: boolean // false -> never use server-side named prepared statements (transaction-pooler safe)
   reconnect: { enabled: boolean; base: number; max: number; maxRetries: number | null }
   socket?: () => Duplex | Promise<Duplex>
   path?: string
@@ -33,6 +34,15 @@ export interface NormalizedConfig {
 }
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms))
+
+// Detect a transaction-mode pooler (where server-side NAMED prepared statements are unsafe — a Parse on
+// one backend may not exist on the next Bind). Used only to DEFAULT `prepare` off; explicit config wins.
+function transactionPoolerDetected(host: string, port: number): boolean {
+  if (host.includes('-pooler.')) return true                              // Neon PgBouncer pooled endpoint
+  if (host.includes('pooler.supabase.com') || port === 6543) return true  // Supabase Supavisor transaction pooler
+  if (process.env.VERCEL || process.env.VERCEL_ENV) return true           // Vercel serverless: connections are ~always pooled
+  return false
+}
 // Errors that won't fix themselves on retry (bad auth/config) — stop reconnecting.
 function isFatalAuth(err: unknown): boolean {
   const code = (err as { code?: string } | null)?.code
@@ -146,15 +156,18 @@ export class Connection {
 
   constructor(config: ConnectConfig = {}) {
     const user = config.user || process.env.PGUSER || defaultUser()
+    const host = config.host || process.env.PGHOST || 'localhost'
+    const port = config.port || Number(process.env.PGPORT) || 5432
     this.cfg = {
-      host: config.host || process.env.PGHOST || 'localhost',
-      port: config.port || Number(process.env.PGPORT) || 5432,
+      host,
+      port,
       user,
       password: config.password ?? process.env.PGPASSWORD ?? '',
       database: config.database || process.env.PGDATABASE || user,
       ssl: config.ssl && config.ssl !== 'disable' ? config.ssl : false, // 'disable'/falsy -> no TLS
       applicationName: config.applicationName || 'minipg',
       connectTimeout: config.connectTimeout ?? 30000,
+      prepare: config.prepare ?? !transactionPoolerDetected(host, port), // explicit wins; else off behind a pooler
       decoders: buildDecoders(config.types, config.jsonBigints),
       reconnect: ((rc) => {
         const o = rc && typeof rc === 'object' ? rc : {}
@@ -513,6 +526,7 @@ export class Connection {
         if (!e) { e = { name: '_c' + (this.chunkSeq++), sql: buildChunkSql(sql) }; this.chunkCache.set(sql, e) }
         text = e.sql; name = e.name
       }
+      if (!this.cfg.prepare) name = undefined // pooler-safe: never a server-side named prepared statement
       const task: Task = { sql: text, params, name, mode: opts.mode ?? 'array', rows: [], resolve, reject, timeout: opts.timeout, signal: opts.signal }
       this.beginPerf(task, params, !!opts.metrics)
       if (this.armSignal(task)) return

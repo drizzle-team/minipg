@@ -52,6 +52,12 @@ export interface ConnectConfig {
    *  native JSON source-text reviver. Order-independent (works for jsonb). For a known
    *  shape, Json()/JsonArray() is faster — this is the zero-declaration safety net. */
   jsonBigints?: 'number' | 'string' | 'bigint'
+  /** Use server-side NAMED prepared statements for `{ name }` queries and the reused-chunks builder.
+   *  Set `false` behind a transaction-mode pooler (PgBouncer/Supavisor) where a named statement prepared
+   *  on one backend may not exist on the next — every query then goes unnamed (Parse+Bind+Execute).
+   *  Default: auto — off when a pooler is detected (Neon `-pooler` host, Supabase `pooler.supabase.com`
+   *  / port 6543, or the Vercel serverless runtime), on otherwise. Explicit value always wins. */
+  prepare?: boolean
   /** Auto-reconnect this connection after an unexpected drop (default off). Object
    *  tunes backoff (baseMs/maxMs) and maxRetries (null/omitted = retry forever). */
   reconnect?: boolean | { baseMs?: number; maxMs?: number; maxRetries?: number }
