@@ -9,6 +9,8 @@ import type { ConnectConfig, Decoder, Field, QueryOptions, QueryResult, ResultMo
 import type { CodegenCol } from './decode2.ts'
 import { buildMapperFactory, type RowMapper, type RowMapperFactory } from './mapper.ts'
 import { resolveUrl } from './url.ts'
+import { shapeCols, type ShapeSpec, type ShapeOf } from './spec.ts'
+import type { ShapeMapper } from './shape.ts'
 import type { Plugin, QueryInfo, QueryMetrics } from './plugin.ts'
 
 type ConnState = 'idle' | 'connecting' | 'ready' | 'reconnecting' | 'closed'
@@ -336,7 +338,9 @@ export class Connection {
   // Serves BOTH the standard path (cols from RowDescription fields) and queryTyped (cols from caller).
   private getMapper(cols: CodegenCol[], mode: ResultMode): RowMapper | undefined {
     if (mode !== 'array' && mode !== 'object') return undefined
-    const key = mode + '|' + cols.map((c) => `${c.name}:${c.oid}:${c.format ?? 't'}:${c.js ?? ''}:${c.json ? 'j' : ''}`).join(',')
+    // NB: encode the whole json marker (its declared shape), not just "has json" — two shapes that differ
+    // only inside a Json()/JsonArray() must get different mappers, else the first one is wrongly reused.
+    const key = mode + '|' + cols.map((c) => `${c.name}:${c.oid}:${c.format ?? 't'}:${c.js ?? ''}:${c.json ? JSON.stringify(c.json) : ''}`).join(',')
     let m = this.mapperCache.get(key)
     if (!m) { m = this.mapperFactory(cols, mode, this.cfg.decoders); this.mapperCache.set(key, m) }
     return m
@@ -514,8 +518,11 @@ export class Connection {
   }
 
   // ---- public query API ----
-  query(sql: string | readonly string[], params?: unknown[], opts?: { name?: string; mode?: 'array'; metrics?: boolean; timeout?: number; signal?: AbortSignal }): Promise<QueryResult<unknown[]>>
-  query(sql: string | readonly string[], params: unknown[], opts: { name?: string; mode: 'object'; metrics?: boolean; timeout?: number; signal?: AbortSignal }): Promise<QueryResult<Record<string, unknown>>>
+  // a shape (without an explicit non-object mode) decodes to objects — matches the runtime default.
+  // generic over the shape's column names so editors autocomplete each value to the known type list.
+  query<K extends string>(sql: string | readonly string[], params: unknown[], opts: { shape: ShapeOf<K> | ShapeMapper; mode?: 'object'; name?: string; metrics?: boolean; timeout?: number; signal?: AbortSignal }): Promise<QueryResult<Record<string, unknown>>>
+  query(sql: string | readonly string[], params?: unknown[], opts?: { name?: string; mode?: 'array'; metrics?: boolean; timeout?: number; signal?: AbortSignal; shape?: ShapeSpec | ShapeMapper }): Promise<QueryResult<unknown[]>>
+  query(sql: string | readonly string[], params: unknown[], opts: { name?: string; mode: 'object'; metrics?: boolean; timeout?: number; signal?: AbortSignal; shape?: ShapeSpec | ShapeMapper }): Promise<QueryResult<Record<string, unknown>>>
   query(sql: string | readonly string[], params: unknown[], opts: { name?: string; mode: 'buffer'; metrics?: boolean; timeout?: number; signal?: AbortSignal }): Promise<QueryResult<(Buffer | null)[]>>
   query(sql: string | readonly string[], params: unknown[], opts: { name?: string; mode: 'raw'; metrics?: boolean; timeout?: number; signal?: AbortSignal }): Promise<QueryResult<Buffer>>
   query(sql: string | readonly string[], params: unknown[] = [], opts: QueryOptions = {}): Promise<QueryResult<never>> {
@@ -529,7 +536,16 @@ export class Connection {
         text = e.sql; name = e.name
       }
       if (!this.cfg.prepare) name = undefined // pooler-safe: never a server-side named prepared statement
-      const task: Task = { sql: text, params, name, mode: opts.mode ?? 'array', rows: [], resolve, reject, timeout: opts.timeout, signal: opts.signal }
+      const mode = opts.mode ?? (opts.shape ? 'object' : 'array') // a shape implies named columns -> object
+      const task: Task = { sql: text, params, name, mode, rows: [], resolve, reject, timeout: opts.timeout, signal: opts.signal }
+      if (opts.shape) {
+        // declared column shape: decode with the SAME cached jit/interpreted mapper as any query, and
+        // request binary wire format for any column marked format:'binary'. (mode is array|object here.)
+        const cols = typeof opts.shape === 'function' ? (opts.shape.$cols as CodegenCol[]) : shapeCols(opts.shape)
+        task.mapper = this.getMapper(cols, mode)
+        task.resultFormat = cols.map((c) => (c.format === 'binary' ? 1 : 0))
+        task._typed = true
+      }
       this.beginPerf(task, params, !!opts.metrics)
       if (this.armSignal(task)) return
       this.queue.push(task)

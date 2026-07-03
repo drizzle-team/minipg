@@ -78,6 +78,49 @@ ${lines.join('\n')}
   return new Function(`return (${src})`)() as (cells: Buffer[]) => unknown[]
 }
 
+// Same idea, but each cell is a JSON ARRAY of objects (json_agg style). The object parse is inlined INTO
+// the array loop — no per-element function call. Returns `(cells) => (row[])[]` (one array per cell).
+function compileArrayShape(shape: Shape): (cells: Buffer[]) => unknown[] {
+  const skipWs = 'while (p < e && (b[p] === 32 || b[p] === 9 || b[p] === 10 || b[p] === 13)) p++;'
+  const skipKey = "p++; while (p < e) { const c = b[p]; if (c === 92) { p += 2; continue } if (c === 34) { p++; break } p++ }"
+  const obj: string[] = []
+  shape.forEach(([, t], i) => {
+    obj.push(`        ${skipWs} ${skipKey} ${skipWs} p++; ${skipWs}   // "key":`)
+    obj.push(`        ${readSnippet(t, 'v' + i)};`)
+    obj.push(`        ${skipWs} if (b[p] === 44) p++;`)
+  })
+  const ret = '{ ' + shape.map(([k], i) => (k === '__proto__' ? `["__proto__"]: v${i}` : `${JSON.stringify(k)}: v${i}`)).join(', ') + ' }'
+  const decl = shape.map((_, i) => `v${i} = null`).join(', ')
+  const src = `function rows(arr) {
+  "use strict";
+  const n = arr.length, res = new Array(n);
+  for (let i = 0; i < n; i++) {
+    const b = arr[i]; let p = 0; const e = b.length;
+    ${skipWs}
+    if (b[p] === 110) { res[i] = null; continue }   // top-level JSON null
+    p++;                                            // '['
+    const out = [];
+    ${skipWs}
+    if (b[p] === 93) { res[i] = out; continue }     // '[]'
+    while (p < e) {
+      ${skipWs} p++;                                // '{'
+      let ${decl};
+${obj.join('\n')}
+      while (p < e && b[p] !== 125) p++; p++;       // past this object's '}'
+      out.push(${ret});
+      ${skipWs}
+      if (b[p] === 44) { p++; continue }            // ',' -> next element
+      if (b[p] === 93) { p++; break }               // ']' -> done
+      break;
+    }
+    res[i] = out;
+  }
+  return res;
+}`
+  if (process.env.SHAPE_DEBUG) console.error('\n' + src + '\n')
+  return new Function(`return (${src})`)() as (cells: Buffer[]) => unknown[]
+}
+
 // ---------------------------------------------------------------------------------------------
 // Baselines that operate on the same cell buffers.
 const jpUtf8 = (c: Buffer[]) => { const o = new Array(c.length); for (let i = 0; i < c.length; i++) o[i] = JSON.parse(c[i]!.toString('utf8')); return o } // readString(utf8) + JSON.parse
@@ -152,6 +195,30 @@ for (const s of SCENARIOS) {
       })
     })
   }
+}
+
+// -------- array-of-objects (json_agg style): each cell is [ {6 fields}, {6 fields}, ... ] --------
+const ARR_SHAPE: Shape = [['id', 'int'], ['name', 'str'], ['active', 'bool'], ['price', 'num'], ['seats', 'int'], ['ts', 'str']]
+const arrObj = (i: number) => `{"id":${i},"name":"acct ${i}","active":${i % 3 === 0},"price":${(i % 1000) + 0.99},"seats":${i % 64},"ts":"2024-01-01T00:00:0${i % 10}Z"}`
+const arrCell = (count: number) => (i: number) => '[' + Array.from({ length: count }, (_, j) => arrObj(i * count + j)).join(',') + ']'
+const arrScanner = compileArrayShape(ARR_SHAPE)
+
+console.log('\narray-of-objects parity (scanner vs JSON.parse):')
+{
+  const cells = Array.from({ length: 3 }, (_, i) => Buffer.from(arrCell(4)(i), 'utf8'))
+  const ok = JSON.stringify(arrScanner(cells)) === JSON.stringify(cells.map((c) => JSON.parse(c.toString('utf8'))))
+  console.log(`  ${ok ? 'OK' : 'MISMATCH'}  (4 objects/cell)`)
+  if (!ok) throw new Error('array parity failed')
+}
+
+for (const count of [1, 3, 10, 50]) {
+  const cells = Array.from({ length: 100 }, (_, i) => Buffer.from(arrCell(count)(i), 'utf8'))
+  group(`array · ${count} object(s)/cell · 100 cells · 6-field objects`, () => {
+    summary(() => {
+      bench('JSON.parse per cell', () => do_not_optimize(cells.map((c) => JSON.parse(c.toString('utf8'))))).gc('inner')
+      bench('shaped array scanner (inlined, one pass)', () => do_not_optimize(arrScanner(cells))).gc('inner')
+    })
+  })
 }
 
 await run()

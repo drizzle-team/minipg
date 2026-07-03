@@ -1,6 +1,8 @@
 import type * as tls from 'node:tls'
 import type { Duplex } from 'node:stream'
 import type { Plugin, QueryMetrics } from './plugin.ts'
+import type { ShapeSpec } from './spec.ts'
+import type { ShapeMapper } from './shape.ts'
 
 /** Row-shape of a query result. */
 export type ResultMode = 'array' | 'object' | 'buffer' | 'raw'
@@ -77,6 +79,10 @@ export interface QueryOptions {
   /** Reuse a server-side prepared statement under this name (parse once, bind many). */
   name?: string
   mode?: ResultMode
+  /** Decode this query's result with a declared column shape (a `ShapeSpec` object, or a `Shape()` mapper —
+   *  its `$cols` are reused). Enables typed/binary decode via the same cached jit/interpreted mapper the
+   *  driver uses for every query; columns marked `format:'binary'` request the binary wire format. */
+  shape?: ShapeSpec | ShapeMapper
   /** Attach per-query timings/sizes to the result as `.metrics` (works with or without plugins). */
   metrics?: boolean
   /** Cancel the query (out-of-band CancelRequest) after this many milliseconds. */

@@ -63,7 +63,7 @@
     "test:unit": "bun test test/unit",
     "test:integration": "bun test test/integration",
     "test:cf": "vitest run --config test/cf/vitest.config.ts",
-    "test:query": "bun test test/integration/results.test.ts test/integration/types-core.test.ts test/integration/types-advanced.test.ts test/integration/types-temporal-json.test.ts test/integration/parameters.test.ts test/integration/query-protocol.test.ts test/integration/prepared-statements.test.ts test/integration/regression.test.ts",
+    "test:query": "bun test test/integration/results.test.ts test/integration/types-core.test.ts test/integration/types-advanced.test.ts test/integration/types-temporal-json.test.ts test/integration/parameters.test.ts test/integration/query-protocol.test.ts test/integration/prepared-statements.test.ts test/integration/regression.test.ts test/integration/query-shape.test.ts",
     "test:query:interp": "MINIPG_VARIANT=interpreted bun run test:query",
     "test:query:both": "bun run test:query && bun run test:query:interp",
     "test:smoke": "bun test/smoke.ts",
@@ -81,7 +81,8 @@
     "bench:binary": "bun bench/binary-vs-text.bench.ts",
     "bench:pertype": "bun bench/per-type-decode.bench.ts",
     "bench:chunks": "bun bench/chunks.bench.ts",
-    "bench:mapper-dispatch": "bun bench/mapper-dispatch.bench.ts"
+    "bench:mapper-dispatch": "bun bench/mapper-dispatch.bench.ts",
+    "bench:query-decode": "bun bench/query-decode.bench.ts"
   },
   "devDependencies": {
     "@cloudflare/vitest-pool-workers": "^0.5.2",

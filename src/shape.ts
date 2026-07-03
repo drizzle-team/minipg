@@ -13,21 +13,11 @@
 //   })
 //   user.$printMapper()              // prints the generated decoder
 //   const rows = user(dataRowBodies) // decode an array of DataRow bodies -> rows[]
-import { compileResultSet, type CodegenCol } from './codegen.ts'
-import { isJsonMarker, splitType, type JsonMarker } from './json.ts'
+import { compileResultSet, type CodegenCol } from './decode2.ts'
 import { buildDecoders } from './codec.ts'
+import { shapeCols, type ShapeSpec, type ShapeOf } from './spec.ts'
 
-// PG type alias -> OID (decode kind is chosen by the codegen, same as a live query).
-const TYPE_OID: Record<string, number> = {
-  int2: 21, smallint: 21, int4: 23, int: 23, integer: 23, serial: 23, oid: 26,
-  int8: 20, bigint: 20, float4: 700, real: 700, float8: 701, 'double precision': 701,
-  numeric: 1700, decimal: 1700, money: 790, bool: 16, boolean: 16,
-  text: 25, varchar: 1043, bpchar: 1042, char: 18, name: 19,
-  json: 114, jsonb: 3802, bytea: 17, uuid: 2950,
-  date: 1082, time: 1083, timestamp: 1114, timestamptz: 1184, interval: 1186,
-}
-
-export type ShapeSpec = Record<string, string | JsonMarker>
+export type { ShapeSpec }
 export interface ShapeMapper {
   /** Decode all DataRow bodies of a result set into rows (object or array per `mode`). */
   (rows: Buffer[]): unknown[]
@@ -41,15 +31,10 @@ export interface ShapeMapper {
   $printMapper(): void
 }
 
-/** Build a callable, codegen-compiled whole-result-set mapper from a declared shape. */
-export function Shape(spec: ShapeSpec, mode: 'object' | 'array' = 'object'): ShapeMapper {
-  const cols: CodegenCol[] = Object.entries(spec).map(([name, t]) => {
-    if (isJsonMarker(t)) return { name, oid: t.type === 'jsonb' ? 3802 : 114, json: t }
-    const { pg, js } = splitType(t)
-    const oid = TYPE_OID[pg.toLowerCase()]
-    if (oid === undefined) throw new Error(`Shape: unknown type ${JSON.stringify(pg)} for column "${name}" (known: ${Object.keys(TYPE_OID).join(', ')})`)
-    return { name, oid, js }
-  })
+/** Build a callable, codegen-compiled whole-result-set mapper from a declared shape.
+ *  Generic over the column names so editors autocomplete each value to the known type list. */
+export function Shape<K extends string>(spec: ShapeOf<K>, mode: 'object' | 'array' = 'object'): ShapeMapper {
+  const cols: CodegenCol[] = shapeCols(spec as ShapeSpec)
   const mapper = compileResultSet(cols, mode, buildDecoders())
   const fn = ((rows: Buffer[]) => mapper(rows)) as ShapeMapper
   Object.defineProperties(fn, {

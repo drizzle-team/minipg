@@ -11,7 +11,7 @@ const show = async (src: string) => console.log(colorize(await pretty(src))) // 
 
 // 1) Declare a shape, inspect its generated result-set mapper — pure library API.
 const user = Shape({
-  id: 'int4', name: 'text', active: 'bool', balance: 'numeric', date: "date:temporal",
+  id: 'int4', name: 'text', active: 'bool', balance: 'numeric', date: 'date',
   big: 'int8:number', meta: 'jsonb', avatar: 'bytea',
   subscriptions: JsonArray({ id: "int4",  })
 })

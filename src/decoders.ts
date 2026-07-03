@@ -6,6 +6,7 @@
 import type { Decoder } from './types.ts'
 import { decoderFor, defaultDecoders } from './codec.ts'
 import { ASCII_SAFE, INSTANT_OIDS, INT_OIDS, defaultJs, type CodegenCol, type Target } from './decode2.ts'
+import { specHasTemporal, buildTemporalWalk } from './json.ts'
 
 /** Decode a cell in place from (buffer, offset, length) — no per-cell subarray. */
 export type CellDecoder = (b: Buffer, o: number, l: number) => unknown
@@ -108,6 +109,7 @@ function pickText(oid: number, js?: Target): CellDecoder | null {
   switch (eff) {
     case 'number': return INT_OIDS.has(oid) ? txtInt : txtF64
     case 'string': return ASCII_SAFE.has(oid) ? txtLatin1 : txtUtf8
+    case 'latin1': return txtLatin1 // caller asserts ASCII/latin1 (e.g. email) -> skip the utf8 scan
     case 'bool': return txtBool
     case 'json': return txtJson
     case 'bytea': return txtBytea
@@ -118,8 +120,15 @@ function pickText(oid: number, js?: Target): CellDecoder | null {
 /** Resolve the CellDecoder for a column, mirroring decode2's dispatch exactly. */
 export function pickDecoder(col: CodegenCol, map: Map<number, Decoder>): CellDecoder {
   if (col.format === 'binary') return pickBinary(col.oid, col.js)
-  // shaped-JSON positional scanning is JIT-only; interpreted uses the map's json decoder (respects jsonBigints)
-  if (col.json) return wrap(decoderFor(col.oid, map))
+  if (col.json) {
+    // shaped json in the no-eval path: JSON.parse (respects jsonBigints via the map's json decoder), then
+    // a temporal post-parse walk to match the jit scanner's :epoch/:date output. Exact bigint/numeric
+    // precision beyond JSON.parse stays a jit-only / jsonBigints concern (documented).
+    const base = wrap(decoderFor(col.oid, map))
+    if (!specHasTemporal(col.json.spec)) return base
+    const walk = buildTemporalWalk(col.json)
+    return (b, o, l) => walk(base(b, o, l))
+  }
   // a custom (config.types) override always wins — decode2 routes these to its helper too
   if (map !== defaultDecoders) { const d = map.get(col.oid); if (d && d !== defaultDecoders.get(col.oid)) return wrap(d) }
   return pickText(col.oid, col.js) ?? wrap(decoderFor(col.oid, map))

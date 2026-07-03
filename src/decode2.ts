@@ -9,7 +9,7 @@
 // to the helper closure) stay UTF-8 so unicode is preserved.
 import type { Decoder } from './types.ts'
 import { decoderFor, defaultDecoders } from './codec.ts'
-import { genJsonParsers, JSON_RUNTIME, type JsonMarker, type JsonPlan, type JsTarget } from './json.ts'
+import { genJsonParsers, type JsonMarker, type JsonPlan, type JsTarget } from './json.ts'
 
 // decode2 extends the JS-target set with temporal INSTANT targets: 'date' -> JS Date, 'epoch' -> ms number.
 export type Target = JsTarget | 'date' | 'epoch'
@@ -132,6 +132,7 @@ function inlineSnippet(oid: number, v: string, js?: Target): [string, string] | 
       const ascii = ASCII_SAFE.has(oid)
       return [`${v} = ${(ascii ? lat : str)('o', 'o + l')}`, (js ? 'string :string' : 'string') + (ascii ? ' (latin1)' : '')]
     }
+    case 'latin1': return [`${v} = ${lat('o', 'o + l')}`, 'string :latin1'] // caller asserts ASCII/latin1 (e.g. email)
     case 'bool': return [`${v} = b[o] === 116`, 'bool']
     case 'json': return [`${v} = JSON.parse(${str('o', 'o + l')})`, 'json'] // JSON text may contain unicode -> utf8
     case 'bytea': return [`{ const s = ${lat('o', 'o + l')}; ${v} = s.charCodeAt(0) === 92 && s.charCodeAt(1) === 120 ? Buffer.from(s.slice(2), 'hex') : Buffer.from(s, 'utf8') }`, 'bytea (latin1)'] // hex text is ASCII
@@ -198,9 +199,10 @@ function customOidsOf(map: Map<number, Decoder>): Set<number> {
 function jsonPrep(cols: CodegenCol[]): { header: string; plan: Map<JsonMarker, JsonPlan> } {
   const markers = cols.filter((c) => c.json).map((c) => c.json!)
   if (!markers.length) return { header: '', plan: new Map() }
-  const { decls, plan } = genJsonParsers(markers)
-  const header = decls.length ? `\n${DEBUG ? '  // --- shaped JSON sub-parsers (positional) ---\n' : ''}${JSON_RUNTIME}\n${decls.join('\n')}\n` : ''
-  return { header, plan }
+  const { plan } = genJsonParsers(markers)
+  // the cursor (jb/jp/je) is declared block-locally at each column site (below), not once at function
+  // scope — block locals are register-allocated better by V8, worth it in the hot per-field loop.
+  return { header: '', plan }
 }
 
 function columnLines(out: string[], col: CodegenCol, i: number, ind: string, helperOids: number[], plan: Map<JsonMarker, JsonPlan>, custom: Set<number>): void {
@@ -219,7 +221,7 @@ function columnLines(out: string[], col: CodegenCol, i: number, ind: string, hel
     out.push(`${ind}${readLen} let ${v} = null;`)
     out.push(pl.fast
       ? `${ind}if (l !== -1) { ${v} = JSON.parse(${str('o', 'o + l')}); o += l }`
-      : `${ind}if (l !== -1) { jb = b; jp = o; je = o + l; ${v} = ${pl.call}; o += l }`)
+      : `${ind}if (l !== -1) { let jb = b, jp = o, je = o + l; ${pl.inline(v)} o += l }`)
     return
   }
   const inl = custom.has(col.oid) ? null : inlineSnippet(col.oid, v, col.js)
