@@ -32,11 +32,11 @@ const shaped = shapeCols({
   subscriptions: JsonArray({
     id: 'int8:number', user_id: 'int8:number', plan: 'text', status: 'text',
     price: 'numeric:number', seats: 'int4',
-    started_at: 'timestamptz:epoch', renews_at: 'timestamptz:epoch', canceled_at: 'timestamptz:epoch',
+    started_at: 'timestamptz:ms', renews_at: 'timestamptz:ms', canceled_at: 'timestamptz:ms',
   }),
 })
 
-// scanner WITHOUT :epoch (exact bigint/numeric, timestamps left as ISO strings) — isolates Date.parse cost
+// scanner WITHOUT :ms (exact bigint/numeric, timestamps left as ISO strings) — isolates Date.parse cost
 const shapedExact = shapeCols({
   id: 'int8', name: 'text',
   subscriptions: JsonArray({
@@ -57,9 +57,9 @@ const SW = 'while (p < e) { const w = b[p]; if (w === 32 || w === 9 || w === 10 
 const SK = 'p++; while (p < e) { const k = b[p]; if (k === 92) { p += 2; continue } if (k === 34) { p++; break } p++ }'
 const rNum = (v: string) => `if (b[p] === 110) { ${v} = null; p += 4 } else if (b[p] === 34) { p++; const s = p; while (p < e && b[p] !== 34) p++; ${v} = Number(b.utf8Slice(s, p)); p++ } else { const s = p; if (b[p] === 45) p++; while (p < e) { const c = b[p]; if ((c>=48&&c<=57)||c===46||c===43||c===45||c===101||c===69) p++; else break } ${v} = Number(b.latin1Slice(s, p)) }`
 const rStr = (v: string) => `if (b[p] === 110) { ${v} = null; p += 4 } else { p++; const s = p; let esc = false; while (p < e) { const c = b[p]; if (c === 92) { esc = true; p += 2; continue } if (c === 34) break; p++ } ${v} = esc ? JSON.parse(b.toString('utf8', s - 1, p + 1)) : b.utf8Slice(s, p); p++ }`
-// :epoch via Date.parse (allocates the ISO string first)
+// :ms via Date.parse (allocates the ISO string first)
 const rEpDate = (v: string) => `if (b[p] === 110) { ${v} = null; p += 4 } else { p++; const s = p; while (p < e && b[p] !== 34) p++; ${v} = Date.parse(b.utf8Slice(s, p)); p++ }`
-// :epoch via a fixed-format ISO byte parse (no string alloc, no Date.parse) — YYYY-MM-DDTHH:MM:SS[.fff][±HH:MM|Z]
+// :ms via a fixed-format ISO byte parse (no string alloc, no Date.parse) — YYYY-MM-DDTHH:MM:SS[.fff][±HH:MM|Z]
 const rEpFast = (v: string) => `if (b[p] === 110) { ${v} = null; p += 4 } else { p++;
   const Y=(b[p]-48)*1000+(b[p+1]-48)*100+(b[p+2]-48)*10+(b[p+3]-48), Mo=(b[p+5]-48)*10+(b[p+6]-48), D=(b[p+8]-48)*10+(b[p+9]-48);
   const H=(b[p+11]-48)*10+(b[p+12]-48), Mi=(b[p+14]-48)*10+(b[p+15]-48), S=(b[p+17]-48)*10+(b[p+18]-48);
@@ -106,8 +106,8 @@ function compileInline(rEp: (v: string) => string): (b: Buffer) => unknown {
 }
 // timestamps kept as STRINGS, read via latin1 (ISO is ASCII) — the ':latin1' target
 const rLat1 = (v: string) => `if (b[p] === 110) { ${v} = null; p += 4 } else { p++; const s = p; let esc = false; while (p < e) { const c = b[p]; if (c === 92) { esc = true; p += 2; continue } if (c === 34) break; p++ } ${v} = esc ? JSON.parse(b.toString('utf8', s - 1, p + 1)) : b.latin1Slice(s, p); p++ }`
-const inlineMapper = compileInline(rEpDate)   // inlined scanner, :epoch via Date.parse
-const inlineFast = compileInline(rEpFast)     // inlined scanner, :epoch via fixed-format byte parse
+const inlineMapper = compileInline(rEpDate)   // inlined scanner, :ms via Date.parse
+const inlineFast = compileInline(rEpFast)     // inlined scanner, :ms via fixed-format byte parse
 const inlineLat1 = compileInline(rLat1)       // inlined scanner, timestamps as latin1 STRINGS (same output as JSON.parse)
 
 // APPLES-TO-APPLES: JSON.parse doesn't return epochs — to match the shape's output you must ALSO visit
@@ -164,9 +164,9 @@ group('decode users+subscriptions (28 rows, LATERAL json_agg) — whole result',
     bench('interpreted (json via JSON.parse, lossy bigint, STRING ts)', () => { do_not_optimize(bodies.map(interp)) }).gc('inner')
     bench('jit (json via JSON.parse, lossy bigint, STRING ts)', () => { do_not_optimize(bodies.map(jit)) }).gc('inner')
     bench('jit + shape, exact bigint/numeric (scanner, string ts)', () => { do_not_optimize(bodies.map(shapeExact)) }).gc('inner')
-    bench('jit + shape + :epoch (scanner + Date.parse, function-call helpers)', () => { do_not_optimize(bodies.map(shape)) }).gc('inner')
-    bench('jit + shape + :epoch, INLINED scanner + Date.parse', () => { do_not_optimize(bodies.map(inlineMapper)) }).gc('inner')
-    bench('jit + shape + :epoch, INLINED scanner + fast ISO parse', () => { do_not_optimize(bodies.map(inlineFast)) }).gc('inner')
+    bench('jit + shape + :ms (scanner + Date.parse, function-call helpers)', () => { do_not_optimize(bodies.map(shape)) }).gc('inner')
+    bench('jit + shape + :ms, INLINED scanner + Date.parse', () => { do_not_optimize(bodies.map(inlineMapper)) }).gc('inner')
+    bench('jit + shape + :ms, INLINED scanner + fast ISO parse', () => { do_not_optimize(bodies.map(inlineFast)) }).gc('inner')
   })
 })
 await run()

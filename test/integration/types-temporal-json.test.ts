@@ -18,7 +18,7 @@ const objRow = (r: { rows: unknown[] }): Record<string, unknown> => r.rows[0] as
 describe('temporal decode — string passthrough (ISO/UTC session)', () => {
   let c: Connection
   beforeAll(async () => {
-    c = await testConnect()
+    c = await testConnect({ temporal: 'string' }) // this block pins the exact-text decode (now the opt-in)
     await c.query("SET datestyle = 'ISO, YMD'")
     await c.query("SET TIME ZONE 'UTC'")
     await c.query("SET intervalstyle = 'postgres'")
@@ -149,7 +149,7 @@ describe('timestamptz decode — instant preserved, session-zone controls text',
 
       // same instant regardless of textual offset
       expect(Date.parse(cell(utc) as string)).toBe(Date.parse(cell(ist) as string))
-    })
+    }, { temporal: 'string' })
   })
 
   test('the same timestamptz literal selected twice decodes identically', async () => {
@@ -158,11 +158,11 @@ describe('timestamptz decode — instant preserved, session-zone controls text',
       const a = await c.query("SELECT '2020-06-01 12:00:00+00'::timestamptz")
       const b = await c.query("SELECT '2020-06-01 12:00:00+00'::timestamptz")
       expect(cell(a)).toBe(cell(b))
-    })
+    }, { temporal: 'string' })
   })
 
   test('SET TIME ZONE on a pooled client affects subsequent timestamptz text', async () => {
-    const pool = testPool({ max: 1 })
+    const pool = testPool({ max: 1, temporal: 'string' })
     try {
       const { client, release } = await pool.connect()
       try {
@@ -188,7 +188,7 @@ describe('temporal param round-trips (Date / strings)', () => {
       const r = await c.query('SELECT ts FROM rt_ts WHERE id = 1')
       // stored text is the ISO calendar/wall-clock (timestamp drops the Z offset)
       expect(cell(r)).toBe('2020-06-01 13:45:00')
-    })
+    }, { temporal: 'string' })
   })
 
   test('JS Date round-trips through timestamptz preserving the instant under any session zone', async () => {
@@ -234,7 +234,7 @@ describe('temporal param round-trips (Date / strings)', () => {
       expect(Date.parse(cell(r) as string)).toBe(Date.parse('2020-01-01T00:00:00+05:00'))
       const r2 = await c.query('SELECT ts FROM so WHERE id = 2')
       expect(cell(r2) as string).toContain('.123')
-    })
+    }, { temporal: 'string' })
   })
 
   test('a bogus string bound as ::timestamptz yields a clean PgError, not an encoder crash', async () => {

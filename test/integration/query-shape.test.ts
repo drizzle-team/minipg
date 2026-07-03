@@ -66,13 +66,13 @@ describe('query({ shape }) — declared shape decode', () => {
   })
 })
 
-describe('temporal targets — :epoch / :date', () => {
+describe('temporal targets — :ms / :date', () => {
   const ISO = '2022-11-21T14:29:11.987Z'
 
-  test('top-level timestamptz:epoch -> number, :date -> Date (both mappers)', async () => {
+  test('top-level timestamptz:ms -> number, :date -> Date (both mappers)', async () => {
     const c = await conn()
     const sql = `select '2022-11-21 14:29:11.987+00'::timestamptz as ts`
-    const e = await c.query(sql, [], { shape: { ts: 'timestamptz:epoch' }, mode: 'object' })
+    const e = await c.query(sql, [], { shape: { ts: 'timestamptz:ms' }, mode: 'object' })
     expect((e.rows[0] as { ts: number }).ts).toBe(Date.parse(ISO))
     const d = await c.query(sql, [], { shape: { ts: 'timestamptz:date' }, mode: 'object' })
     const dt = (d.rows[0] as { ts: Date }).ts
@@ -80,38 +80,42 @@ describe('temporal targets — :epoch / :date', () => {
     expect(dt.toISOString()).toBe(ISO)
   })
 
-  test('json field :epoch re-parses the ISO string to epoch ms (both mappers — interpreted walks after JSON.parse)', async () => {
+  test('json field :ms re-parses the ISO string to epoch ms (both mappers — interpreted walks after JSON.parse)', async () => {
     const c = await conn()
     const sql = `select json_build_object('n', 1, 'ts', '2022-11-21T14:29:11.987+00:00'::timestamptz) as j`
-    const r = await c.query(sql, [], { shape: { j: Json({ n: 'int4', ts: 'timestamptz:epoch' }) }, mode: 'object' })
+    const r = await c.query(sql, [], { shape: { j: Json({ n: 'int4', ts: 'timestamptz:ms' }) }, mode: 'object' })
     expect((r.rows[0] as { j: { ts: unknown } }).j.ts).toBe(Date.parse(ISO)) // jit scanner OR interpreted post-parse walk
   })
 
-  test('json array over row_to_json(s.*): :epoch fields become numbers (both mappers)', async () => {
+  test('json array over row_to_json(s.*): :ms fields become numbers (both mappers)', async () => {
     const c = await conn()
     const sql = `select coalesce(json_agg(row_to_json(t)), '[]') as rows from (
       select 1::int4 as id, '2022-11-21T14:29:11.987+00:00'::timestamptz as ts) t`
-    const r = await c.query(sql, [], { shape: { rows: JsonArray({ id: 'int4', ts: 'timestamptz:epoch' }) }, mode: 'object' })
+    const r = await c.query(sql, [], { shape: { rows: JsonArray({ id: 'int4', ts: 'timestamptz:ms' }) }, mode: 'object' })
     expect((r.rows[0] as { rows: Array<{ ts: unknown }> }).rows[0]!.ts).toBe(Date.parse(ISO))
   })
 
   test('regression: two json shapes on one connection do not collide in the mapper cache', async () => {
     const c = await conn()
     const sql = `select json_build_object('ts', '2022-11-21T14:29:11.987+00:00'::timestamptz) as j`
-    const asStr = await c.query(sql, [], { shape: { j: Json({ ts: 'timestamptz' }) }, mode: 'object' })
-    const asEpoch = await c.query(sql, [], { shape: { j: Json({ ts: 'timestamptz:epoch' }) }, mode: 'object' })
-    expect(typeof (asStr.rows[0] as { j: { ts: unknown } }).j.ts).toBe('string')  // plain shape -> ISO string, not reused below
-    expect((asEpoch.rows[0] as { j: { ts: unknown } }).j.ts).toBe(Date.parse(ISO)) // :epoch shape -> number, in both mappers
+    const asStr = await c.query(sql, [], { shape: { j: Json({ ts: 'timestamptz:string' }) }, mode: 'object' })
+    const asEpoch = await c.query(sql, [], { shape: { j: Json({ ts: 'timestamptz:ms' }) }, mode: 'object' })
+    expect(typeof (asStr.rows[0] as { j: { ts: unknown } }).j.ts).toBe('string')  // :string shape -> ISO string, not reused below
+    expect((asEpoch.rows[0] as { j: { ts: unknown } }).j.ts).toBe(Date.parse(ISO)) // :ms shape -> number, in both mappers
   })
 })
 
 // Type-level checks (no runtime): the shape value union autocompletes + rejects typos.
 {
-  const ok: ShapeSpec = { a: 'int4', b: 'bigint:number', c: 'timestamptz:epoch', d: 'text:latin1', e: Json({ n: 'int8:number', ts: 'timestamptz:date' }) }
+  const ok: ShapeSpec = { a: 'int4', b: 'bigint:number', c: 'timestamptz:ms', d: 'text:latin1', e: 'timestamptz:string', f: Json({ n: 'int8:number', ts: 'timestamptz:date' }) }
   void ok
   // @ts-expect-error - 'bignt' is not a PG type alias
   const bad1: ShapeSpec = { a: 'bignt' }
-  // @ts-expect-error - ':temporal' is not a valid JS target (:number/:string only)
+  // @ts-expect-error - ':temporal' is not a valid JS target
   const bad2: ShapeSpec = { a: 'date:temporal' }
-  void bad1; void bad2
+  // @ts-expect-error - timestamptz has no :number target (use :ms for epoch ms)
+  const bad3: ShapeSpec = { a: 'timestamptz:number' }
+  // @ts-expect-error - timestamptz has no :latin1 target
+  const bad4: ShapeSpec = { a: 'timestamptz:latin1' }
+  void bad1; void bad2; void bad3; void bad4
 }

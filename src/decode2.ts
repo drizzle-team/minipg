@@ -11,8 +11,8 @@ import type { Decoder } from './types.ts'
 import { decoderFor, defaultDecoders } from './codec.ts'
 import { genJsonParsers, type JsonMarker, type JsonPlan, type JsTarget } from './json.ts'
 
-// decode2 extends the JS-target set with temporal INSTANT targets: 'date' -> JS Date, 'epoch' -> ms number.
-export type Target = JsTarget | 'date' | 'epoch'
+// decode2 extends the JS-target set with temporal INSTANT targets: 'date' -> JS Date, 'ms' -> ms number.
+export type Target = JsTarget | 'date' | 'ms'
 /** A column to decode: name + wire OID, optional JS-target override, shaped-JSON marker, and the WIRE
  *  format the value arrives in ('text' default, or 'binary' when the query requested binary for it). */
 export interface CodegenCol { name: string; oid: number; js?: Target; json?: JsonMarker; format?: 'text' | 'binary' }
@@ -80,13 +80,13 @@ const f64FromBytes = (v: string) => `{ let p = o; const e = o + l; const c0 = b[
       else { const r = eff >= 0 ? sig * P[eff] : sig / P[-eff]; ${v} = neg ? -r : r }
     } }`
 
-// OPT #3 — temporal INSTANT targets (opt-in via js 'date'/'epoch'). Default stays the exact string
+// OPT #3 — temporal INSTANT targets (opt-in via js 'date'/'ms'). Default stays the exact string
 // (fastest + lossless). date/timestamp/timestamptz can map to a JS Date or epoch-ms number; naive
 // (no-offset) values are treated as UTC, timestamptz applies its offset. Direct field parse from
 // bytes -> Date.UTC (2-4x faster than new Date(text) AND correct — new Date parses no-tz as LOCAL).
 // ms = first 3 fractional digits (micros truncated; Date is ms-only). Years < 100 / BC: use string.
 export const INSTANT_OIDS = new Set([1082, 1114, 1184]) // date, timestamp, timestamptz
-const tsFromBytes = (v: string, kind: 'date' | 'epoch') => `{ let p = o; const e = o + l;
+const tsFromBytes = (v: string, kind: 'date' | 'ms') => `{ let p = o; const e = o + l;
       let Y = 0; for (; p < e; p++) { const c = b[p]; if (c < 48 || c > 57) break; Y = Y * 10 + (c - 48) } p++;
       const Mo = (b[p] - 48) * 10 + (b[p + 1] - 48); p += 3;
       const D = (b[p] - 48) * 10 + (b[p + 1] - 48); p += 2;
@@ -119,9 +119,10 @@ export const INT_OIDS = new Set([20, 21, 23, 26]) // int8/int2/int4/oid — digi
 // Inline decode expression for a column. ASCII-safe types use latin1; unicode-capable ones utf8.
 // float4/float8 (and the numeric:number target) decode via the exact Clinger fast path (f64FromBytes).
 function inlineSnippet(oid: number, v: string, js?: Target): [string, string] | null {
-  if (js === 'date' || js === 'epoch') {
+  if (!js && INSTANT_OIDS.has(oid)) js = 'date' // date/timestamp/timestamptz default to a JS Date (:string/:ms override)
+  if (js === 'date' || js === 'ms') {
     if (INSTANT_OIDS.has(oid)) return [tsFromBytes(v, js), `temporal :${js}`]
-    js = 'string' // :date/:epoch on a non-instant type -> fall back to the exact string
+    js = 'string' // :date/:ms on a non-instant type -> fall back to the exact string
   }
   const eff = js ?? defaultJs(oid)
   switch (eff) {
@@ -162,13 +163,13 @@ function binarySnippet(oid: number, v: string, js?: Target): [string, string] | 
       : [`{ ${RD64}; const n = hi * 4294967296 + lo; ${v} = (n >= -9007199254740991 && n <= 9007199254740991) ? '' + n : b.readBigInt64BE(o).toString() }`, 'int8 bin string']
     case 700: return [`${v} = b.readFloatBE(o)`, 'float4 bin']
     case 701: return [`${v} = b.readDoubleBE(o)`, 'float8 bin (exact)']
-    case 1114: case 1184: { // timestamp/timestamptz: int64 µs since 2000-01-01 (no BigInt)
+    case 1114: case 1184: { // timestamp/timestamptz: int64 µs since 2000-01-01 (no BigInt). Default -> Date.
       const ms = `Math.floor((hi * 4294967296 + lo) / 1000) + ${PG_EPOCH_MS}`
-      return js === 'date' ? [`{ ${RD64}; ${v} = new Date(${ms}) }`, 'timestamp bin :date'] : [`{ ${RD64}; ${v} = ${ms} }`, 'timestamp bin :epoch']
+      return js === 'ms' ? [`{ ${RD64}; ${v} = ${ms} }`, 'timestamp bin :ms'] : [`{ ${RD64}; ${v} = new Date(${ms}) }`, 'timestamp bin :date']
     }
-    case 1082: { // date: int32 days since 2000-01-01
+    case 1082: { // date: int32 days since 2000-01-01. Default -> Date.
       const ms = `b.readInt32BE(o) * 86400000 + ${PG_EPOCH_MS}`
-      return js === 'date' ? [`${v} = new Date(${ms})`, 'date bin :date'] : [`${v} = ${ms}`, 'date bin :epoch']
+      return js === 'ms' ? [`${v} = ${ms}`, 'date bin :ms'] : [`${v} = new Date(${ms})`, 'date bin :date']
     }
     // NOTE: binary uuid must BUILD the 36-char string from 16 bytes, whereas TEXT ships it pre-formatted
     // (one slice) — so text uuid is ~3x (JSC) / ~7x (V8) faster. Request text for uuid strings; use binary

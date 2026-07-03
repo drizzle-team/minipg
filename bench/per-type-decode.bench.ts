@@ -26,8 +26,8 @@ const TYPES: Spec[] = [
   { label: 'float4', oid: 700, text: (i) => String(Math.fround(i * 1.5)), bin: (i) => wire.bin.float4(Math.fround(i * 1.5)) },
   { label: 'float8', oid: 701, text: (i) => String(i * 1.5 + 0.125), bin: (i) => wire.bin.float8(i * 1.5 + 0.125) },
   { label: 'uuid', oid: 2950, text: () => UUID, bin: () => wire.bin.uuid(UUID) },
-  { label: 'timestamptz:epoch', oid: 1184, js: 'epoch', text: (i) => iso(inst(i)), bin: (i) => wire.bin.timestamp(inst(i)) },
-  { label: 'date:epoch', oid: 1082, js: 'epoch', text: (i) => new Date(dinst(i)).toISOString().slice(0, 10), bin: (i) => wire.bin.date(dinst(i)) },
+  { label: 'timestamptz:ms', oid: 1184, js: 'ms', text: (i) => iso(inst(i)), bin: (i) => wire.bin.timestamp(inst(i)) },
+  { label: 'date:ms', oid: 1082, js: 'ms', text: (i) => new Date(dinst(i)).toISOString().slice(0, 10), bin: (i) => wire.bin.date(dinst(i)) },
   { label: 'bytea', oid: 17, text: () => '\\xdeadbeef', bin: () => wire.bin.bytea(Buffer.from('deadbeef', 'hex')) },
   { label: 'text', oid: 25, text: (i) => 'user_' + i, bin: (i) => wire.bin.text('user_' + i) },
 ]

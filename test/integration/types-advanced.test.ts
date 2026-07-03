@@ -519,8 +519,7 @@ describe('ALL-COMMON-TYPES round-trip matrix', () => {
     { sql: 'text', param: 'hello', eq: 'hello' },
     { sql: 'varchar', param: 'world', eq: 'world' },
     { sql: 'uuid', param: '00000000-0000-0000-0000-000000000001', eq: '00000000-0000-0000-0000-000000000001' },
-    { sql: 'date', param: '2020-01-02', eq: '2020-01-02' },
-    { sql: 'time', param: '12:34:56', eq: '12:34:56' },
+    { sql: 'time', param: '12:34:56', eq: '12:34:56' }, // date/timestamp default to Date now — asserted below
     { sql: 'interval', param: '1 day', eq: '1 day' },
   ]
   for (const tc of stringCases) {
@@ -530,10 +529,12 @@ describe('ALL-COMMON-TYPES round-trip matrix', () => {
     })
   }
 
-  test('timestamp / timestamptz return ISO-style strings (DateStyle ISO)', async () => {
-    const r = await c.query('select $1::timestamp as v', ['2020-01-02 03:04:05'])
-    expect(typeof cell0(r)).toBe('string')
-    expect(cell0(r) as string).toContain('2020-01-02')
+  test('date / timestamp / timestamptz default to a JS Date', async () => {
+    for (const t of ['date', 'timestamp', 'timestamptz']) {
+      const r = await c.query(`select $1::${t} as v`, ['2020-01-02 03:04:05'])
+      expect(cell0(r)).toBeInstanceOf(Date)
+      expect((cell0(r) as Date).toISOString()).toContain('2020-01-02')
+    }
   })
 
   test('NULL column for each representative type is strictly null, key present', async () => {

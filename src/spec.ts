@@ -2,7 +2,7 @@
 // JS-target override, or a Json()/Jsonb() marker) into the driver's column plan (CodegenCol[]). Kept
 // separate from shape.ts so the connection can resolve a `{ shape }` query option WITHOUT pulling in the
 // whole-result-set codegen used by the standalone Shape() helper. No node deps (imports only json/types).
-import { isJsonMarker, splitType, type JsonMarker, type JsTarget } from './json.ts'
+import { isJsonMarker, splitType, type JsonMarker } from './json.ts'
 import type { CodegenCol } from './decode2.ts'
 
 // PG type alias -> OID. `satisfies` (not a `: Record<…>` annotation) keeps the literal keys so PgType can
@@ -18,9 +18,20 @@ const TYPE_OID = {
 
 /** A known PG type alias (e.g. 'int4', 'bigint', 'timestamptz'). */
 export type PgType = keyof typeof TYPE_OID
-/** A column's type in a shape: a PG alias, optionally with a `:number`/`:string` JS-target override
- *  (e.g. `'bigint'` -> exact string, `'bigint:number'` -> JS number). Autocompletes to the known list. */
-export type TypeSpec = PgType | `${PgType}:${JsTarget}`
+// Per-type JS-target overrides (mirrors the runtime groups in json.ts). Every type also accepts `:string`
+// (its exact PG text). Temporal adds `:date` (default) / `:ms` (epoch number); precision adds `:number`;
+// text adds `:latin1`. So e.g. `timestamptz` offers date/ms/string — NOT :number/:latin1.
+type TemporalType = 'date' | 'timestamp' | 'timestamptz'
+type PrecisionType = 'int8' | 'bigint' | 'numeric' | 'decimal' | 'money'
+type TextType = 'text' | 'varchar' | 'bpchar' | 'char' | 'name'
+/** A column's type in a shape: a PG alias, plus the JS-target overrides valid for it (autocompletes to the
+ *  known list). e.g. `'bigint'` -> exact string, `'bigint:number'` -> JS number, `'timestamptz:ms'` -> epoch ms. */
+export type TypeSpec =
+  | PgType
+  | `${PgType}:string`
+  | `${TemporalType}:${'date' | 'ms'}`
+  | `${PrecisionType}:number`
+  | `${TextType}:latin1`
 /** A row shape: column name -> TypeSpec, or a Json()/Jsonb()/…Array() marker for a shaped json column. */
 export type ShapeSpec = Record<string, TypeSpec | JsonMarker>
 /** The same value type as ShapeSpec, but over KNOWN keys `K`. The public shape-taking functions use this

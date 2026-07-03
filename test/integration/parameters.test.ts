@@ -452,7 +452,7 @@ describe('type inference by server & explicit casts', () => {
   })
 
   test('typed-literal grammar DATE $1 / TIMESTAMP $1 is always 42601 (only $1::date works)', async () => {
-    const c = await testConnect()
+    const c = await testConnect({ temporal: 'string' })
     try {
       expect((await caught(() => c.query('select DATE $1', ['2020-01-01'])) as PgError).code).toBe('42601')
       expect((await caught(() => c.query('select TIMESTAMP $1', ['2020-01-01'])) as PgError).code).toBe('42601')

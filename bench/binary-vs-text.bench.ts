@@ -23,8 +23,8 @@ const cols = (format: 'text' | 'binary'): CodegenCol[] => [
   { name: 'a', oid: 701, format },
   { name: 'b', oid: 701, format },
   { name: 'big', oid: 20, format },
-  { name: 'ts', oid: 1184, format, js: 'epoch' },
-  { name: 'd', oid: 1082, format, js: 'epoch' },
+  { name: 'ts', oid: 1184, format, js: 'ms' },
+  { name: 'd', oid: 1082, format, js: 'ms' },
   { name: 'u', oid: 2950, format },
   { name: 'ok', oid: 16, format },
 ]

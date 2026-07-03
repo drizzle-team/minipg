@@ -29,8 +29,8 @@ const COLS: CodegenCol[] = [
   { name: 'f8', oid: 701, format: 'binary' },
   { name: 'big', oid: 20, format: 'binary' },              // -> exact string
   { name: 'amt', oid: 1700, format: 'text' },              // numeric stays text (no binary decoder)
-  { name: 'ts', oid: 1184, format: 'binary', js: 'epoch' },
-  { name: 'd', oid: 1082, format: 'binary', js: 'epoch' },
+  { name: 'ts', oid: 1184, format: 'binary', js: 'ms' },
+  { name: 'd', oid: 1082, format: 'binary', js: 'ms' },
   { name: 'u', oid: 2950, format: 'binary' },
   { name: 'by', oid: 17, format: 'binary' },
   { name: 'name', oid: 25, format: 'binary' },             // binary text == utf8 bytes
@@ -76,7 +76,7 @@ describe('binary result format from real PG -> queryTyped', () => {
 
   test('NULLs survive the binary path', async () => {
     const r = await c.queryTyped('select null::float8 as f, null::int8 as i, null::timestamptz as t', [],
-      [{ name: 'f', oid: 701, format: 'binary' }, { name: 'i', oid: 20, format: 'binary' }, { name: 't', oid: 1184, format: 'binary', js: 'epoch' }], { mode: 'object' })
+      [{ name: 'f', oid: 701, format: 'binary' }, { name: 'i', oid: 20, format: 'binary' }, { name: 't', oid: 1184, format: 'binary', js: 'ms' }], { mode: 'object' })
     expect(r.rows[0] as unknown).toEqual({ f: null, i: null, t: null })
   })
 

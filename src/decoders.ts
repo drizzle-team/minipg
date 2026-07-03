@@ -43,7 +43,7 @@ const txtF64: CellDecoder = (b, o, l) => {
   return neg ? -r : r
 }
 
-// temporal :date/:epoch (direct field parse -> Date.UTC; naive = UTC, tz applies offset; micros -> ms)
+// temporal :date/:ms (direct field parse -> Date.UTC; naive = UTC, tz applies offset; micros -> ms)
 function tsParse(b: Buffer, o: number, l: number): number {
   let p = o; const e = o + l
   let Y = 0; for (; p < e; p++) { const c = b[p]!; if (c < 48 || c > 57) break; Y = Y * 10 + (c - 48) } p++
@@ -93,8 +93,8 @@ function pickBinary(oid: number, js?: Target): CellDecoder {
     case 20: return js === 'number' ? binInt8Num : binInt8Str
     case 700: return binFloat4
     case 701: return binFloat8
-    case 1114: case 1184: return js === 'date' ? binTsDate : binTsEpoch
-    case 1082: return js === 'date' ? binDateDate : binDateEpoch
+    case 1114: case 1184: return js === 'ms' ? binTsEpoch : binTsDate // default -> Date
+    case 1082: return js === 'ms' ? binDateEpoch : binDateDate
     case 2950: return binUuid
     case 17: return binBytea
     case 18: case 19: case 25: case 1042: case 1043: return binText
@@ -104,7 +104,8 @@ function pickBinary(oid: number, js?: Target): CellDecoder {
 
 // text strategy for an oid+target; null = "use the helper/map decoder" (uncommon/unknown types)
 function pickText(oid: number, js?: Target): CellDecoder | null {
-  if (js === 'date' || js === 'epoch') { if (INSTANT_OIDS.has(oid)) return js === 'date' ? tsDate : tsEpoch; js = 'string' }
+  if (!js && INSTANT_OIDS.has(oid)) js = 'date' // date/timestamp/timestamptz default to a JS Date (:string/:ms override)
+  if (js === 'date' || js === 'ms') { if (INSTANT_OIDS.has(oid)) return js === 'date' ? tsDate : tsEpoch; js = 'string' }
   const eff = js ?? defaultJs(oid)
   switch (eff) {
     case 'number': return INT_OIDS.has(oid) ? txtInt : txtF64
@@ -122,7 +123,7 @@ export function pickDecoder(col: CodegenCol, map: Map<number, Decoder>): CellDec
   if (col.format === 'binary') return pickBinary(col.oid, col.js)
   if (col.json) {
     // shaped json in the no-eval path: JSON.parse (respects jsonBigints via the map's json decoder), then
-    // a temporal post-parse walk to match the jit scanner's :epoch/:date output. Exact bigint/numeric
+    // a temporal post-parse walk to match the jit scanner's :ms/:date output. Exact bigint/numeric
     // precision beyond JSON.parse stays a jit-only / jsonBigints concern (documented).
     const base = wrap(decoderFor(col.oid, map))
     if (!specHasTemporal(col.json.spec)) return base

@@ -50,6 +50,11 @@ export interface ConnectConfig {
    *  (fastest, needs eval — Node/Bun/Deno); 'interpreted' resolves per-column decoders and loops (no eval —
    *  CSP / Cloudflare Workers); 'auto' (default) uses jit where eval is available, else interpreted. */
   decode?: 'auto' | 'jit' | 'interpreted'
+  /** How date/timestamp/timestamptz columns decode by default: 'date' (default) = a JS Date (like
+   *  pg/postgres.js); 'string' = the exact PG text, lossless (keeps µs, BC eras, 5-digit years, and
+   *  infinity, none of which a JS Date can hold). Per-column `:string`/`:date`/`:ms` targets in a
+   *  shape/queryTyped always override this. Note: Date is millisecond-precision. */
+  temporal?: 'date' | 'string'
   /** Per-OID decoder overrides for the parsed ('array'/'object') modes. */
   types?: Record<number, Decoder>
   /** How to decode integers inside ANY json/jsonb value that exceed 2^53 (which plain

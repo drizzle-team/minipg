@@ -53,14 +53,14 @@ export function isJsonMarker(x: unknown): x is JsonMarker {
 //   date    -> Date object        epoch  -> epoch milliseconds (number)
 // date/epoch apply to timestamp/date/timestamptz: top-level columns parse the wire value; inside a shaped
 // json column they re-parse the ISO string PG serialized into the JSON (Date.parse / new Date).
-export type JsTarget = 'number' | 'string' | 'latin1' | 'date' | 'epoch'
+export type JsTarget = 'number' | 'string' | 'latin1' | 'date' | 'ms'
 /** Split a "<pgtype>" or "<pgtype>:number|string|latin1|date|epoch" spec into PG type + JS-target override. */
 export function splitType(s: string): { pg: string; js?: JsTarget } {
   const i = s.indexOf(':')
   if (i === -1) return { pg: s.trim() }
   const js = s.slice(i + 1).trim().toLowerCase()
-  if (js !== 'number' && js !== 'string' && js !== 'latin1' && js !== 'date' && js !== 'epoch') {
-    throw new Error(`unknown JS target ${JSON.stringify(js)} in ${JSON.stringify(s)} (use ':number', ':string', ':latin1', ':date' or ':epoch')`)
+  if (js !== 'number' && js !== 'string' && js !== 'latin1' && js !== 'date' && js !== 'ms') {
+    throw new Error(`unknown JS target ${JSON.stringify(js)} in ${JSON.stringify(s)} (use ':number', ':string', ':latin1', ':date' or ':ms')`)
   }
   return { pg: s.slice(0, i).trim(), js: js as JsTarget }
 }
@@ -87,25 +87,34 @@ function effJs(cat: ReturnType<typeof category>, js?: JsTarget): 'number' | 'str
   return 'string' // precision defaults to exact string; text stays string
 }
 
+// date/timestamp/timestamptz default to a JS Date (:string/:number opts out, :ms -> number). Returns
+// the temporal target for a field, or null if it isn't a temporal conversion.
+const TEMPORAL = new Set(['date', 'timestamp', 'timestamptz'])
+function temporalTarget(pg: string, js?: JsTarget): 'date' | 'ms' | null {
+  if (js === 'date' || js === 'ms') return js
+  if (!js && TEMPORAL.has(pg.toLowerCase().trim())) return 'date'
+  return null
+}
+
 /** True if anywhere in the shape there's a field whose exact value JSON.parse can't produce
  *  (a precision type left as string). A `:number` override opts out — Number is JSON.parse-safe. */
 export function specHasPrecision(spec: JsonSpec): boolean {
   for (const v of Object.values(spec)) {
     if (isJsonMarker(v)) { if (specHasPrecision(v.spec)) return true; continue }
     const { pg, js } = splitType(v)
-    if (js === 'date' || js === 'epoch') return true // temporal transform needs the positional scanner
+    if (temporalTarget(pg, js)) return true // temporal (default Date, or :date/:ms) needs the positional scanner
     if (PRECISION.has(pg.toLowerCase().trim()) && js !== 'number') return true
   }
   return false
 }
 
-/** True if the shape has any :epoch/:date field (recursively). The interpreted (no-eval) path decodes
+/** True if the shape has any :ms/:date field (recursively). The interpreted (no-eval) path decodes
  *  shaped json via JSON.parse, so only shapes that answer true need the temporal post-parse walk below. */
 export function specHasTemporal(spec: JsonSpec): boolean {
   for (const v of Object.values(spec)) {
     if (isJsonMarker(v)) { if (specHasTemporal(v.spec)) return true; continue }
-    const { js } = splitType(v)
-    if (js === 'epoch' || js === 'date') return true
+    const { pg, js } = splitType(v)
+    if (temporalTarget(pg, js)) return true
   }
   return false
 }
@@ -120,7 +129,7 @@ function isoEpoch(s: string): number {
   return Date.parse(s)
 }
 
-/** Build a recursive post-JSON.parse walk that converts the shape's :epoch/:date fields in place. The
+/** Build a recursive post-JSON.parse walk that converts the shape's :ms/:date fields in place. The
  *  interpreted path decodes shaped json with JSON.parse (temporal fields arrive as ISO strings), then
  *  applies this to match the jit scanner's output. Only temporal fields (and nested markers holding one)
  *  are visited; access is by key, so jsonb's sorted wire order is irrelevant. */
@@ -128,9 +137,10 @@ export function buildTemporalWalk(marker: JsonMarker): (v: unknown) => unknown {
   const fns: Array<[string, (x: unknown) => unknown]> = []
   for (const [key, field] of Object.entries(marker.spec)) {
     if (isJsonMarker(field)) { if (specHasTemporal(field.spec)) fns.push([key, buildTemporalWalk(field)]); continue }
-    const { js } = splitType(field)
-    if (js === 'epoch') fns.push([key, (x) => (typeof x === 'string' ? isoEpoch(x) : x)])
-    else if (js === 'date') fns.push([key, (x) => (typeof x === 'string' ? new Date(isoEpoch(x)) : x)])
+    const { pg, js } = splitType(field)
+    const tt = temporalTarget(pg, js)
+    if (tt === 'ms') fns.push([key, (x) => (typeof x === 'string' ? isoEpoch(x) : x)])
+    else if (tt === 'date') fns.push([key, (x) => (typeof x === 'string' ? new Date(isoEpoch(x)) : x)])
   }
   const walkObj = (o: Record<string, unknown>): Record<string, unknown> => {
     for (const [k, f] of fns) { const val = o[k]; if (val != null) o[k] = f(val) }
@@ -197,7 +207,8 @@ function inlineValue(field: string | JsonMarker, target: string, type: 'json' | 
     return inlineMarker(field, target, ctx) // recurse into the scanned object/array
   }
   const { pg, js } = splitType(field)
-  if (js === 'epoch' || js === 'date') return inlineEpoch(target, js, ctx)
+  const tt = temporalTarget(pg, js)
+  if (tt) return inlineEpoch(target, tt, ctx)
   switch (effJs(category(pg), js)) {
     case 'number': return `if (jb[jp] === 110) { ${target} = null; jp += 4 } else if (jb[jp] === 34) ${rdStrNum(target)} else ${rdNum(target)}`
     case 'bool': return `if (jb[jp] === 110) { ${target} = null; jp += 4 } else { ${target} = jb[jp] === 116; jp += ${target} ? 4 : 5 }`
@@ -206,9 +217,9 @@ function inlineValue(field: string | JsonMarker, target: string, type: 'json' | 
   }
 }
 
-// :epoch / :date — fast fixed-format ISO byte-parse (naive time = UTC, matching the wire temporal
+// :ms / :date — fast fixed-format ISO byte-parse (naive time = UTC, matching the wire temporal
 // convention), falling back to Date.parse for anything not matching YYYY-MM-DD[T ]HH:MM:SS[.f][±HH:MM|Z].
-function inlineEpoch(target: string, js: 'epoch' | 'date', ctx: { n: number }): string {
+function inlineEpoch(target: string, js: 'ms' | 'date', ctx: { n: number }): string {
   const id = ctx.n++, S = `_ss${id}`, E = `_se${id}`, P = `_ep${id}`
   return `if (jb[jp] === 110) { ${target} = null; jp += 4 } else { `
     + `jp++; const ${S} = jp; while (jp < je && jb[jp] !== 34) jp++; const ${E} = jp; jp++; let ${P}; `

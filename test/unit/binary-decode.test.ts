@@ -9,7 +9,7 @@ import { buildDecoders } from '../../src/codec.ts'
 import * as wire from '../helpers/wire.ts'
 
 const map = buildDecoders()
-const decodeBin = (oid: number, cell: Buffer, js?: 'number' | 'date' | 'epoch') => {
+const decodeBin = (oid: number, cell: Buffer, js?: 'number' | 'date' | 'ms') => {
   const col: CodegenCol = { name: 'c', oid, format: 'binary', ...(js ? { js } : {}) }
   return (compileRow([col], 'object', map)(wire.dataRow([cell])) as Record<string, unknown>).c
 }
@@ -32,15 +32,15 @@ describe('binary decode round-trips PG binary format', () => {
     for (const x of [3.141592653589793, -0.5, 1.5e300, 0.1, 0]) expect(decodeBin(701, wire.bin.float8(x))).toBe(x)
     expect(decodeBin(701, wire.bin.float8(NaN))).toBeNaN()
   })
-  test('timestamptz :epoch (ms) and :date', () => {
+  test('timestamptz :ms (ms) and :date', () => {
     const ms = Date.UTC(2021, 5, 2, 12, 34, 56, 789)
-    expect(decodeBin(1184, wire.bin.timestamp(ms), 'epoch')).toBe(ms)
+    expect(decodeBin(1184, wire.bin.timestamp(ms), 'ms')).toBe(ms)
     expect(decodeBin(1184, wire.bin.timestamp(ms), 'date')).toEqual(new Date(ms))
-    expect(decodeBin(1184, wire.bin.timestamp(ms))).toBe(ms) // default epoch ms
+    expect(decodeBin(1184, wire.bin.timestamp(ms))).toEqual(new Date(ms)) // default -> Date
   })
-  test('date :epoch and :date', () => {
+  test('date :ms and :date', () => {
     const ms = Date.UTC(2021, 5, 2)
-    expect(decodeBin(1082, wire.bin.date(ms), 'epoch')).toBe(ms)
+    expect(decodeBin(1082, wire.bin.date(ms), 'ms')).toBe(ms)
     expect(decodeBin(1082, wire.bin.date(ms), 'date')).toEqual(new Date(ms))
   })
   test('uuid', () => { const u = 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'; expect(decodeBin(2950, wire.bin.uuid(u))).toBe(u) })
@@ -59,7 +59,7 @@ describe('mixed text + binary columns in one row', () => {
       { name: 'id', oid: 23, format: 'binary' },
       { name: 'price', oid: 701, format: 'binary' },
       { name: 'big', oid: 20, format: 'binary' },
-      { name: 'at', oid: 1184, format: 'binary', js: 'epoch' },
+      { name: 'at', oid: 1184, format: 'binary', js: 'ms' },
       { name: 'amount', oid: 1700, format: 'text' }, // numeric stays text (exact string)
       { name: 'name', oid: 25, format: 'text' },
     ]

@@ -6,7 +6,7 @@ import { md5Password, scram, type Scram } from './auth.ts'
 import { buildDecoders, decoderFor, encodeParam } from './codec.ts'
 import { PgError, parseErrorFields } from './errors.ts'
 import type { ConnectConfig, Decoder, Field, QueryOptions, QueryResult, ResultMode, StreamOptions } from './types.ts'
-import type { CodegenCol } from './decode2.ts'
+import { INSTANT_OIDS, type CodegenCol } from './decode2.ts'
 import { buildMapperFactory, type RowMapper, type RowMapperFactory } from './mapper.ts'
 import { resolveUrl } from './url.ts'
 import { shapeCols, type ShapeSpec, type ShapeOf } from './spec.ts'
@@ -30,6 +30,7 @@ export interface NormalizedConfig {
   ssl: Exclude<NonNullable<ConnectConfig['ssl']>, 'disable'> // 'disable' normalized to false
   applicationName: string; connectTimeout: number; decoders: Map<number, Decoder>
   prepare: boolean // false -> never use server-side named prepared statements (transaction-pooler safe)
+  temporal: 'date' | 'string' // default decode for date/timestamp(tz) columns without an explicit target
   reconnect: { enabled: boolean; base: number; max: number; maxRetries: number | null }
   socket?: () => Duplex | Promise<Duplex>
   path?: string
@@ -172,6 +173,7 @@ export class Connection {
       applicationName: config.applicationName || 'minipg',
       connectTimeout: config.connectTimeout ?? 30000,
       prepare: config.prepare ?? !transactionPoolerDetected(host, port), // explicit wins; else off behind a pooler
+      temporal: config.temporal ?? 'date',
       decoders: buildDecoders(config.types, config.jsonBigints),
       reconnect: ((rc) => {
         const o = rc && typeof rc === 'object' ? rc : {}
@@ -338,6 +340,9 @@ export class Connection {
   // Serves BOTH the standard path (cols from RowDescription fields) and queryTyped (cols from caller).
   private getMapper(cols: CodegenCol[], mode: ResultMode): RowMapper | undefined {
     if (mode !== 'array' && mode !== 'object') return undefined
+    // temporal:'string' opts date/timestamp(tz) columns (no explicit target, not a shaped-json col) back
+    // to the exact-string decode — lossless for µs/BC/infinity that a JS Date can't represent.
+    if (this.cfg.temporal === 'string') cols = cols.map((c) => (!c.js && !c.json && INSTANT_OIDS.has(c.oid) ? { ...c, js: 'string' } : c))
     // NB: encode the whole json marker (its declared shape), not just "has json" — two shapes that differ
     // only inside a Json()/JsonArray() must get different mappers, else the first one is wrongly reused.
     const key = mode + '|' + cols.map((c) => `${c.name}:${c.oid}:${c.format ?? 't'}:${c.js ?? ''}:${c.json ? JSON.stringify(c.json) : ''}`).join(',')
