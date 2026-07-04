@@ -134,6 +134,8 @@ export interface QueryOptions {
   timeout?: number
   /** Cancel the query when this AbortSignal fires. */
   signal?: AbortSignal
+  /** Repropagate error to preserve link to original call stack */
+  trace?: boolean
 }
 
 export interface StreamOptions extends QueryOptions {

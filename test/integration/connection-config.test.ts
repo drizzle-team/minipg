@@ -367,3 +367,42 @@ describe('roadmap: not implemented in minipg (object-only config)', () => {
   test.todo('multi-host / target_session_attrs / DNS round-robin failover (roadmap)', () => {})
   test.todo('inject a custom Duplex stream / pre-connected socket (roadmap)', () => {})
 })
+
+// { trace } — run the query through an async wrapper so a rejection carries the awaiting caller's frames
+// (the raw reject comes from onData with no caller in its stack). See stack-explore.ts for the mechanism.
+describe('{ trace }: async wrapper surfaces the caller in the error stack', () => {
+  async function appQuery(c: Awaited<ReturnType<typeof connect>>) {
+    return await c.query('select bad syntax here', [], { trace: true }) // caller AWAITS -> gets linked
+  }
+  async function appQueryNoTrace(c: Awaited<ReturnType<typeof connect>>) {
+    return await c.query('select bad syntax here')
+  }
+
+  test('trace: true -> awaiting caller in the stack; PgError + code preserved; internal cause kept', async () => {
+    const c = await testConnect()
+    try {
+      const err = await caught(() => appQuery(c))
+      expect(err).toBeInstanceOf(PgError) // prototype preserved through the retrace copy
+      expect((err as PgError).code).toBe('42601')
+      expect((err as Error).stack).toContain('appQuery') // the caller is recovered
+      expect((err as Error).stack).toContain('--- driver internals ---') // where it raised, as a tail
+    } finally { await c.end() }
+  })
+
+  test('trace: false (default) -> internal stack only, caller absent', async () => {
+    const c = await testConnect()
+    try {
+      const err = await caught(() => appQueryNoTrace(c))
+      expect((err as PgError).code).toBe('42601')
+      expect((err as Error).stack).not.toContain('appQueryNoTrace')
+    } finally { await c.end() }
+  })
+
+  test('trace: true on a successful query is transparent (returns rows, no wrapping visible)', async () => {
+    const c = await testConnect()
+    try {
+      const r = await c.query('select 1 as n', [], { mode: 'object', trace: true })
+      expect((r.rows[0] as { n: number }).n).toBe(1)
+    } finally { await c.end() }
+  })
+})

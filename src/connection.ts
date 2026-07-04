@@ -203,6 +203,10 @@ export class Connection {
     Object.defineProperty(this.cfg, 'password', { value: this.cfg.password, enumerable: false, writable: true, configurable: true })
   }
 
+  private rejectTask(t: Task, err: Error): void {
+    if (t.stream) t.streamError?.(err); else t.reject?.(err)
+  }
+
   // ---- telemetry helpers (no-ops unless instrumented / metrics requested) ----
   private beginPerf(t: Task, params: unknown[], metrics: boolean | 'ms' | 'us' | undefined): void {
     if (!this.instrumented && !metrics) return
@@ -467,7 +471,7 @@ export class Connection {
       payload = w.slice()
       if (t.perf) t.perf.sent = payload.length
     } catch (e) {
-      if (t.stream) t.streamError?.(e as Error); else t.reject?.(e as Error)
+      this.rejectTask(t, e as Error)
       queueMicrotask(() => this.processQueue())
       return
     }
@@ -481,7 +485,7 @@ export class Connection {
   private armSignal(task: Task): boolean {
     const sig = task.signal
     if (!sig) return false
-    const settle = (r: Error) => { task.settled = true; if (task.stream) task.streamError?.(r); else task.reject?.(r) }
+    const settle = (r: Error) => { task.settled = true; this.rejectTask(task, r) }
     if (sig.aborted) { settle((sig.reason as Error) ?? Object.assign(new Error('query aborted'), { name: 'AbortError' })); return true }
     const onAbort = () => this.cancelTask(task, (sig.reason as Error) ?? Object.assign(new Error('query aborted'), { name: 'AbortError' }))
     sig.addEventListener('abort', onAbort, { once: true })
@@ -497,13 +501,13 @@ export class Connection {
     if (task.timer) clearTimeout(task.timer)
     if (this.current === task) {
       this.fireEnd(task, reason)
-      if (task.stream) task.streamError?.(reason); else task.reject?.(reason)
+      this.rejectTask(task, reason)
       this.sendCancelRequest()
       task.graceTimer = setTimeout(() => { try { this.socket?.destroy() } catch { /* */ } }, 5000) // dead-network fallback
     } else {
       const i = this.queue.indexOf(task); if (i >= 0) this.queue.splice(i, 1)
       task.signalCleanup?.()
-      if (task.stream) task.streamError?.(reason); else task.reject?.(reason)
+      this.rejectTask(task, reason)
     }
   }
 
@@ -531,7 +535,7 @@ export class Connection {
         // NOT inside a (now-aborted) transaction: the retry would only hit 25P02; surface the real 0A000.
         if (!t.settled && !t.stream && !t._typed && !this.inTransaction && (t._retries ?? 0) < 1) {
           t._retries = (t._retries ?? 0) + 1
-          ;(t._retryErrors ??= []).push(code)
+            ; (t._retryErrors ??= []).push(code)
           if (t.timer) clearTimeout(t.timer) // old timer cleared here; startTask re-arms a fresh one (else it leaks)
           if (t.graceTimer) clearTimeout(t.graceTimer)
           t.error = undefined; t.rows = []; t.command = undefined; t.rowCount = undefined; t.fields = undefined; t._debugCols = undefined; t._reused = undefined
@@ -545,7 +549,7 @@ export class Connection {
     if (t.graceTimer) clearTimeout(t.graceTimer)
     t.signalCleanup?.()
     if (!t.settled) { // a timed-out/aborted task was already settled by the caller
-      if (t.error) { if (t.debug) (t.error as PgError & { debug?: QueryDebug }).debug = this.buildDebug(t); this.fireEnd(t, t.error); if (t.stream) t.streamError?.(t.error); else t.reject?.(t.error) }
+      if (t.error) { if (t.debug) (t.error as PgError & { debug?: QueryDebug }).debug = this.buildDebug(t); this.fireEnd(t, t.error); this.rejectTask(t, t.error) }
       else if (t.stream) { this.fireEnd(t); t.streamEnd?.({ command: t.command, rowCount: t.rowCount }) }
       else {
         const m = this.fireEnd(t)
@@ -563,13 +567,13 @@ export class Connection {
   private settlePending(e: Error): void {
     // Prefer an informative server error already received for the in-flight query
     // (e.g. a FATAL 57P01 admin_shutdown that arrives just before the socket closes).
-    if (this.current) { const t = this.current; this.current = null; if (t.timer) clearTimeout(t.timer); if (t.graceTimer) clearTimeout(t.graceTimer); t.signalCleanup?.(); if (!t.settled) { const reason = t.error ?? e; this.fireEnd(t, reason); if (t.stream) t.streamError?.(reason); else t.reject?.(reason) } }
-    while (this.queue.length) { const t = this.queue.shift()!; t.signalCleanup?.(); if (!t.settled) { if (t.stream) t.streamError?.(e); else t.reject?.(e) } }
+    if (this.current) { const t = this.current; this.current = null; if (t.timer) clearTimeout(t.timer); if (t.graceTimer) clearTimeout(t.graceTimer); t.signalCleanup?.(); if (!t.settled) { const reason = t.error ?? e; this.fireEnd(t, reason); this.rejectTask(t, reason) } }
+    while (this.queue.length) { const t = this.queue.shift()!; t.signalCleanup?.(); if (!t.settled) { this.rejectTask(t, e) } }
   }
 
   // reject only the queued (not-yet-sent) tasks; the in-flight one is handled separately
   private rejectQueue(err: Error): void {
-    while (this.queue.length) { const t = this.queue.shift()!; if (t.stream) t.streamError?.(err); else t.reject?.(err) }
+    while (this.queue.length) { const t = this.queue.shift()!; this.rejectTask(t, err) }
   }
 
   // An establish attempt (initial connect or a reconnect try) failed.
@@ -592,7 +596,7 @@ export class Connection {
     const dead = this.socket; this.socket = null // claim the death; further events from `dead` are ignored
     try { dead?.destroy() } catch { /* */ }
     const t = this.current; this.current = null
-    if (t) { if (t.timer) clearTimeout(t.timer); if (t.graceTimer) clearTimeout(t.graceTimer); t.signalCleanup?.(); if (!t.settled) { const reason = t.error ?? err; this.fireEnd(t, reason); if (t.stream) t.streamError?.(reason); else t.reject?.(reason) } }
+    if (t) { if (t.timer) clearTimeout(t.timer); if (t.graceTimer) clearTimeout(t.graceTimer); t.signalCleanup?.(); if (!t.settled) { const reason = t.error ?? err; this.fireEnd(t, reason); this.rejectTask(t, reason) } }
     if (this.cfg.reconnect.enabled && !this.ended) {
       this.state = 'reconnecting'
       this.prepared.clear(); this.staleStatements.clear() // server-side prepared statements are gone after a drop/restart
@@ -621,12 +625,12 @@ export class Connection {
   // a shape (without an explicit non-object mode) decodes to objects — matches the runtime default.
   // generic over the shape's column names so editors autocomplete each value to the known type list.
   query<K extends string>(sql: string | readonly string[], params: unknown[], opts: { shape: ShapeOf<K> | ShapeMapper; mode?: 'object'; name?: string; metrics?: boolean | 'ms' | 'us'; debug?: boolean; timeout?: number; signal?: AbortSignal }): Promise<QueryResult<Record<string, unknown>>>
-  query(sql: string | readonly string[], params?: unknown[], opts?: { name?: string; mode?: 'array'; metrics?: boolean | 'ms' | 'us'; debug?: boolean; timeout?: number; signal?: AbortSignal; shape?: ShapeSpec | ShapeMapper; binary?: boolean }): Promise<QueryResult<unknown[]>>
-  query(sql: string | readonly string[], params: unknown[], opts: { name?: string; mode: 'object'; metrics?: boolean | 'ms' | 'us'; debug?: boolean; timeout?: number; signal?: AbortSignal; shape?: ShapeSpec | ShapeMapper; binary?: boolean }): Promise<QueryResult<Record<string, unknown>>>
-  query(sql: string | readonly string[], params: unknown[], opts: { name?: string; mode: 'buffer'; metrics?: boolean | 'ms' | 'us'; debug?: boolean; timeout?: number; signal?: AbortSignal; binary?: boolean }): Promise<QueryResult<(Buffer | null)[]>>
-  query(sql: string | readonly string[], params: unknown[], opts: { name?: string; mode: 'raw'; metrics?: boolean | 'ms' | 'us'; debug?: boolean; timeout?: number; signal?: AbortSignal; binary?: boolean }): Promise<QueryResult<Buffer>>
+  query(sql: string | readonly string[], params?: unknown[], opts?: { name?: string; mode?: 'array'; metrics?: boolean | 'ms' | 'us'; debug?: boolean; timeout?: number; signal?: AbortSignal; trace?: boolean; shape?: ShapeSpec | ShapeMapper; binary?: boolean }): Promise<QueryResult<unknown[]>>
+  query(sql: string | readonly string[], params: unknown[], opts: { name?: string; mode: 'object'; metrics?: boolean | 'ms' | 'us'; debug?: boolean; timeout?: number; signal?: AbortSignal; trace?: boolean; shape?: ShapeSpec | ShapeMapper; binary?: boolean }): Promise<QueryResult<Record<string, unknown>>>
+  query(sql: string | readonly string[], params: unknown[], opts: { name?: string; mode: 'buffer'; metrics?: boolean | 'ms' | 'us'; debug?: boolean; timeout?: number; signal?: AbortSignal; trace?: boolean; binary?: boolean }): Promise<QueryResult<(Buffer | null)[]>>
+  query(sql: string | readonly string[], params: unknown[], opts: { name?: string; mode: 'raw'; metrics?: boolean | 'ms' | 'us'; debug?: boolean; timeout?: number; signal?: AbortSignal; trace?: boolean; binary?: boolean }): Promise<QueryResult<Buffer>>
   query(sql: string | readonly string[], params: unknown[] = [], opts: QueryOptions = {}): Promise<QueryResult<never>> {
-    return new Promise<QueryResult<never>>((resolve, reject) => {
+    const p = new Promise<QueryResult<never>>((resolve, reject) => {
       if (this.state === 'closed') return reject(new Error('connection is closed'))
       let text: string, name = opts.name
       if (typeof sql === 'string') { text = sql } else {
@@ -656,14 +660,15 @@ export class Connection {
       this.queue.push(task)
       this.processQueue()
     })
+    return opts.trace ? this.retraced(p) : p
   }
 
   /** Run a query whose result columns are declared upfront (name + wire OID + per-column format/target).
    *  Requests the given wire formats from the server (binary for `format:'binary'` columns) and decodes
    *  with a typed mapper — enabling the binary result format for supported types without a Describe round
    *  trip. `columns` MUST match the SELECT's result columns (count + order). */
-  queryTyped(sql: string, params: unknown[], columns: CodegenCol[], opts: { mode?: 'array' | 'object'; metrics?: boolean | 'ms' | 'us'; timeout?: number; signal?: AbortSignal; debug?: boolean } = {}): Promise<QueryResult<never>> {
-    return new Promise<QueryResult<never>>((resolve, reject) => {
+  queryTyped(sql: string, params: unknown[], columns: CodegenCol[], opts: { mode?: 'array' | 'object'; metrics?: boolean | 'ms' | 'us'; timeout?: number; signal?: AbortSignal; debug?: boolean; trace?: boolean } = {}): Promise<QueryResult<never>> {
+    const p = new Promise<QueryResult<never>>((resolve, reject) => {
       if (this.state === 'closed') return reject(new Error('connection is closed'))
       const mode = opts.mode ?? 'object'
       const cols = this.resolveCols(columns)
@@ -677,6 +682,27 @@ export class Connection {
       this.queue.push(task)
       this.processQueue()
     })
+    return opts.trace ? this.retraced(p) : p
+  }
+
+  // `trace`: run the query promise through an async wrapper so a rejection is re-thrown as a fresh error born
+  // INSIDE the awaited chain — the runtime's async stack traces then splice in the caller's frames (a raw
+  // reject from onData/a timer can't carry them). One extra async hop per query; rebuilds the error only on
+  // failure. No built-in links an IO-callback rejection to its origin (verified: async stack traces cover only
+  // await/then; AsyncLocalStorage can't attribute a shared socket listener; console.createTask is DevTools-only
+  // and absent on Bun/Deno), so moving error creation into the await chain is the one portable way.
+  private async retraced<T>(p: Promise<T>): Promise<T> {
+    try { return await p }
+    catch (err) {
+      if (!(err instanceof Error))throw err
+      const fresh = new Error(err.message) // NEW error -> its stack is captured here, linked to the awaiting caller
+      Object.setPrototypeOf(fresh, Object.getPrototypeOf(err) as object) // preserve PgError/AbortError instanceof
+      Object.assign(fresh, err) // copy enumerable own props (code, severity, detail, debug, …); message/stack aren't enumerable
+      fresh.name = err.name
+      const inner = (err.stack ?? '').split('\n').slice(1).join('\n') // keep where it actually raised, as a tail
+      if (inner && fresh.stack) fresh.stack += '\n    --- driver internals ---\n' + inner
+      throw fresh
+    }
   }
 
   stream<Row = unknown[]>(sql: string, params: unknown[] = [], opts: StreamOptions = {}): AsyncIterableIterator<Row> {
