@@ -39,7 +39,8 @@ for (const t of TYPES) {
   const binBodies = wire.dataRows(Array.from({ length: N }, (_, i) => [t.bin(i)] as wire.Cell[]))
   const tMap = compileResultSet([tCol], 'object', map)
   const bMap = compileResultSet([bCol], 'object', map)
-  if (JSON.stringify(tMap(textBodies)) !== JSON.stringify(bMap(binBodies))) throw new Error(`parity mismatch: ${t.label}`)
+  const bj = (x: unknown) => JSON.stringify(x, (_, v) => (typeof v === 'bigint' ? v + 'n' : v)) // BigInt-safe
+  if (bj(tMap(textBodies)) !== bj(bMap(binBodies))) throw new Error(`parity mismatch: ${t.label}`)
   group(`${t.label} · ${N} rows`, () => {
     summary(() => {
       bench('text', () => do_not_optimize(tMap(textBodies))).gc('inner')

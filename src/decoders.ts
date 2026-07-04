@@ -6,7 +6,7 @@
 import type { Decoder } from './types.ts'
 import { decoderFor, defaultDecoders } from './codec.ts'
 import { ASCII_SAFE, INSTANT_OIDS, INT_OIDS, defaultJs, type CodegenCol, type Target } from './decode2.ts'
-import { specHasTemporal, buildTemporalWalk } from './json.ts'
+import { specNeedsWalk, buildJsonWalk } from './json.ts'
 
 /** Decode a cell in place from (buffer, offset, length) — no per-cell subarray. */
 export type CellDecoder = (b: Buffer, o: number, l: number) => unknown
@@ -25,6 +25,7 @@ const txtJson: CellDecoder = (b, o, l) => JSON.parse(utf8(b, o, l))
 const txtBytea: CellDecoder = (b, o, l) => { const s = lat1(b, o, l); return s.charCodeAt(0) === 92 && s.charCodeAt(1) === 120 ? Buffer.from(s.slice(2), 'hex') : Buffer.from(s, 'utf8') }
 // digit-parse straight from ASCII bytes -> JS number (int2/int4/oid, and int8/bigint:number)
 const txtInt: CellDecoder = (b, o, l) => { let p = o, s = false, x = 0; const e = o + l; if (b[o] === 45) { s = true; p++ } for (; p < e; p++) x = x * 10 + (b[p]! - 48); return s ? -x : x }
+const txtBigInt: CellDecoder = (b, o, l) => BigInt(lat1(b, o, l)) // int8/bigint -> exact JS BigInt
 
 // exact-fast Clinger ASCII -> f64 (bit-identical to Number for the fast domain; falls back to Number otherwise)
 const POW10 = [1, 10, 100, 1000, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9, 1e10, 1e11, 1e12, 1e13, 1e14, 1e15, 1e16, 1e17, 1e18, 1e19, 1e20, 1e21, 1e22]
@@ -42,6 +43,7 @@ const txtF64: CellDecoder = (b, o, l) => {
   const r = eff >= 0 ? sig * POW10[eff]! : sig / POW10[-eff]!
   return neg ? -r : r
 }
+const txtF4Precise: CellDecoder = (b, o, l) => Math.fround(txtF64(b, o, l) as number) // float4:precise -> exact stored f32
 
 // temporal :date/:ms (direct field parse -> Date.UTC; naive = UTC, tz applies offset; micros -> ms)
 function tsParse(b: Buffer, o: number, l: number): number {
@@ -58,7 +60,9 @@ function tsParse(b: Buffer, o: number, l: number): number {
     if (p < e && b[p] === 46) { p++; let f = 0, k = 0; for (; p < e && k < 3; p++) { const c = b[p]!; if (c < 48 || c > 57) break; f = f * 10 + (c - 48); k++ } while (k < 3) { f *= 10; k++ } ms = f; while (p < e) { const c = b[p]!; if (c < 48 || c > 57) break; p++ } }
     if (p < e && (b[p] === 43 || b[p] === 45)) { const sg = b[p] === 45 ? -1 : 1; p++; const th = (b[p]! - 48) * 10 + (b[p + 1]! - 48); p += 2; let tm = 0; if (p < e && b[p] === 58) { p++; tm = (b[p]! - 48) * 10 + (b[p + 1]! - 48); p += 2 } off = sg * (th * 60 + tm) * 60000 }
   }
-  return Date.UTC(Y, Mo - 1, D, H, Mi, S, ms) - off
+  let ems = Date.UTC(Y, Mo - 1, D, H, Mi, S, ms)
+  if (Y <= 99) { const d = new Date(ems); d.setUTCFullYear(Y); ems = d.getTime() } // Date.UTC remaps years 0-99 to 1900+Y; undo it BEFORE applying the tz offset
+  return ems - off
 }
 const tsDate: CellDecoder = (b, o, l) => new Date(tsParse(b, o, l))
 const tsEpoch: CellDecoder = (b, o, l) => tsParse(b, o, l)
@@ -74,6 +78,7 @@ const binFloat4: CellDecoder = (b, o) => b.readFloatBE(o)
 const binFloat8: CellDecoder = (b, o) => b.readDoubleBE(o)
 const binInt8Num: CellDecoder = (b, o) => rd64(b, o)
 const binInt8Str: CellDecoder = (b, o) => { const n = rd64(b, o); return n >= -9007199254740991 && n <= 9007199254740991 ? '' + n : b.readBigInt64BE(o).toString() }
+const binInt8BigInt: CellDecoder = (b, o) => b.readBigInt64BE(o)
 const binTsEpoch: CellDecoder = (b, o) => Math.floor(rd64(b, o) / 1000) + PG_EPOCH_MS
 const binTsDate: CellDecoder = (b, o) => new Date(Math.floor(rd64(b, o) / 1000) + PG_EPOCH_MS)
 const binDateEpoch: CellDecoder = (b, o) => b.readInt32BE(o) * 86400000 + PG_EPOCH_MS
@@ -90,7 +95,7 @@ function pickBinary(oid: number, js?: Target): CellDecoder {
     case 21: return binInt2
     case 23: return binInt4
     case 26: return binOid
-    case 20: return js === 'number' ? binInt8Num : binInt8Str
+    case 20: return js === 'number' ? binInt8Num : js === 'string' ? binInt8Str : binInt8BigInt // default -> BigInt
     case 700: return binFloat4
     case 701: return binFloat8
     case 1114: case 1184: return js === 'ms' ? binTsEpoch : binTsDate // default -> Date
@@ -106,6 +111,8 @@ function pickBinary(oid: number, js?: Target): CellDecoder {
 function pickText(oid: number, js?: Target): CellDecoder | null {
   if (!js && INSTANT_OIDS.has(oid)) js = 'date' // date/timestamp/timestamptz default to a JS Date (:string/:ms override)
   if (js === 'date' || js === 'ms') { if (INSTANT_OIDS.has(oid)) return js === 'date' ? tsDate : tsEpoch; js = 'string' }
+  if (js === 'bigint' || (!js && oid === 20)) return txtBigInt // int8/bigint default to a JS BigInt (:number/:string override)
+  if (oid === 700 && js !== 'string') { if (js === 'precise') return txtF4Precise; js = undefined } // float4: :precise -> fround; bare/:pretty -> Number (canonical)
   const eff = js ?? defaultJs(oid)
   switch (eff) {
     case 'number': return INT_OIDS.has(oid) ? txtInt : txtF64
@@ -126,8 +133,8 @@ export function pickDecoder(col: CodegenCol, map: Map<number, Decoder>): CellDec
     // a temporal post-parse walk to match the jit scanner's :ms/:date output. Exact bigint/numeric
     // precision beyond JSON.parse stays a jit-only / jsonBigints concern (documented).
     const base = wrap(decoderFor(col.oid, map))
-    if (!specHasTemporal(col.json.spec)) return base
-    const walk = buildTemporalWalk(col.json)
+    if (!specNeedsWalk(col.json.spec)) return base
+    const walk = buildJsonWalk(col.json)
     return (b, o, l) => walk(base(b, o, l))
   }
   // a custom (config.types) override always wins — decode2 routes these to its helper too

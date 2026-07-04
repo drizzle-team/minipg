@@ -5,8 +5,8 @@ import { W, Writer, writeParse, writeDescribe, writeBind, writeExecute, writeClo
 import { md5Password, scram, type Scram } from './auth.ts'
 import { buildDecoders, decoderFor, encodeParam } from './codec.ts'
 import { PgError, parseErrorFields } from './errors.ts'
-import type { ConnectConfig, Decoder, Field, QueryOptions, QueryResult, ResultMode, StreamOptions } from './types.ts'
-import { INSTANT_OIDS, type CodegenCol } from './decode2.ts'
+import type { ConnectConfig, Decoder, Field, QueryDebug, QueryOptions, QueryResult, ResultMode, StreamOptions } from './types.ts'
+import { INSTANT_OIDS, BINARY_FAST, type CodegenCol } from './decode2.ts'
 import { buildMapperFactory, type RowMapper, type RowMapperFactory } from './mapper.ts'
 import { resolveUrl } from './url.ts'
 import { shapeCols, type ShapeSpec, type ShapeOf } from './spec.ts'
@@ -31,6 +31,7 @@ export interface NormalizedConfig {
   applicationName: string; connectTimeout: number; decoders: Map<number, Decoder>
   prepare: boolean // false -> never use server-side named prepared statements (transaction-pooler safe)
   temporal: 'date' | 'string' // default decode for date/timestamp(tz) columns without an explicit target
+  reuseBinaryOids: Set<number> // BINARY_FAST minus config.types overrides: cols to upgrade to binary on prepared-statement reuse
   reconnect: { enabled: boolean; base: number; max: number; maxRetries: number | null }
   socket?: () => Duplex | Promise<Duplex>
   path?: string
@@ -66,6 +67,14 @@ interface Task {
   perf?: TaskPerf
   info?: QueryInfo
   wantMetrics?: boolean
+  metricsUnit?: 'ms' | 'us'
+  metricsRound?: boolean
+  debug?: boolean // { debug: true }: attach the resolved decode plan to the result
+  _debugCols?: CodegenCol[] // captured column plan (name/oid/format/js) for debug
+  _reused?: boolean // this execution reused a cached prepared statement (Parse skipped)
+  _retries?: number // transparent auto-retries performed (DDL-invalidated prepared statement)
+  _retryErrors?: string[] // SQLSTATE codes of the swallowed attempts
+  _repreparedSqlChanged?: boolean // the name was cached with DIFFERENT SQL -> old statement deallocated + re-Parsed
   _instrDone?: boolean // guard so onQueryEnd/Error fires exactly once across the settle paths
   fields?: Field[]
   mapper?: RowMapper
@@ -77,6 +86,7 @@ interface Task {
   _cacheName?: string
   resultFormat?: number | number[] // result-format code(s) for Bind (ORM binary flow)
   _typed?: boolean // builder came from a caller-supplied column plan — don't override from RowDescription
+  binary?: boolean // { binary: true }: force all columns binary; build the mapper binary from RowDescription OIDs
   timeout?: number
   signal?: AbortSignal
   timer?: ReturnType<typeof setTimeout>
@@ -140,6 +150,7 @@ export class Connection {
   private queue: Task[] = []
   private current: Task | null = null
   private prepared = new Map<string, { sql: string; fields: Field[] }>()
+  private staleStatements = new Set<string>() // names invalidated by DDL (0A000/26000) — Close before re-Parse
   private mapperCache = new Map<string, RowMapper>() // per-shape row mappers (standard + typed queries)
   private mapperFactory: RowMapperFactory            // interpreted or jit, chosen once from config.decode
   // query-builder fast path: a chunks array (tagged template / builder) has stable identity, so cache
@@ -175,6 +186,9 @@ export class Connection {
       prepare: config.prepare ?? !transactionPoolerDetected(host, port), // explicit wins; else off behind a pooler
       temporal: config.temporal ?? 'date',
       decoders: buildDecoders(config.types, config.jsonBigints),
+      // types to auto-upgrade to binary on prepared-statement reuse — the bench-fast set, minus any OID the
+      // user overrode via config.types (binary decode bypasses the text override, so leave those as text).
+      reuseBinaryOids: new Set([...BINARY_FAST].filter((oid) => !(config.types && oid in config.types))),
       reconnect: ((rc) => {
         const o = rc && typeof rc === 'object' ? rc : {}
         return { enabled: rc === true || (rc != null && typeof rc === 'object'), base: o.baseMs ?? 100, max: o.maxMs ?? 5000, maxRetries: o.maxRetries ?? null }
@@ -190,16 +204,18 @@ export class Connection {
   }
 
   // ---- telemetry helpers (no-ops unless instrumented / metrics requested) ----
-  private beginPerf(t: Task, params: unknown[], wantMetrics: boolean): void {
-    if (!this.instrumented && !wantMetrics) return
-    t.wantMetrics = wantMetrics
+  private beginPerf(t: Task, params: unknown[], metrics: boolean | 'ms' | 'us' | undefined): void {
+    if (!this.instrumented && !metrics) return
+    t.wantMetrics = !!metrics
+    t.metricsUnit = metrics === 'us' ? 'us' : 'ms'
+    t.metricsRound = metrics === 'ms' || metrics === 'us' // 'ms'/'us' -> integer; true -> keep sub-ms float
     t.perf = { t0: performance.now(), decodeMs: 0, sent: 0, recv: 0 }
     t.info = { sql: t.sql, statementName: t.name, paramCount: Array.isArray(params) ? params.length : 0, database: this.cfg.database, host: this.cfg.host, prepared: false }
   }
   private fireStart(t: Task): void {
     const p = t.perf; if (!p) return
     if (t.info) { t.info.backendPid = this.backendKey?.pid; }
-    if (this.instrumented) p.states = this.cfg.plugins.map((pl) => pl.onQueryStart?.(t.info!))
+    if (this.instrumented && p.states === undefined) p.states = this.cfg.plugins.map((pl) => pl.onQueryStart?.(t.info!)) // once, even across a retry
   }
   // Compute metrics + fire onQueryEnd/onQueryError exactly once. Returns the metrics (for result attach).
   private fireEnd(t: Task, err?: Error): QueryMetrics | undefined {
@@ -207,11 +223,16 @@ export class Connection {
     t._instrDone = true
     const end = performance.now()
     const start = p.tStart ?? p.t0, wrote = p.tWrite ?? start
+    // performance.now() is float ms, so 'us' MULTIPLIES by 1000 (no division anywhere); 'ms' rounds; true
+    // keeps the float. 1000/1e6 aren't powers of two, so there's no bit-shift shortcut — but none is needed.
+    const unit = t.metricsUnit ?? 'ms'
+    const c = t.metricsRound ? (unit === 'us' ? (x: number) => Math.round(x * 1000) : (x: number) => Math.round(x)) : (x: number) => x
     const m: QueryMetrics = {
-      queueWaitMs: start - p.t0, writeMs: wrote - start,
-      ttfbMs: p.tFirst !== undefined ? p.tFirst - wrote : 0,
-      downloadMs: p.tFirst !== undefined ? end - p.tFirst : 0,
-      decodeMs: p.decodeMs, totalMs: end - p.t0,
+      unit,
+      queueWait: c(start - p.t0), write: c(wrote - start),
+      ttfb: c(p.tFirst !== undefined ? p.tFirst - wrote : 0),
+      download: c(p.tFirst !== undefined ? end - p.tFirst : 0),
+      decode: c(p.decodeMs), total: c(end - p.t0),
       bytesSent: p.sent, bytesReceived: p.recv,
       rowCount: t.rowCount ?? (t.rows ? t.rows.length : null), columnCount: t.fields?.length ?? 0,
       command: t.command ?? null, ...(err ? { error: err } : {}),
@@ -293,7 +314,7 @@ export class Connection {
       // replies ErrorResponse); the trailing Sync guarantees a ReadyForQuery, since
       // the Sync we already sent was swallowed by copy-in mode.
       case 'G': case 'W': { try { this.socket?.write(Buffer.concat([W.copyFail('COPY is not supported by minipg'), W.sync()])) } catch { /* */ } return }
-      case 'T': if (this.current) { this.current.fields = parseRowDescription(body); if (!this.current._typed) this.current.mapper = this.getMapper(this.current.fields.map((f) => ({ name: f.name, oid: f.dataTypeOid })), this.current.mode); if (this.current._cacheName) this.prepared.set(this.current._cacheName, { sql: this.current.sql, fields: this.current.fields }) } return
+      case 'T': if (this.current) { this.current.fields = parseRowDescription(body); if (!this.current._typed) { const bin = this.current.binary; try { const cols = this.current.fields.map((f) => (bin ? { name: f.name, oid: f.dataTypeOid, format: 'binary' as const } : { name: f.name, oid: f.dataTypeOid })); this.assignMapper(this.current, cols) } catch (e) { this.current.error = e as Error } /* e.g. { binary: true } on a type with no binary decoder */ } if (this.current._cacheName) this.prepared.set(this.current._cacheName, { sql: this.current.sql, fields: this.current.fields }) } return
       case 'n': if (this.current) { this.current.fields = []; if (this.current._cacheName) this.prepared.set(this.current._cacheName, { sql: this.current.sql, fields: [] }) } return
       case 'D': return this.dataRow(body)
       case 'C': if (this.current) { const tag = firstCstr(body); this.current.command = tag.split(' ')[0]; const m = tag.match(/(\d+)\s*$/); this.current.rowCount = m ? parseInt(m[1]!, 10) : null } return
@@ -338,11 +359,41 @@ export class Connection {
 
   // Build (cached) the row mapper for a shape. array/object only; buffer/raw fall through to makeRow.
   // Serves BOTH the standard path (cols from RowDescription fields) and queryTyped (cols from caller).
+  // Normalize a shape/typed column plan against connection config before building the mapper AND choosing
+  // result formats (callers use this for both, so they agree). temporal:'string' forces date/timestamp(tz)
+  // columns with no explicit target to the exact-string TEXT decode — dropping any binary upgrade, since
+  // binary can't yield the PG text (lossless for µs/BC/infinity that a JS Date can't represent).
+  private resolveCols(cols: CodegenCol[]): CodegenCol[] {
+    if (this.cfg.temporal !== 'string') return cols
+    return cols.map((c) => (!c.js && !c.json && INSTANT_OIDS.has(c.oid) ? { ...c, js: 'string', format: 'text' } : c))
+  }
+
+  // Build + assign the row mapper for a task, capturing the resolved column plan when { debug: true }.
+  private assignMapper(t: Task, cols: CodegenCol[]): void {
+    t.mapper = this.getMapper(cols, t.mode)
+    if (t.debug) t._debugCols = cols
+  }
+
+  // Assemble the { debug: true } decode plan from what the task resolved to.
+  private buildDebug(t: Task): QueryDebug {
+    const src = (t.mapper as (RowMapper & { source?: string }) | undefined)?.source // compileRow attaches .source; interpreted has none
+    const cols = t._debugCols ?? (t.fields ?? []).map((f) => ({ name: f.name, oid: f.dataTypeOid } as CodegenCol))
+    return {
+      sql: t.sql, mode: t.mode, statementName: t.name, reusedPreparedStatement: !!t._reused,
+      ...(t._repreparedSqlChanged ? { repreparedSqlChanged: true } : {}),
+      decode: t.mapper ? (src ? 'jit' : 'interpreted') : 'none', // buffer/raw have no mapper
+      ...(src ? { mapperSource: src } : {}),
+      columns: cols.map((c) => ({
+        name: c.name, oid: c.oid, format: c.format === 'binary' ? 'binary' : 'text',
+        ...(c.js ? { js: c.js } : {}), ...(c.json ? { json: true } : {}),
+      })),
+      ...(t._retries ? { retries: t._retries, retriedErrors: t._retryErrors } : {}),
+    }
+  }
+
   private getMapper(cols: CodegenCol[], mode: ResultMode): RowMapper | undefined {
     if (mode !== 'array' && mode !== 'object') return undefined
-    // temporal:'string' opts date/timestamp(tz) columns (no explicit target, not a shaped-json col) back
-    // to the exact-string decode — lossless for µs/BC/infinity that a JS Date can't represent.
-    if (this.cfg.temporal === 'string') cols = cols.map((c) => (!c.js && !c.json && INSTANT_OIDS.has(c.oid) ? { ...c, js: 'string' } : c))
+    cols = this.resolveCols(cols)
     // NB: encode the whole json marker (its declared shape), not just "has json" — two shapes that differ
     // only inside a Json()/JsonArray() must get different mappers, else the first one is wrongly reused.
     const key = mode + '|' + cols.map((c) => `${c.name}:${c.oid}:${c.format ?? 't'}:${c.js ?? ''}:${c.json ? JSON.stringify(c.json) : ''}`).join(',')
@@ -384,11 +435,32 @@ export class Connection {
       w.reset()
       if (t.name) {
         const cached = this.prepared.get(t.name)
-        if (cached && cached.sql === t.sql) { reuse = true; t.fields = cached.fields; t.mapper = this.getMapper(cached.fields.map((f) => ({ name: f.name, oid: f.dataTypeOid })), t.mode) }
-        else if (cached) { writeClose(w, 'S', t.name); this.prepared.delete(t.name) }
+        if (cached && cached.sql === t.sql) {
+          reuse = true; t.fields = cached.fields
+          if (t._typed) {
+            // shape / queryTyped: the caller already chose per-column formats + mapper in query(); keep them.
+          } else if (t.binary) {
+            this.assignMapper(t, cached.fields.map((f) => ({ name: f.name, oid: f.dataTypeOid, format: 'binary' as const }))) // { binary: true }: all binary
+          } else if (t.mode === 'array' || t.mode === 'object') {
+            // Plain query (no shape), 2nd+ execution: the result OIDs are now known from the first roundtrip's
+            // RowDescription, so request BINARY for the bench-fast types (same decoded value as text, smaller +
+            // faster). The first execution went out text. resolveCols honors temporal:'string'.
+            const cols = this.resolveCols(cached.fields.map((f) => (this.cfg.reuseBinaryOids.has(f.dataTypeOid) ? { name: f.name, oid: f.dataTypeOid, format: 'binary' as const } : { name: f.name, oid: f.dataTypeOid })))
+            this.assignMapper(t, cols)
+            t.resultFormat = cols.map((c) => (c.format === 'binary' ? 1 : 0))
+          } else {
+            this.assignMapper(t, cached.fields.map((f) => ({ name: f.name, oid: f.dataTypeOid }))) // buffer/raw: text bytes
+          }
+        }
+        else if (cached) { writeClose(w, 'S', t.name); this.prepared.delete(t.name); t._repreparedSqlChanged = true } // same name, different SQL -> deallocate + re-Parse
       }
-      if (!reuse) { writeParse(w, name, t.sql); writeDescribe(w, 'S', name); if (t.name) t._cacheName = t.name }
-      if (t.info) t.info.prepared = reuse
+      if (!reuse) {
+        // a name invalidated by DDL still exists server-side (0A000) — deallocate it before re-Parsing, or
+        // the Parse errors 42P05 "already exists". Close of an absent statement (26000 case) is a harmless no-op.
+        if (t.name && this.staleStatements.has(t.name)) { writeClose(w, 'S', t.name); this.staleStatements.delete(t.name) }
+        writeParse(w, name, t.sql); writeDescribe(w, 'S', name); if (t.name) t._cacheName = t.name
+      }
+      t._reused = reuse; if (t.info) t.info.prepared = reuse
       writeBind(w, '', name, enc, t.resultFormat ?? 0); writeExecute(w, '', 0); writeSync(w)
       // Safe to hand the reusable slice to write(): one query is in flight at a time,
       // so the buffer isn't reset until ReadyForQuery (i.e. after the bytes flushed).
@@ -445,19 +517,42 @@ export class Connection {
 
   private finishTask(): void {
     const t = this.current; this.current = null
-    if (t) {
-      if (t.timer) clearTimeout(t.timer)
-      if (t.graceTimer) clearTimeout(t.graceTimer)
-      t.signalCleanup?.()
-      if (!t.settled) { // a timed-out/aborted task was already settled by the caller
-        if (t.error) { this.fireEnd(t, t.error); if (t.stream) t.streamError?.(t.error); else t.reject?.(t.error) }
-        else if (t.stream) { this.fireEnd(t); t.streamEnd?.({ command: t.command, rowCount: t.rowCount }) }
-        else {
-          const m = this.fireEnd(t)
-          const res: QueryResult<never> = { rows: t.rows as never[], columns: (t.fields ?? []).map((f) => f.name), rowCount: t.rowCount ?? null, command: t.command ?? null }
-          if (t.wantMetrics && m) res.metrics = m
-          t.resolve?.(res)
+    if (!t) { this.processQueue(); return }
+    // A prepared statement invalidated by DDL — 0A000 "cached plan must not change result type" or 26000
+    // "prepared statement does not exist" — is dropped from the cache and transparently RE-RUN once. Both
+    // are raised before execution (no rows affected), so the retry is side-effect-safe. It Close+re-Parses
+    // (staleStatements) and, for a plain query, goes back out TEXT since the new OIDs are unknown again.
+    if (t.name && t.error) {
+      const code = (t.error as PgError).code
+      if (code === '0A000' || code === '26000') {
+        this.prepared.delete(t.name); this.staleStatements.add(t.name)
+        // NOT for _typed (shape/queryTyped): the caller-declared mapper isn't rebuilt from the fresh
+        // RowDescription, so a schema change would silently decode with the stale plan — surface instead.
+        // NOT inside a (now-aborted) transaction: the retry would only hit 25P02; surface the real 0A000.
+        if (!t.settled && !t.stream && !t._typed && !this.inTransaction && (t._retries ?? 0) < 1) {
+          t._retries = (t._retries ?? 0) + 1
+          ;(t._retryErrors ??= []).push(code)
+          if (t.timer) clearTimeout(t.timer) // old timer cleared here; startTask re-arms a fresh one (else it leaks)
+          if (t.graceTimer) clearTimeout(t.graceTimer)
+          t.error = undefined; t.rows = []; t.command = undefined; t.rowCount = undefined; t.fields = undefined; t._debugCols = undefined; t._reused = undefined
+          if (t.perf) t.perf.tFirst = undefined // measure the retry's ttfb, not the failed attempt's error response
+          if (!t.binary) t.resultFormat = undefined // plain query: re-run as text; { binary: true } keeps all-binary
+          this.queue.unshift(t); this.processQueue(); return // re-run next; onQueryStart/End still fire exactly once
         }
+      }
+    }
+    if (t.timer) clearTimeout(t.timer)
+    if (t.graceTimer) clearTimeout(t.graceTimer)
+    t.signalCleanup?.()
+    if (!t.settled) { // a timed-out/aborted task was already settled by the caller
+      if (t.error) { if (t.debug) (t.error as PgError & { debug?: QueryDebug }).debug = this.buildDebug(t); this.fireEnd(t, t.error); if (t.stream) t.streamError?.(t.error); else t.reject?.(t.error) }
+      else if (t.stream) { this.fireEnd(t); t.streamEnd?.({ command: t.command, rowCount: t.rowCount }) }
+      else {
+        const m = this.fireEnd(t)
+        const res: QueryResult<never> = { rows: t.rows as never[], columns: (t.fields ?? []).map((f) => f.name), rowCount: t.rowCount ?? null, command: t.command ?? null }
+        if (t.wantMetrics && m) res.metrics = m
+        if (t.debug) res.debug = this.buildDebug(t)
+        t.resolve?.(res)
       }
     }
     this.processQueue()
@@ -500,7 +595,7 @@ export class Connection {
     if (t) { if (t.timer) clearTimeout(t.timer); if (t.graceTimer) clearTimeout(t.graceTimer); t.signalCleanup?.(); if (!t.settled) { const reason = t.error ?? err; this.fireEnd(t, reason); if (t.stream) t.streamError?.(reason); else t.reject?.(reason) } }
     if (this.cfg.reconnect.enabled && !this.ended) {
       this.state = 'reconnecting'
-      this.prepared.clear() // server-side prepared statements are gone after a drop/restart
+      this.prepared.clear(); this.staleStatements.clear() // server-side prepared statements are gone after a drop/restart
       void this.startReconnect(err)
     } else {
       this.state = 'closed'
@@ -525,11 +620,11 @@ export class Connection {
   // ---- public query API ----
   // a shape (without an explicit non-object mode) decodes to objects — matches the runtime default.
   // generic over the shape's column names so editors autocomplete each value to the known type list.
-  query<K extends string>(sql: string | readonly string[], params: unknown[], opts: { shape: ShapeOf<K> | ShapeMapper; mode?: 'object'; name?: string; metrics?: boolean; timeout?: number; signal?: AbortSignal }): Promise<QueryResult<Record<string, unknown>>>
-  query(sql: string | readonly string[], params?: unknown[], opts?: { name?: string; mode?: 'array'; metrics?: boolean; timeout?: number; signal?: AbortSignal; shape?: ShapeSpec | ShapeMapper }): Promise<QueryResult<unknown[]>>
-  query(sql: string | readonly string[], params: unknown[], opts: { name?: string; mode: 'object'; metrics?: boolean; timeout?: number; signal?: AbortSignal; shape?: ShapeSpec | ShapeMapper }): Promise<QueryResult<Record<string, unknown>>>
-  query(sql: string | readonly string[], params: unknown[], opts: { name?: string; mode: 'buffer'; metrics?: boolean; timeout?: number; signal?: AbortSignal }): Promise<QueryResult<(Buffer | null)[]>>
-  query(sql: string | readonly string[], params: unknown[], opts: { name?: string; mode: 'raw'; metrics?: boolean; timeout?: number; signal?: AbortSignal }): Promise<QueryResult<Buffer>>
+  query<K extends string>(sql: string | readonly string[], params: unknown[], opts: { shape: ShapeOf<K> | ShapeMapper; mode?: 'object'; name?: string; metrics?: boolean | 'ms' | 'us'; debug?: boolean; timeout?: number; signal?: AbortSignal }): Promise<QueryResult<Record<string, unknown>>>
+  query(sql: string | readonly string[], params?: unknown[], opts?: { name?: string; mode?: 'array'; metrics?: boolean | 'ms' | 'us'; debug?: boolean; timeout?: number; signal?: AbortSignal; shape?: ShapeSpec | ShapeMapper; binary?: boolean }): Promise<QueryResult<unknown[]>>
+  query(sql: string | readonly string[], params: unknown[], opts: { name?: string; mode: 'object'; metrics?: boolean | 'ms' | 'us'; debug?: boolean; timeout?: number; signal?: AbortSignal; shape?: ShapeSpec | ShapeMapper; binary?: boolean }): Promise<QueryResult<Record<string, unknown>>>
+  query(sql: string | readonly string[], params: unknown[], opts: { name?: string; mode: 'buffer'; metrics?: boolean | 'ms' | 'us'; debug?: boolean; timeout?: number; signal?: AbortSignal; binary?: boolean }): Promise<QueryResult<(Buffer | null)[]>>
+  query(sql: string | readonly string[], params: unknown[], opts: { name?: string; mode: 'raw'; metrics?: boolean | 'ms' | 'us'; debug?: boolean; timeout?: number; signal?: AbortSignal; binary?: boolean }): Promise<QueryResult<Buffer>>
   query(sql: string | readonly string[], params: unknown[] = [], opts: QueryOptions = {}): Promise<QueryResult<never>> {
     return new Promise<QueryResult<never>>((resolve, reject) => {
       if (this.state === 'closed') return reject(new Error('connection is closed'))
@@ -542,16 +637,21 @@ export class Connection {
       }
       if (!this.cfg.prepare) name = undefined // pooler-safe: never a server-side named prepared statement
       const mode = opts.mode ?? (opts.shape ? 'object' : 'array') // a shape implies named columns -> object
-      const task: Task = { sql: text, params, name, mode, rows: [], resolve, reject, timeout: opts.timeout, signal: opts.signal }
+      const task: Task = { sql: text, params, name, mode, rows: [], resolve, reject, timeout: opts.timeout, signal: opts.signal, debug: opts.debug }
       if (opts.shape) {
         // declared column shape: decode with the SAME cached jit/interpreted mapper as any query, and
         // request binary wire format for any column marked format:'binary'. (mode is array|object here.)
-        const cols = typeof opts.shape === 'function' ? (opts.shape.$cols as CodegenCol[]) : shapeCols(opts.shape)
-        task.mapper = this.getMapper(cols, mode)
-        task.resultFormat = cols.map((c) => (c.format === 'binary' ? 1 : 0))
+        const cols = this.resolveCols(typeof opts.shape === 'function' ? (opts.shape.$cols as CodegenCol[]) : shapeCols(opts.shape))
+        this.assignMapper(task, cols)
+        task.resultFormat = cols.map((c) => (c.format === 'binary' ? 1 : 0)) // shapeCols upgraded boost types
         task._typed = true
+      } else if (opts.binary) {
+        // force BINARY for every column; the mapper is built binary from RowDescription OIDs in the 'T'
+        // handler (a scalar resultFormat of 1 tells the server "all columns binary").
+        task.binary = true
+        task.resultFormat = 1
       }
-      this.beginPerf(task, params, !!opts.metrics)
+      this.beginPerf(task, params, opts.metrics)
       if (this.armSignal(task)) return
       this.queue.push(task)
       this.processQueue()
@@ -562,15 +662,17 @@ export class Connection {
    *  Requests the given wire formats from the server (binary for `format:'binary'` columns) and decodes
    *  with a typed mapper — enabling the binary result format for supported types without a Describe round
    *  trip. `columns` MUST match the SELECT's result columns (count + order). */
-  queryTyped(sql: string, params: unknown[], columns: CodegenCol[], opts: { mode?: 'array' | 'object'; metrics?: boolean; timeout?: number; signal?: AbortSignal } = {}): Promise<QueryResult<never>> {
+  queryTyped(sql: string, params: unknown[], columns: CodegenCol[], opts: { mode?: 'array' | 'object'; metrics?: boolean | 'ms' | 'us'; timeout?: number; signal?: AbortSignal; debug?: boolean } = {}): Promise<QueryResult<never>> {
     return new Promise<QueryResult<never>>((resolve, reject) => {
       if (this.state === 'closed') return reject(new Error('connection is closed'))
       const mode = opts.mode ?? 'object'
+      const cols = this.resolveCols(columns)
       const task: Task = {
-        sql, params, mode, rows: [], resolve, reject, timeout: opts.timeout, signal: opts.signal,
-        mapper: this.getMapper(columns, mode), resultFormat: columns.map((c) => (c.format === 'binary' ? 1 : 0)), _typed: true,
+        sql, params, mode, rows: [], resolve, reject, timeout: opts.timeout, signal: opts.signal, debug: opts.debug,
+        mapper: this.getMapper(cols, mode), resultFormat: cols.map((c) => (c.format === 'binary' ? 1 : 0)), _typed: true,
       }
-      this.beginPerf(task, params, !!opts.metrics)
+      if (opts.debug) task._debugCols = cols
+      this.beginPerf(task, params, opts.metrics)
       if (this.armSignal(task)) return
       this.queue.push(task)
       this.processQueue()

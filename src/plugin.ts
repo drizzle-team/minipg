@@ -16,15 +16,17 @@ export interface QueryInfo {
   prepared: boolean // true if this reused a cached prepared statement (Parse skipped)
 }
 
-/** Per-query measurements (monotonic ms). ttfb ≈ network RTT + server exec; download is first byte →
- *  ReadyForQuery (decode is interleaved in the streaming model, so `decodeMs` is the CPU subset of it). */
+/** Per-query measurements. Durations are in `unit`: 'ms' (default — `metrics:true` keeps sub-ms floating
+ *  point; `metrics:'ms'` rounds to whole ms) or 'us' (microseconds, integer — `metrics:'us'`). ttfb ≈
+ *  network RTT + server exec; download is first byte → ReadyForQuery (decode is the CPU subset of it). */
 export interface QueryMetrics {
-  queueWaitMs: number // enqueue → execution start (pool/serialization contention)
-  writeMs: number     // encode + serialize + socket.write
-  ttfbMs: number      // write → first response byte
-  downloadMs: number  // first byte → ReadyForQuery (wall; includes interleaved decode)
-  decodeMs: number    // CPU spent mapping DataRow bodies → JS
-  totalMs: number     // enqueue → resolve
+  unit: 'ms' | 'us'   // the unit of every duration field below
+  queueWait: number   // enqueue → execution start (pool/serialization contention)
+  write: number       // encode + serialize + socket.write
+  ttfb: number        // write → first response byte
+  download: number    // first byte → ReadyForQuery (wall; includes interleaved decode)
+  decode: number      // CPU spent mapping DataRow bodies → JS
+  total: number       // enqueue → resolve
   bytesSent: number
   bytesReceived: number
   rowCount: number | null

@@ -218,13 +218,13 @@ describe('number / bigint / boolean / string scalar encoding', () => {
     } finally { await c.end() }
   })
 
-  test('bigint round-trips through ::int8 as STRING with no precision loss', async () => {
+  test('bigint round-trips through ::int8 as BigInt with no precision loss', async () => {
     const c = await testConnect()
     try {
-      // int8 decodes to STRING in minipg (precision-safe)
-      expect(cell0(await c.query('select $1::int8', [9007199254740993n]))).toBe('9007199254740993')
-      expect(cell0(await c.query('select $1::int8', [0n]))).toBe('0')
-      expect(cell0(await c.query('select $1::int8', [-9007199254740993n]))).toBe('-9007199254740993')
+      // int8 decodes to a JS BigInt in minipg (precision-safe)
+      expect(cell0(await c.query('select $1::int8', [9007199254740993n]))).toBe(9007199254740993n)
+      expect(cell0(await c.query('select $1::int8', [0n]))).toBe(0n)
+      expect(cell0(await c.query('select $1::int8', [-9007199254740993n]))).toBe(-9007199254740993n)
     } finally { await c.end() }
   })
 

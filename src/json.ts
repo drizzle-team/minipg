@@ -53,14 +53,14 @@ export function isJsonMarker(x: unknown): x is JsonMarker {
 //   date    -> Date object        epoch  -> epoch milliseconds (number)
 // date/epoch apply to timestamp/date/timestamptz: top-level columns parse the wire value; inside a shaped
 // json column they re-parse the ISO string PG serialized into the JSON (Date.parse / new Date).
-export type JsTarget = 'number' | 'string' | 'latin1' | 'date' | 'ms'
-/** Split a "<pgtype>" or "<pgtype>:number|string|latin1|date|epoch" spec into PG type + JS-target override. */
+export type JsTarget = 'number' | 'string' | 'latin1' | 'date' | 'ms' | 'bigint' | 'precise' | 'pretty'
+/** Split a "<pgtype>" or "<pgtype>:number|string|latin1|date|ms|bigint|precise|pretty" spec into PG type + JS-target override. */
 export function splitType(s: string): { pg: string; js?: JsTarget } {
   const i = s.indexOf(':')
   if (i === -1) return { pg: s.trim() }
   const js = s.slice(i + 1).trim().toLowerCase()
-  if (js !== 'number' && js !== 'string' && js !== 'latin1' && js !== 'date' && js !== 'ms') {
-    throw new Error(`unknown JS target ${JSON.stringify(js)} in ${JSON.stringify(s)} (use ':number', ':string', ':latin1', ':date' or ':ms')`)
+  if (js !== 'number' && js !== 'string' && js !== 'latin1' && js !== 'date' && js !== 'ms' && js !== 'bigint' && js !== 'precise' && js !== 'pretty') {
+    throw new Error(`unknown JS target ${JSON.stringify(js)} in ${JSON.stringify(s)} (use ':number', ':string', ':latin1', ':date', ':ms', ':bigint', ':precise' or ':pretty')`)
   }
   return { pg: s.slice(0, i).trim(), js: js as JsTarget }
 }
@@ -96,6 +96,23 @@ function temporalTarget(pg: string, js?: JsTarget): 'date' | 'ms' | null {
   return null
 }
 
+// int8/bigint default to a JS BigInt (:number -> lossy number, :string -> exact string). numeric/decimal
+// have fractional parts so they stay string. True if the field decodes to BigInt.
+const BIGINT_PG = new Set(['int8', 'bigint'])
+function bigintField(pg: string, js?: JsTarget): boolean {
+  if (js === 'bigint') return true
+  return !js && BIGINT_PG.has(pg.toLowerCase().trim())
+}
+
+// float4/real: 'pretty' (default) = PG's canonical shortest decimal via Number(text); 'precise' = the exact
+// stored f32 via Math.fround(Number(text)). Returns the target, or null if the field isn't a float4 number.
+const FLOAT4_PG = new Set(['float4', 'real'])
+export function float4Target(pg: string, js?: JsTarget): 'precise' | 'pretty' | null {
+  if (js === 'string') return null // :string -> raw text, handled elsewhere
+  if (!FLOAT4_PG.has(pg.toLowerCase().trim())) return null
+  return js === 'precise' ? 'precise' : 'pretty' // bare / :pretty -> pretty
+}
+
 /** True if anywhere in the shape there's a field whose exact value JSON.parse can't produce
  *  (a precision type left as string). A `:number` override opts out — Number is JSON.parse-safe. */
 export function specHasPrecision(spec: JsonSpec): boolean {
@@ -108,13 +125,14 @@ export function specHasPrecision(spec: JsonSpec): boolean {
   return false
 }
 
-/** True if the shape has any :ms/:date field (recursively). The interpreted (no-eval) path decodes
- *  shaped json via JSON.parse, so only shapes that answer true need the temporal post-parse walk below. */
-export function specHasTemporal(spec: JsonSpec): boolean {
+/** True if the shape has any field the interpreted (no-eval) path must fix up after JSON.parse — a
+ *  :ms/:date temporal (ISO string -> Date/number) or an int8/bigint (number/string -> BigInt). Only
+ *  shapes that answer true need the post-parse walk below. */
+export function specNeedsWalk(spec: JsonSpec): boolean {
   for (const v of Object.values(spec)) {
-    if (isJsonMarker(v)) { if (specHasTemporal(v.spec)) return true; continue }
+    if (isJsonMarker(v)) { if (specNeedsWalk(v.spec)) return true; continue }
     const { pg, js } = splitType(v)
-    if (temporalTarget(pg, js)) return true
+    if (temporalTarget(pg, js) || bigintField(pg, js) || float4Target(pg, js) === 'precise') return true
   }
   return false
 }
@@ -129,18 +147,21 @@ function isoEpoch(s: string): number {
   return Date.parse(s)
 }
 
-/** Build a recursive post-JSON.parse walk that converts the shape's :ms/:date fields in place. The
- *  interpreted path decodes shaped json with JSON.parse (temporal fields arrive as ISO strings), then
- *  applies this to match the jit scanner's output. Only temporal fields (and nested markers holding one)
- *  are visited; access is by key, so jsonb's sorted wire order is irrelevant. */
-export function buildTemporalWalk(marker: JsonMarker): (v: unknown) => unknown {
+/** Build a recursive post-JSON.parse walk that converts the shape's :ms/:date (ISO string -> Date/number)
+ *  and int8/bigint (number/string -> BigInt) fields in place. The interpreted path decodes shaped json with
+ *  JSON.parse, then applies this to match the jit scanner. NB: for int8 > 2^53 JSON.parse already lost
+ *  precision, so BigInt(that) is a BigInt of the ROUNDED value — exact only with jsonBigints preserving it
+ *  as a string. Access is by key, so jsonb's sorted wire order is irrelevant. */
+export function buildJsonWalk(marker: JsonMarker): (v: unknown) => unknown {
   const fns: Array<[string, (x: unknown) => unknown]> = []
   for (const [key, field] of Object.entries(marker.spec)) {
-    if (isJsonMarker(field)) { if (specHasTemporal(field.spec)) fns.push([key, buildTemporalWalk(field)]); continue }
+    if (isJsonMarker(field)) { if (specNeedsWalk(field.spec)) fns.push([key, buildJsonWalk(field)]); continue }
     const { pg, js } = splitType(field)
     const tt = temporalTarget(pg, js)
     if (tt === 'ms') fns.push([key, (x) => (typeof x === 'string' ? isoEpoch(x) : x)])
     else if (tt === 'date') fns.push([key, (x) => (typeof x === 'string' ? new Date(isoEpoch(x)) : x)])
+    else if (bigintField(pg, js)) fns.push([key, (x) => (typeof x === 'bigint' ? x : BigInt(x as string | number))])
+    else if (float4Target(pg, js) === 'precise') fns.push([key, (x) => (typeof x === 'number' ? Math.fround(x) : x)])
   }
   const walkObj = (o: Record<string, unknown>): Record<string, unknown> => {
     for (const [k, f] of fns) { const val = o[k]; if (val != null) o[k] = f(val) }
@@ -187,6 +208,8 @@ const rdStrNum = (v: string) => `{ jp++; const _s = jp; while (jp < je && jb[jp]
 const rdNum = (v: string) => `{ const _s = jp; if (jb[jp] === 45) jp++; while (jp < je) { const _n = jb[jp]; if ((_n >= 48 && _n <= 57) || _n === 46 || _n === 43 || _n === 45 || _n === 101 || _n === 69) jp++; else break } ${v} = Number(${L1('_s', 'jp')}) }`
 // read a bare number token as an EXACT string
 const rdRaw = (v: string) => `{ const _s = jp; if (jb[jp] === 45) jp++; while (jp < je) { const _n = jb[jp]; if ((_n >= 48 && _n <= 57) || _n === 46 || _n === 43 || _n === 45 || _n === 101 || _n === 69) jp++; else break } ${v} = ${L1('_s', 'jp')} }`
+// read an integer token (bare, or bigint-as-quoted-string) -> exact JS BigInt
+const rdBigInt = (v: string) => `{ if (jb[jp] === 34) { jp++; const _s = jp; while (jp < je && jb[jp] !== 34) jp++; ${v} = BigInt(${U8('_s', 'jp')}); jp++ } else { const _s = jp; if (jb[jp] === 45) jp++; while (jp < je) { const _n = jb[jp]; if (_n >= 48 && _n <= 57) jp++; else break } ${v} = BigInt(${L1('_s', 'jp')}) } }`
 // skip an arbitrary value (string/object/array/scalar); leaves jp just past it
 const SKIPVALUE = `{ ${SKIPWS} const _vc = jb[jp]; if (_vc === 34) { ${SKIPSTR} } else if (_vc === 123 || _vc === 91) { const _open = _vc, _close = _vc === 123 ? 125 : 93; let _depth = 0; while (jp < je) { const _d = jb[jp]; if (_d === 34) { ${SKIPSTR} continue } if (_d === _open) { _depth++; jp++; continue } if (_d === _close) { _depth--; jp++; if (_depth === 0) break; continue } jp++ } } else { while (jp < je) { const _d = jb[jp]; if (_d === 44 || _d === 125 || _d === 93) break; jp++ } } }`
 // advance past the current object's matching '}' (tolerates extra/trailing fields; string-safe)
@@ -209,6 +232,12 @@ function inlineValue(field: string | JsonMarker, target: string, type: 'json' | 
   const { pg, js } = splitType(field)
   const tt = temporalTarget(pg, js)
   if (tt) return inlineEpoch(target, tt, ctx)
+  if (bigintField(pg, js)) return `if (jb[jp] === 110) { ${target} = null; jp += 4 } else ${rdBigInt(target)}`
+  const f4 = float4Target(pg, js) // float4: bare/:pretty -> Number(token); :precise -> fround it
+  if (f4) {
+    const rd = `if (jb[jp] === 110) { ${target} = null; jp += 4 } else if (jb[jp] === 34) ${rdStrNum(target)} else ${rdNum(target)}`
+    return f4 === 'precise' ? `${rd} if (${target} !== null) ${target} = Math.fround(${target})` : rd
+  }
   switch (effJs(category(pg), js)) {
     case 'number': return `if (jb[jp] === 110) { ${target} = null; jp += 4 } else if (jb[jp] === 34) ${rdStrNum(target)} else ${rdNum(target)}`
     case 'bool': return `if (jb[jp] === 110) { ${target} = null; jp += 4 } else { ${target} = jb[jp] === 116; jp += ${target} ? 4 : 5 }`
@@ -228,7 +257,7 @@ function inlineEpoch(target: string, js: 'ms' | 'date', ctx: { n: number }): str
     + `const _H=(jb[_p+11]-48)*10+(jb[_p+12]-48), _Mi=(jb[_p+14]-48)*10+(jb[_p+15]-48), _Sc=(jb[_p+17]-48)*10+(jb[_p+18]-48); `
     + `let _q=_p+19, _ms=0; if (jb[_q]===46){ _q++; let _f=0,_k=0; while(_k<3&&jb[_q]>=48&&jb[_q]<=57){_f=_f*10+(jb[_q]-48);_q++;_k++} while(_k<3){_f*=10;_k++} _ms=_f; while(_q<${E}&&jb[_q]>=48&&jb[_q]<=57)_q++ } `
     + `let _off=0; const _sg=jb[_q]; if(_sg===43||_sg===45){ _q++; const _oh=(jb[_q]-48)*10+(jb[_q+1]-48); _q+=2; let _om=0; if(jb[_q]===58){_q++;_om=(jb[_q]-48)*10+(jb[_q+1]-48);_q+=2} _off=(_sg===45?-1:1)*(_oh*60+_om)*60000 } `
-    + `${P} = Date.UTC(_Y,_Mo-1,_D,_H,_Mi,_Sc,_ms)-_off; } else { ${P} = Date.parse(jb.toString('utf8', ${S}, ${E})) } `
+    + `${P} = Date.UTC(_Y,_Mo-1,_D,_H,_Mi,_Sc,_ms); if (_Y <= 99) { const _dd = new Date(${P}); _dd.setUTCFullYear(_Y); ${P} = _dd.getTime() } ${P} -= _off; } else { ${P} = Date.parse(jb.toString('utf8', ${S}, ${E})) } `
     + `${target} = ${js === 'date' ? `new Date(${P})` : P}; }`
 }
 

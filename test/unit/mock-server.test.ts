@@ -107,16 +107,17 @@ describe('MockPgServer: in-process transport (no TCP)', () => {
 })
 
 describe('MockPgServer: prepared-statement / restart trap', () => {
-  test('a forgotten prepared statement (post-restart) reuse yields 26000', async () => {
-    // This is the prepared-cache-clear bug: after the server loses state, reusing a
-    // cached name must re-Parse. Until reconnect clears the cache, the driver hits 26000.
+  test('a forgotten prepared statement (post-restart) reuse: transparently re-parses (26000 swallowed)', async () => {
+    // After the server loses state, reusing a cached name Binds a statement it no longer has -> 26000.
+    // The driver drops its cache and re-runs once (Close + re-Parse), so the caller sees a normal result.
     await withMock({ onQuery: () => ({ fields: [{ name: 'n', oid: 23 }], rows: [['1']], command: 'SELECT' }) }, async (m) => {
       const c = await connect(m.connectConfig())
       await c.query('select $1::int', [1], { name: 'p1' }) // Parse + cache
       m.forgetStatements() // simulate restart losing server-side state
-      const err = await c.query('select $1::int', [2], { name: 'p1' }).catch((e) => e) // reuse -> Bind only
-      expect(err).toBeInstanceOf(PgError)
-      expect((err as PgError).code).toBe('26000')
+      const r = await c.query('select $1::int', [2], { name: 'p1', mode: 'object', debug: true }) // reuse -> 26000 -> auto re-parse
+      expect((r.rows[0] as { n: unknown }).n).toBe(1)
+      expect(r.debug!.retries).toBe(1)
+      expect(r.debug!.retriedErrors).toEqual(['26000'])
       await c.end()
     })
   })

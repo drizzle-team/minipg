@@ -126,8 +126,8 @@ describe('strict result-set integrity under load', () => {
       expect((rt.rows[0] as unknown[])[0]).toBeNull()
       expect((rt.rows[0] as unknown[])[1]).toBe(big)
       expect((rw.rows[0] as unknown[])[0]).toBe(1) // int2 -> number
-      expect((rw.rows[0] as unknown[])[2]).toBe('3') // int8 -> string
-      expect((ri.rows[0] as unknown[])[0]).toBe('9223372036854775807')
+      expect((rw.rows[0] as unknown[])[2]).toBe(3n) // int8 -> BigInt
+      expect((ri.rows[0] as unknown[])[0]).toBe(9223372036854775807n)
       expect((rn.rows[0] as unknown[])[0]).toBe('123.456')
       const cellb = (rb.rows[0] as unknown[])[0]
       expect(Buffer.isBuffer(cellb)).toBe(true)

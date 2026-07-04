@@ -35,9 +35,9 @@ describe('streaming :: async-iteration baselines (all result modes)', () => {
       for await (const row of c.stream(sql)) streamed.push(row as unknown[])
       const q = await c.query(sql)
       expect(streamed).toEqual(q.rows as unknown[][])
-      // int4 -> number, int8 -> string
+      // int4 -> number, int8 -> BigInt
       expect(typeof (streamed[0] as unknown[])[0]).toBe('number')
-      expect(typeof (streamed[0] as unknown[])[1]).toBe('string')
+      expect(typeof (streamed[0] as unknown[])[1]).toBe('bigint')
     })
   })
 

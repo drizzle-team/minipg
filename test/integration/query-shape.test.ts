@@ -10,13 +10,13 @@ afterEach(async () => { for (const c of open) await c.end().catch(() => {}); ope
 const conn = async () => { const c = await testConnect(); open.push(c); return c }
 
 describe('query({ shape }) — declared shape decode', () => {
-  test('scalar shape spec: typed decode (int8 exact, int8:number, bool, float8)', async () => {
+  test('scalar shape spec: typed decode (int8 BigInt, int8:number, bool, float8)', async () => {
     const c = await conn()
     const sql = `select 42::int4 as i, 'hi'::text as t, 9223372036854775807::int8 as big,
                         100::int8 as n, true as b, 3.5::float8 as f`
     const r = await c.query(sql, [], { shape: { i: 'int4', t: 'text', big: 'int8', n: 'int8:number', b: 'bool', f: 'float8' } })
-    expect(r.rows[0]).toEqual({ i: 42, t: 'hi', big: '9223372036854775807', n: 100, b: true, f: 3.5 })
-    expect(typeof (r.rows[0] as Record<string, unknown>).big).toBe('string') // int8 -> exact string
+    expect(r.rows[0]).toEqual({ i: 42, t: 'hi', big: 9223372036854775807n, n: 100, b: true, f: 3.5 })
+    expect(typeof (r.rows[0] as Record<string, unknown>).big).toBe('bigint') // int8 -> BigInt
     expect(typeof (r.rows[0] as Record<string, unknown>).n).toBe('number')   // int8:number -> number
   })
 
@@ -105,9 +105,32 @@ describe('temporal targets — :ms / :date', () => {
   })
 })
 
+describe('{ debug: true } surfaces the decode plan', () => {
+  test('reports mode, jit/interpreted (+ source), and per-column text/binary format', async () => {
+    const c = await conn()
+    const r = await c.query('select 1::int8 as big, now() as ts, 42::int4 as i, 2.5::float4 as f', [],
+      { shape: { big: 'int8', ts: 'timestamptz:ms', i: 'int4', f: 'float4:precise' }, mode: 'object', debug: true })
+    const d = r.debug!
+    expect(d.mode).toBe('object')
+    expect(['jit', 'interpreted']).toContain(d.decode)
+    if (d.decode === 'jit') expect(typeof d.mapperSource).toBe('string') // the generated per-shape function
+    else expect(d.mapperSource).toBeUndefined()
+    const byName = Object.fromEntries(d.columns.map((x) => [x.name, x]))
+    expect(byName.big).toMatchObject({ oid: 20, format: 'binary' })            // int8 -> binary
+    expect(byName.ts).toMatchObject({ oid: 1184, format: 'binary', js: 'ms' }) // timestamptz:ms -> binary
+    expect(byName.i!.format).toBe('binary')                                    // int4 -> binary
+    expect(byName.f).toMatchObject({ oid: 700, format: 'binary', js: 'precise' }) // float4:precise -> binary
+  })
+
+  test('no debug option -> no .debug', async () => {
+    const c = await conn()
+    expect((await c.query('select 1')).debug).toBeUndefined()
+  })
+})
+
 // Type-level checks (no runtime): the shape value union autocompletes + rejects typos.
 {
-  const ok: ShapeSpec = { a: 'int4', b: 'bigint:number', c: 'timestamptz:ms', d: 'text:latin1', e: 'timestamptz:string', f: Json({ n: 'int8:number', ts: 'timestamptz:date' }) }
+  const ok: ShapeSpec = { a: 'int4', b: 'bigint:number', c: 'timestamptz:ms', d: 'text:latin1', e: 'timestamptz:string', g: 'float4:precise', h: 'float4:pretty', f: Json({ n: 'int8:number', ts: 'timestamptz:date' }) }
   void ok
   // @ts-expect-error - 'bignt' is not a PG type alias
   const bad1: ShapeSpec = { a: 'bignt' }
@@ -117,5 +140,7 @@ describe('temporal targets — :ms / :date', () => {
   const bad3: ShapeSpec = { a: 'timestamptz:number' }
   // @ts-expect-error - timestamptz has no :latin1 target
   const bad4: ShapeSpec = { a: 'timestamptz:latin1' }
-  void bad1; void bad2; void bad3; void bad4
+  // @ts-expect-error - :precise is float4-only, not a float8 target
+  const bad5: ShapeSpec = { a: 'float8:precise' }
+  void bad1; void bad2; void bad3; void bad4; void bad5
 }

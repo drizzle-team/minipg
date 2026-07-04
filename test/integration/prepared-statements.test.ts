@@ -288,31 +288,60 @@ describe('error during prepare / cache poisoning guards', () => {
   })
 })
 
-describe('cache-invalidation footguns (current behavior)', () => {
-  test('ALTER selected column type then reuse name -> 0A000, connection recovers', async () => {
+describe('prepared-statement cache invalidation (self-heal + collisions)', () => {
+  test('ALTER selected column type then reuse: transparently re-parses (0A000 swallowed)', async () => {
     await withConn(async (c) => {
       await c.query('create temp table fg_alt(id int, v int)')
       await c.query('insert into fg_alt values(1,10)')
       const name = `${K}_fga`
-      const r1 = await c.query('select * from fg_alt where id=$1', [1], { name })
-      expect((r1.rows[0] as unknown[])[1]).toBe(10)
+      await c.query('select * from fg_alt where id=$1', [1], { name })
+      await c.query('select * from fg_alt where id=$1', [1], { name }) // warm to binary
       await c.query('alter table fg_alt alter column v type bigint')
-      const err = await caught(() => c.query('select * from fg_alt where id=$1', [1], { name }))
-      expect((err as PgError).code).toBe('0A000') // cached plan must not change result type
-      const live = await c.query('select 1 as a') // recovered
-      expect((live.rows[0] as unknown[])[0]).toBe(1)
+      const r = await c.query('select * from fg_alt where id=$1', [1], { name, mode: 'object', debug: true }) // 0A000 -> auto re-parse
+      expect((r.rows[0] as { v: unknown }).v).toBe(10n) // v is int8 now -> BigInt, decoded after the transparent retry
+      expect(r.debug!.retries).toBe(1)
+      expect(r.debug!.retriedErrors).toEqual(['0A000'])
     })
   })
 
-  test('DEALLOCATE the name via raw SQL then reuse -> 26000, connection recovers', async () => {
+  test('DEALLOCATE the name via raw SQL then reuse: transparently re-parses (26000 swallowed)', async () => {
     await withConn(async (c) => {
       const name = `${K}_fgd`
       await c.query('select 1 as a', [], { name })
       await c.query(`deallocate "${name}"`)
-      const err = await caught(() => c.query('select 1 as a', [], { name }))
-      expect((err as PgError).code).toBe('26000') // driver does not invalidate its own cache
-      const live = await c.query('select 2 as a')
-      expect((live.rows[0] as unknown[])[0]).toBe(2)
+      const r = await c.query('select 1 as a', [], { name, mode: 'object', debug: true }) // 26000 -> auto re-parse
+      expect((r.rows[0] as { a: unknown }).a).toBe(1)
+      expect(r.debug!.retries).toBe(1)
+      expect(r.debug!.retriedErrors).toEqual(['26000'])
+    })
+  })
+
+  test('a shape (_typed) query is NOT auto-retried on 0A000 — it surfaces (the declared mapper could be stale)', async () => {
+    await withConn(async (c) => {
+      await c.query('create temp table fg_shape(a int4)')
+      await c.query('insert into fg_shape values (1000000)')
+      const name = `${K}_fgs`
+      const shape = { a: 'int4' } as const
+      await c.query('select a from fg_shape', [], { name, shape })
+      await c.query('select a from fg_shape', [], { name, shape })
+      await c.query('alter table fg_shape alter column a type bigint') // shape declares int4 but col is int8 now
+      const err = await caught(() => c.query('select a from fg_shape', [], { name, shape }))
+      expect((err as PgError).code).toBe('0A000') // surfaced, not silently decoded with the stale int4 mapper
+    })
+  })
+
+  test('0A000 inside a transaction surfaces the real code (a retry would only hit 25P02)', async () => {
+    await withConn(async (c) => {
+      await c.query('create temp table fg_tx(a int4)')
+      await c.query('insert into fg_tx values (1)')
+      const name = `${K}_fgtx`
+      await c.query('select a from fg_tx', [], { name })
+      await c.query('select a from fg_tx', [], { name })
+      await c.query('alter table fg_tx alter column a type bigint')
+      await c.query('begin')
+      const err = await caught(() => c.query('select a from fg_tx', [], { name }))
+      expect((err as PgError).code).toBe('0A000')
+      await c.query('rollback')
     })
   })
 
@@ -461,6 +490,89 @@ describe('pool: per-connection statement isolation', () => {
   })
 })
 
+// A reused prepared statement (no shape) learns its result OIDs from the first roundtrip's RowDescription,
+// then requests BINARY for the bench-fast types on every subsequent execution — same values, smaller wire.
+describe('prepared-statement reuse auto-upgrades to binary (plain queries, no shape)', () => {
+  const norm = (r: unknown) => JSON.stringify(r, (_k, v) => (typeof v === 'bigint' ? v + 'n' : v))
+
+  test('1st execution text, 2nd+ binary: identical values, smaller wire', async () => {
+    await withConn(async (c) => {
+      await c.query("SET TIME ZONE 'UTC'")
+      const sql = `select (g*98765432109)::int8 as big, (g*1.123456789)::float8 as f,
+        '2021-06-02 12:34:56.789+00'::timestamptz as ts from generate_series(1,50) g`
+      const name = `${K}_bin`
+      const r1 = await c.query(sql, [], { name, mode: 'object', metrics: true })
+      const r2 = await c.query(sql, [], { name, mode: 'object', metrics: true })
+      expect(norm(r2.rows)).toBe(norm(r1.rows)) // binary decode == text decode for these types
+      expect(r2.metrics!.bytesReceived).toBeLessThan(r1.metrics!.bytesReceived) // 2nd exec came back binary (narrower)
+    })
+  })
+
+  test('temporal:string keeps a reused timestamptz column as exact text (not a binary Date)', async () => {
+    await withConn(async (c) => {
+      await c.query("SET TIME ZONE 'UTC'")
+      const sql = "select '2021-06-02 12:34:56.789+00'::timestamptz as ts"
+      const name = `${K}_tstr`
+      await c.query(sql, [], { name, mode: 'object' })
+      const r = await c.query(sql, [], { name, mode: 'object' })
+      expect(typeof (r.rows[0] as { ts: unknown }).ts).toBe('string')
+    }, { temporal: 'string' })
+  })
+
+  test('a config.types override survives reuse (not bypassed by the binary upgrade)', async () => {
+    const c = await testConnect({ types: { 23: (buf) => 'OV:' + buf.toString('utf8') } }) // override int4
+    try {
+      const name = `${K}_ov`
+      await c.query('select 42::int4 as i', [], { name, mode: 'object' })
+      const r = await c.query('select 42::int4 as i', [], { name, mode: 'object' })
+      expect((r.rows[0] as { i: unknown }).i).toBe('OV:42') // override wins -> stayed text, not binary int4
+    } finally { await c.end() }
+  })
+
+  test('reusing a name with DIFFERENT sql re-Parses (debug.repreparedSqlChanged), not the stale plan', async () => {
+    await withConn(async (c) => {
+      const name = `${K}_swap`
+      await c.query('select 10::int8 as b', [], { name, mode: 'object' }) // caches name -> int8 sql
+      const r = await c.query('select 10::int4 as b', [], { name, mode: 'object', debug: true }) // different sql, same name
+      expect(r.debug!.reusedPreparedStatement).toBe(false)
+      expect(r.debug!.repreparedSqlChanged).toBe(true)
+      expect(r.debug!.columns[0]!.oid).toBe(23) // int4, decoded by the re-parsed plan (not the stale int8)
+      expect((r.rows[0] as { b: unknown }).b).toBe(10)
+      const fresh = await c.query('select 5::int2 as b', [], { name: `${K}_fresh`, mode: 'object', debug: true })
+      expect(fresh.debug!.reusedPreparedStatement).toBe(false)
+      expect(fresh.debug!.repreparedSqlChanged).toBeUndefined() // fresh first-use has no reprepare flag
+    })
+  })
+
+  test('buffer mode reuse stays text (raw cells are the text wire bytes, not binary)', async () => {
+    await withConn(async (c) => {
+      const name = `${K}_buf`
+      await c.query('select 12345::int8 as v', [], { name, mode: 'buffer' })
+      const r = await c.query('select 12345::int8 as v', [], { name, mode: 'buffer' })
+      expect((r.rows[0] as (Buffer | null)[])[0]).toEqual(Buffer.from('12345')) // ascii digits, not the int64 bytes
+    })
+  })
+
+  test('DDL changing the result type: transparently re-parses in ONE call (0A000 swallowed), debug shows it', async () => {
+    await withConn(async (c) => {
+      await c.query('create temp table stheal(a int4)')
+      await c.query('insert into stheal values (1)')
+      const name = `${K}_heal`
+      await c.query('select a from stheal', [], { name, mode: 'object' }) // 1st: text, caches a as int4
+      await c.query('select a from stheal', [], { name, mode: 'object' }) // 2nd: binary reuse
+      await c.query('alter table stheal alter column a type bigint')       // result type int4 -> int8
+      const r = await c.query('select a from stheal', [], { name, mode: 'object', debug: true }) // no throw: auto re-parse
+      expect((r.rows[0] as { a: unknown }).a).toBe(1n) // int8 now -> BigInt, decoded correctly after the retry
+      expect(r.debug!.retries).toBe(1)
+      expect(r.debug!.retriedErrors).toEqual(['0A000'])
+      expect(r.debug!.columns[0]!.format).toBe('text') // the retry went out TEXT (new OIDs unknown until re-Describe)
+      const r2 = await c.query('select a from stheal', [], { name, mode: 'object', debug: true }) // now stable
+      expect(r2.debug!.retries).toBeUndefined()
+      expect(r2.debug!.columns[0]!.format).toBe('binary') // reuse re-upgrades with the fresh int8 OID
+    })
+  })
+})
+
 describe('roadmap / not-yet-implemented', () => {
   // startTask always appends Bind+Execute+Sync; there is no Describe-only path.
   test.todo('describe(sql, {name?}): Parse+Describe only, returning param OIDs + columns without Execute', () => {})
@@ -468,6 +580,6 @@ describe('roadmap / not-yet-implemented', () => {
   test.todo('prepare(name, sql) issuing Parse only, then execute(name, values) Binding later', () => {})
   test.todo('explicit deallocate(name)/close API that sends Close and clears the client cache', () => {})
   test.todo('prepare:false / simple-protocol switch forcing inlined values for pooler compatibility', () => {})
-  test.todo('binary RESULT format option per query (Bind result format 1); today text is hardcoded', () => {})
+  test.todo('binary PARAM format (Bind param format 1) from ParameterDescription; params still text-encoded', () => {})
   test.todo('type inference resolved via ParameterDescription for ambiguous uncast params', () => {})
 })

@@ -512,9 +512,8 @@ describe('ALL-COMMON-TYPES round-trip matrix', () => {
     expect(Buffer.compare(cell0(r) as Buffer, buf)).toBe(0)
   })
 
-  // Scalars that default to STRING (precision-safe / lossless text).
+  // Scalars that default to STRING (precision-safe / lossless text). int8 -> BigInt, temporal -> Date (below).
   const stringCases: { sql: string; param: string; eq: string }[] = [
-    { sql: 'int8', param: '123456789012345', eq: '123456789012345' },
     { sql: 'numeric', param: '1.50', eq: '1.50' },
     { sql: 'text', param: 'hello', eq: 'hello' },
     { sql: 'varchar', param: 'world', eq: 'world' },
@@ -535,6 +534,12 @@ describe('ALL-COMMON-TYPES round-trip matrix', () => {
       expect(cell0(r)).toBeInstanceOf(Date)
       expect((cell0(r) as Date).toISOString()).toContain('2020-01-02')
     }
+  })
+
+  test('int8 / bigint default to a JS BigInt', async () => {
+    const r = await c.query('select $1::int8 as v', ['123456789012345'])
+    expect(cell0(r)).toBe(123456789012345n)
+    expect(typeof cell0(r)).toBe('bigint')
   })
 
   test('NULL column for each representative type is strictly null, key present', async () => {

@@ -33,7 +33,7 @@ it('binary flow (queryTyped) + a larger stream survive the workerd transport', a
       ],
       { mode: 'object' },
     )
-    expect(b.rows[0]).toEqual({ f: 3.141592653589793, big: '9223372036854775807', i: 42 })
+    expect(b.rows[0]).toEqual({ f: 3.141592653589793, big: 9223372036854775807n, i: 42 })
 
     // stress chunking/backpressure through Duplex.from under workerd
     const big = await db.query('select g from generate_series(1, 1000) g')

@@ -27,6 +27,36 @@ export interface QueryResult<Row = unknown[]> {
   command: string | null
   /** Per-query timings + sizes, present only when the query opted in with `{ metrics: true }`. */
   metrics?: QueryMetrics
+  /** The resolved decode plan, present only when the query opted in with `{ debug: true }`. */
+  debug?: QueryDebug
+}
+
+/** How a query's result was decoded — surfaced by `{ debug: true }` for inspection/tuning. */
+export interface QueryDebug {
+  sql: string
+  mode: ResultMode
+  /** Server-side prepared-statement name (undefined = unnamed / simple execution). */
+  statementName?: string
+  /** True if this reused a cached prepared statement (Parse skipped — 2nd+ execution). */
+  reusedPreparedStatement: boolean
+  /** True if this statement name was cached bound to DIFFERENT SQL, so the old prepared statement was
+   *  deallocated and re-Parsed. Reusing one name for alternating SQL re-Parses on every switch (a footgun —
+   *  prefer one name per distinct SQL). */
+  repreparedSqlChanged?: boolean
+  /** Which row mapper ran: 'jit' (compiled per-shape function), 'interpreted' (per-column loop, no eval),
+   *  or 'none' (buffer/raw modes return undecoded cells). */
+  decode: 'jit' | 'interpreted' | 'none'
+  /** The generated JIT mapper source (only when `decode === 'jit'`). */
+  mapperSource?: string
+  /** The resolved column plan: wire OID + the format we requested + any JS-target/JSON override. */
+  columns: Array<{ name: string; oid: number; format: 'text' | 'binary'; js?: string; json?: boolean }>
+  /** Transparent auto-retries performed on this query (absent if the first attempt succeeded). A prepared
+   *  statement invalidated by DDL (SQLSTATE 0A000 "cached plan must not change result type" / 26000
+   *  "prepared statement does not exist") is Close+re-Parsed and re-run once — safe because both are raised
+   *  before execution, so no rows were affected. */
+  retries?: number
+  /** SQLSTATE codes of the swallowed attempts that triggered a retry, e.g. `['0A000']`. */
+  retriedErrors?: string[]
 }
 
 export interface ConnectConfig {
@@ -88,8 +118,18 @@ export interface QueryOptions {
    *  its `$cols` are reused). Enables typed/binary decode via the same cached jit/interpreted mapper the
    *  driver uses for every query; columns marked `format:'binary'` request the binary wire format. */
   shape?: ShapeSpec | ShapeMapper
-  /** Attach per-query timings/sizes to the result as `.metrics` (works with or without plugins). */
-  metrics?: boolean
+  /** Force the BINARY result wire format for EVERY column (manual/testing lever — the shape path picks
+   *  binary per-column automatically). Decodes via each column's binary decoder from the RowDescription
+   *  OIDs. Columns whose type has no binary decoder (numeric, money, json, jsonb, …) will error — select
+   *  only binary-supported types. Ignored when `shape` is given (the shape controls per-column formats). */
+  binary?: boolean
+  /** Attach per-query timings/sizes to the result as `.metrics` (works with or without plugins). `true`
+   *  reports durations as sub-ms floating-point milliseconds; `'ms'` rounds to whole-integer milliseconds;
+   *  `'us'` reports integer microseconds (best for sub-ms queries). The unit is echoed in `metrics.unit`. */
+  metrics?: boolean | 'ms' | 'us'
+  /** Attach the resolved decode plan to the result as `.debug` — statement name, jit/interpreted, the
+   *  generated JIT mapper source, and the per-column text/binary format we picked. For inspection/tuning. */
+  debug?: boolean
   /** Cancel the query (out-of-band CancelRequest) after this many milliseconds. */
   timeout?: number
   /** Cancel the query when this AbortSignal fires. */

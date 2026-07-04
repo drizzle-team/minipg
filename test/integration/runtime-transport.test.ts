@@ -38,7 +38,7 @@ describe('driver over an injected Web-stream transport', () => {
       { name: 'ts', oid: 1184, format: 'binary', js: 'ms' },
     ]
     const r = await c.queryTyped(`select 3.141592653589793::float8, 9223372036854775807::int8, '2021-06-02 12:34:56.789+00'::timestamptz`, [], cols, { mode: 'object' })
-    expect(r.rows[0] as unknown).toEqual({ f: 3.141592653589793, big: '9223372036854775807', ts: Date.UTC(2021, 5, 2, 12, 34, 56, 789) })
+    expect(r.rows[0] as unknown).toEqual({ f: 3.141592653589793, big: 9223372036854775807n, ts: Date.UTC(2021, 5, 2, 12, 34, 56, 789) })
   })
 
   test('metrics + a larger result stream correctly over the transport', async () => {

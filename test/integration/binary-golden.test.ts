@@ -27,7 +27,7 @@ const COLS: CodegenCol[] = [
   { name: 'ok', oid: 16, format: 'binary' },
   { name: 'f4', oid: 700, format: 'binary' },
   { name: 'f8', oid: 701, format: 'binary' },
-  { name: 'big', oid: 20, format: 'binary' },              // -> exact string
+  { name: 'big', oid: 20, format: 'binary' },              // -> BigInt (default)
   { name: 'amt', oid: 1700, format: 'text' },              // numeric stays text (no binary decoder)
   { name: 'ts', oid: 1184, format: 'binary', js: 'ms' },
   { name: 'd', oid: 1082, format: 'binary', js: 'ms' },
@@ -47,7 +47,7 @@ describe('binary result format from real PG -> queryTyped', () => {
     expect(row.ok).toBe(true)
     expect(row.f4).toBe(3.5)
     expect(row.f8).toBe(3.141592653589793)            // float8 binary == exact IEEE value
-    expect(row.big).toBe('9223372036854775807')       // int8 -> exact string
+    expect(row.big).toBe(9223372036854775807n)        // int8 -> BigInt
     expect(row.amt).toBe('12345.6789')                // numeric via text
     expect(row.ts).toBe(Date.UTC(2021, 5, 2, 12, 34, 56, 789)) // int64 µs since 2000 -> epoch ms
     expect(row.d).toBe(Date.UTC(2021, 5, 2))          // int32 days since 2000 -> epoch ms

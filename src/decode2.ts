@@ -43,6 +43,15 @@ const ASCII_EXTRA = [
 ]
 export const ASCII_SAFE = new Set([...ASCII_COMMON, ...ASCII_EXTRA])
 
+// OIDs whose BINARY result-format decode is materially faster than text (bench/per-type-decode.bench.ts):
+// int2/int4/oid 1.6-1.8x, int8 4x, float8 4.6x, date/timestamp(tz) 6-10x, bytea 3.7x. A declared shape
+// upgrades these columns to binary automatically. NOTE — for the int8:number target binary returns the exact
+// stored value while text does a digit-parse, so a shaped query can differ from a plain one beyond 2^53;
+// intentional (already-lossy). float4 is NOT here — it's conditional on the target (float4:precise -> binary
+// exact f32; bare/:pretty -> text canonical), handled in shapeCols(). EXCLUDED: bool (tie), uuid (text 3.5x
+// FASTER), text/varchar/char/name (tie), numeric/money (no binary decoder), json/jsonb (scanner parses text).
+export const BINARY_FAST = new Set([21, 23, 26, 20, 701, 1082, 1114, 1184, 17])
+
 // Read the int32 length prefix as a signed big-endian int straight from the four bytes.
 const readLen = 'l = (b[o] << 24) | (b[o + 1] << 16) | (b[o + 2] << 8) | b[o + 3]; o += 4;'
 
@@ -98,7 +107,7 @@ const tsFromBytes = (v: string, kind: 'date' | 'ms') => `{ let p = o; const e = 
         if (p < e && b[p] === 46) { p++; let f = 0, k = 0; for (; p < e && k < 3; p++) { const c = b[p]; if (c < 48 || c > 57) break; f = f * 10 + (c - 48); k++ } while (k < 3) { f *= 10; k++ } ms = f; while (p < e) { const c = b[p]; if (c < 48 || c > 57) break; p++ } }
         if (p < e && (b[p] === 43 || b[p] === 45)) { const sg = b[p] === 45 ? -1 : 1; p++; const th = (b[p] - 48) * 10 + (b[p + 1] - 48); p += 2; let tm = 0; if (p < e && b[p] === 58) { p++; tm = (b[p] - 48) * 10 + (b[p + 1] - 48); p += 2 } off = sg * (th * 60 + tm) * 60000 }
       }
-      const ems = Date.UTC(Y, Mo - 1, D, H, Mi, S, ms) - off; ${kind === 'date' ? `${v} = new Date(ems)` : `${v} = ems`} }`
+      let ems = Date.UTC(Y, Mo - 1, D, H, Mi, S, ms); if (Y <= 99) { const dd = new Date(ems); dd.setUTCFullYear(Y); ems = dd.getTime() } ems -= off; ${kind === 'date' ? `${v} = new Date(ems)` : `${v} = ems`} }`
 
 // The natural JS target for a wire OID (before any per-column override).
 export function defaultJs(oid: number): 'number' | 'string' | 'bool' | 'json' | 'bytea' | 'helper' {
@@ -123,6 +132,11 @@ function inlineSnippet(oid: number, v: string, js?: Target): [string, string] | 
   if (js === 'date' || js === 'ms') {
     if (INSTANT_OIDS.has(oid)) return [tsFromBytes(v, js), `temporal :${js}`]
     js = 'string' // :date/:ms on a non-instant type -> fall back to the exact string
+  }
+  if (js === 'bigint' || (!js && oid === 20)) return [`${v} = BigInt(${lat('o', 'o + l')})`, 'int8 bigint'] // int8/bigint -> BigInt
+  if (oid === 700 && js !== 'string') { // float4: bare/:pretty -> canonical Number(text); :precise -> exact f32 (fround)
+    const base = f64FromBytes(v)
+    return js === 'precise' ? [`${base} ${v} = Math.fround(${v})`, 'float4 :precise'] : [base, 'float4 :pretty']
   }
   const eff = js ?? defaultJs(oid)
   switch (eff) {
@@ -159,8 +173,10 @@ function binarySnippet(oid: number, v: string, js?: Target): [string, string] | 
     case 26: return [`${v} = b.readUInt32BE(o)`, 'oid bin']
     case 20: return js === 'number'
       ? [`{ ${RD64}; ${v} = hi * 4294967296 + lo }`, 'int8 bin :number']
+      : js === 'string'
       // exact decimal string with NO BigInt for the common case (|v| < 2^53); BigInt only for the rest
-      : [`{ ${RD64}; const n = hi * 4294967296 + lo; ${v} = (n >= -9007199254740991 && n <= 9007199254740991) ? '' + n : b.readBigInt64BE(o).toString() }`, 'int8 bin string']
+      ? [`{ ${RD64}; const n = hi * 4294967296 + lo; ${v} = (n >= -9007199254740991 && n <= 9007199254740991) ? '' + n : b.readBigInt64BE(o).toString() }`, 'int8 bin string']
+      : [`${v} = b.readBigInt64BE(o)`, 'int8 bin bigint'] // default -> BigInt
     case 700: return [`${v} = b.readFloatBE(o)`, 'float4 bin']
     case 701: return [`${v} = b.readDoubleBE(o)`, 'float8 bin (exact)']
     case 1114: case 1184: { // timestamp/timestamptz: int64 µs since 2000-01-01 (no BigInt). Default -> Date.

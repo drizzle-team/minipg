@@ -63,7 +63,7 @@
     "test:unit": "bun test test/unit",
     "test:integration": "bun test test/integration",
     "test:cf": "vitest run --config test/cf/vitest.config.ts",
-    "test:query": "bun test test/integration/results.test.ts test/integration/types-core.test.ts test/integration/types-advanced.test.ts test/integration/types-temporal-json.test.ts test/integration/parameters.test.ts test/integration/query-protocol.test.ts test/integration/prepared-statements.test.ts test/integration/regression.test.ts test/integration/query-shape.test.ts",
+    "test:query": "bun test test/integration/results.test.ts test/integration/types-core.test.ts test/integration/types-advanced.test.ts test/integration/types-temporal-json.test.ts test/integration/parameters.test.ts test/integration/query-protocol.test.ts test/integration/prepared-statements.test.ts test/integration/regression.test.ts test/integration/query-shape.test.ts test/integration/shape-binary.test.ts",
     "test:query:interp": "MINIPG_VARIANT=interpreted bun run test:query",
     "test:query:both": "bun run test:query && bun run test:query:interp",
     "test:smoke": "bun test/smoke.ts",

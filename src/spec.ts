@@ -3,7 +3,7 @@
 // separate from shape.ts so the connection can resolve a `{ shape }` query option WITHOUT pulling in the
 // whole-result-set codegen used by the standalone Shape() helper. No node deps (imports only json/types).
 import { isJsonMarker, splitType, type JsonMarker } from './json.ts'
-import type { CodegenCol } from './decode2.ts'
+import { BINARY_FAST, type CodegenCol } from './decode2.ts'
 
 // PG type alias -> OID. `satisfies` (not a `: Record<…>` annotation) keeps the literal keys so PgType can
 // derive the alias union straight from this map — the type list and the runtime map can never drift apart.
@@ -22,15 +22,20 @@ export type PgType = keyof typeof TYPE_OID
 // (its exact PG text). Temporal adds `:date` (default) / `:ms` (epoch number); precision adds `:number`;
 // text adds `:latin1`. So e.g. `timestamptz` offers date/ms/string — NOT :number/:latin1.
 type TemporalType = 'date' | 'timestamp' | 'timestamptz'
-type PrecisionType = 'int8' | 'bigint' | 'numeric' | 'decimal' | 'money'
+type IntType = 'int8' | 'bigint'                     // default BigInt; :number (lossy) / :string
+type NumericType = 'numeric' | 'decimal' | 'money'   // default exact string; :number (lossy)
+type Float4Type = 'float4' | 'real'                  // default/:pretty -> canonical shortest; :precise -> exact f32
 type TextType = 'text' | 'varchar' | 'bpchar' | 'char' | 'name'
 /** A column's type in a shape: a PG alias, plus the JS-target overrides valid for it (autocompletes to the
- *  known list). e.g. `'bigint'` -> exact string, `'bigint:number'` -> JS number, `'timestamptz:ms'` -> epoch ms. */
+ *  known list). e.g. `'bigint'` -> BigInt, `'bigint:number'` -> JS number, `'timestamptz:ms'` -> epoch ms,
+ *  `'float4:precise'` -> exact stored f32, `'float4:pretty'` -> PG's canonical shortest decimal. */
 export type TypeSpec =
   | PgType
   | `${PgType}:string`
   | `${TemporalType}:${'date' | 'ms'}`
-  | `${PrecisionType}:number`
+  | `${IntType}:${'number' | 'bigint'}`
+  | `${NumericType}:number`
+  | `${Float4Type}:${'precise' | 'pretty'}`
   | `${TextType}:latin1`
 /** A row shape: column name -> TypeSpec, or a Json()/Jsonb()/…Array() marker for a shaped json column. */
 export type ShapeSpec = Record<string, TypeSpec | JsonMarker>
@@ -47,6 +52,14 @@ export function shapeCols(spec: ShapeSpec): CodegenCol[] {
     const { pg, js } = splitType(t)
     const oid = (TYPE_OID as Record<string, number | undefined>)[pg.toLowerCase()] // pg is user text -> string index
     if (oid === undefined) throw new Error(`minipg: unknown type ${JSON.stringify(pg)} for column "${name}" in shape (known: ${Object.keys(TYPE_OID).join(', ')})`)
-    return { name, oid, js }
+    // Auto-request BINARY wire format for bench-proven-faster types (see BINARY_FAST). The ONLY unsafe case
+    // is `:string` on a non-int8 type: binary yields the decoded value (number/Date/Buffer), never the PG
+    // text — only int8:string reconstructs the exact decimal string from the int64. (int8:number DOES go
+    // binary — the >2^53 rounding difference is accepted. temporal:'string' via the global config is
+    // downgraded to text in Connection.resolveCols, after this.)
+    const binaryUnsafe = js === 'string' && oid !== 20
+    let binary = BINARY_FAST.has(oid) && !binaryUnsafe
+    if (oid === 700) binary = js === 'precise' // float4: only :precise (exact f32) goes binary; bare/:pretty/:string stay text (canonical)
+    return binary ? { name, oid, js, format: 'binary' } : { name, oid, js }
   })
 }

@@ -61,17 +61,17 @@ describe('int2 / int4 — number decode', () => {
 })
 
 // ===========================================================================
-describe('int8 / numeric / money — precision-safe STRING default', () => {
-  test('max bigint returns exact string, not a rounded Number', async () => {
+describe('int8 -> BigInt; numeric / money -> precision-safe string', () => {
+  test('max bigint returns a BigInt, not a rounded Number', async () => {
     const r = await c.query('select 9223372036854775807::int8 a')
-    expect(typeof aCell(r)).toBe('string')
-    expect(aCell(r)).toBe('9223372036854775807')
+    expect(typeof aCell(r)).toBe('bigint')
+    expect(aCell(r)).toBe(9223372036854775807n)
   })
 
-  test('2^53+1 round-trips as string with no precision loss', async () => {
+  test('2^53+1 round-trips as BigInt with no precision loss', async () => {
     const r = await c.query('select 9007199254740993::int8 a')
-    expect(aCell(r)).toBe('9007199254740993')
-    // sanity: the Number path WOULD corrupt this
+    expect(aCell(r)).toBe(9007199254740993n)
+    // sanity: the Number path WOULD corrupt this; BigInt is exact
     expect(Number('9007199254740993')).toBe(9007199254740992)
   })
 
@@ -90,10 +90,10 @@ describe('int8 / numeric / money — precision-safe STRING default', () => {
     expect(aCell(r)).toBe('0.30')
   })
 
-  test('COUNT(*) over t returns int8 as a JS string', async () => {
+  test('COUNT(*) over t returns int8 as a BigInt', async () => {
     const r = await c.query('select count(*) a from public.t')
-    expect(typeof aCell(r)).toBe('string')
-    expect(aCell(r)).toBe('3')
+    expect(typeof aCell(r)).toBe('bigint')
+    expect(aCell(r)).toBe(3n)
   })
 
   test('SUM over an int8 column returns a precision-preserving string', async () => {
@@ -127,11 +127,11 @@ describe('int8 / numeric / money — precision-safe STRING default', () => {
     expect(typeof aCell(r)).toBe('string')
   })
 
-  test('bigserial/int8 PK column comes back as string (via temp table)', async () => {
+  test('bigserial/int8 PK column comes back as BigInt (via temp table)', async () => {
     await c.query('create temp table tc_bs(id bigserial primary key, v text)')
     const r = await c.query("insert into tc_bs(v) values ('x') returning id")
-    expect(typeof aCell(r)).toBe('string')
-    expect(aCell(r)).toBe('1')
+    expect(typeof aCell(r)).toBe('bigint')
+    expect(aCell(r)).toBe(1n)
     await c.query('drop table tc_bs')
   })
 })
@@ -442,7 +442,7 @@ describe('UTF-8 fidelity, multibyte & NUL guards', () => {
     await c.query('create temp table tc_utf(name text)')
     await c.query("insert into tc_utf(name) values ('José'),('Jose')")
     const r = await c.query('select count(*) a from tc_utf where name = $1', ['José'])
-    expect(aCell(r)).toBe('1')
+    expect(aCell(r)).toBe(1n)
     await c.query('drop table tc_utf')
   })
 
@@ -483,15 +483,15 @@ describe('override hook & BigInt (config.types)', () => {
     } finally { await bconn.end() }
   })
 
-  test('override is opt-in: default keeps int8 as string', async () => {
+  test('default int8 is a BigInt (override can still remap it)', async () => {
     const r = await c.query('select 9223372036854775807::int8 a')
-    expect(aCell(r)).toBe('9223372036854775807')
+    expect(aCell(r)).toBe(9223372036854775807n)
   })
 
   test('BigInt param encodes implicitly via String(v) (no explicit branch)', async () => {
     expect(String(9223372036854775807n)).toBe('9223372036854775807')
     const r = await c.query('select $1::int8 a', [9223372036854775807n])
-    expect(aCell(r)).toBe('9223372036854775807')
+    expect(aCell(r)).toBe(9223372036854775807n)
   })
 
   test('int8[] / numeric[] decode as one raw string (no per-element parsing yet)', async () => {

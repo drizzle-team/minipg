@@ -432,10 +432,10 @@ describe('bigint-in-json precision', () => {
     })
   })
 
-  test('column-level int8 is lossless (decodes to STRING)', async () => {
+  test('column-level int8 is lossless (decodes to BigInt)', async () => {
     await withConn(async (c) => {
       const r = await c.query('SELECT 9007199254740993::int8')
-      expect(cell(r)).toBe('9007199254740993')
+      expect(cell(r)).toBe(9007199254740993n)
     })
   })
 

@@ -36,7 +36,7 @@ export function otel(opts: { tracer?: TracerLike; captureText?: boolean } = {}):
     onQueryEnd(span: unknown, _info: QueryInfo, m: QueryMetrics) {
       const s = span as SpanLike
       s.setAttributes?.({ 'db.response.returned_rows': m.rowCount ?? 0, 'db.client.response.body.size': m.bytesReceived,
-        'minipg.queue_wait_ms': m.queueWaitMs, 'minipg.ttfb_ms': m.ttfbMs, 'minipg.download_ms': m.downloadMs, 'minipg.decode_ms': m.decodeMs, 'minipg.total_ms': m.totalMs })
+        'minipg.queue_wait_ms': m.queueWait, 'minipg.ttfb_ms': m.ttfb, 'minipg.download_ms': m.download, 'minipg.decode_ms': m.decode, 'minipg.total_ms': m.total })
       s.end?.()
     },
     onQueryError(span: unknown, _info: QueryInfo, err: Error) {
@@ -60,7 +60,7 @@ export function sentry(opts: { client?: SentryLike; captureText?: boolean } = {}
     },
     onQueryEnd(span: unknown, _info: QueryInfo, m: QueryMetrics) {
       const s = span as SpanLike | undefined; if (!s) return
-      s.setAttributes?.({ 'db.rows': m.rowCount ?? 0, 'db.bytes': m.bytesReceived, 'db.queue_wait_ms': m.queueWaitMs, 'db.ttfb_ms': m.ttfbMs, 'db.decode_ms': m.decodeMs, 'db.total_ms': m.totalMs })
+      s.setAttributes?.({ 'db.rows': m.rowCount ?? 0, 'db.bytes': m.bytesReceived, 'db.queue_wait_ms': m.queueWait, 'db.ttfb_ms': m.ttfb, 'db.decode_ms': m.decode, 'db.total_ms': m.total })
       s.end?.()
     },
     onQueryError(span: unknown, _info: QueryInfo, err: Error) {

@@ -23,12 +23,12 @@ describe('plugin metrics', () => {
     expect(metrics.command).toBe('SELECT')
     expect(metrics.rowCount).toBe(50)
     expect(metrics.columnCount).toBe(1)
-    expect(metrics.totalMs).toBeGreaterThan(0)
+    expect(metrics.total).toBeGreaterThan(0)
     expect(metrics.bytesSent).toBeGreaterThan(0)
     expect(metrics.bytesReceived).toBeGreaterThan(0)
-    expect(metrics.queueWaitMs).toBeGreaterThanOrEqual(0)
-    expect(metrics.ttfbMs).toBeGreaterThanOrEqual(0)
-    expect(metrics.decodeMs).toBeGreaterThanOrEqual(0)
+    expect(metrics.queueWait).toBeGreaterThanOrEqual(0)
+    expect(metrics.ttfb).toBeGreaterThanOrEqual(0)
+    expect(metrics.decode).toBeGreaterThanOrEqual(0)
   })
 
   test('collector receives an error event on a failing query', async () => {
@@ -47,9 +47,26 @@ describe('plugin metrics', () => {
     expect(r.metrics).toBeDefined()
     expect(r.metrics!.rowCount).toBe(1)
     expect(r.metrics!.columnCount).toBe(2)
-    expect(r.metrics!.totalMs).toBeGreaterThan(0)
+    expect(r.metrics!.unit).toBe('ms')
+    expect(r.metrics!.total).toBeGreaterThan(0)
     const plain = await c.query('select 1') // no metrics option -> undefined
     expect(plain.metrics).toBeUndefined()
+  })
+
+  test("metrics: 'ms' | 'us' report integer durations in the chosen unit", async () => {
+    const c = await connect(CFG); open.push(c)
+    const sql = 'select * from generate_series(1,200) g'
+    const durations = (m: NonNullable<Awaited<ReturnType<typeof c.query>>['metrics']>) => [m.queueWait, m.write, m.ttfb, m.download, m.decode, m.total]
+    const mms = (await c.query(sql, [], { metrics: 'ms' })).metrics!
+    expect(mms.unit).toBe('ms')
+    expect(durations(mms).every(Number.isInteger)).toBe(true) // whole ms, no floating point
+    const mus = (await c.query(sql, [], { metrics: 'us' })).metrics!
+    expect(mus.unit).toBe('us')
+    expect(durations(mus).every(Number.isInteger)).toBe(true) // whole microseconds
+    expect(mus.total).toBeGreaterThan(0) // sub-ms queries keep resolution in us (unlike coarse ms rounding)
+    const mtrue = (await c.query(sql, [], { metrics: true })).metrics!
+    expect(mtrue.unit).toBe('ms')
+    expect(mtrue.total).toBeGreaterThan(0) // `true` keeps sub-ms floating-point ms (not rounded)
   })
 })
 
