@@ -28,6 +28,7 @@ export type { ShapeSpec, TypeSpec, PgType } from './spec.ts'
 export { Json, JsonArray, Jsonb, JsonbArray } from './json.ts'
 export type { JsonSpec, JsonMarker, JsTarget } from './json.ts'
 export type {
-  ConnectConfig, PoolConfig, QueryOptions, StreamOptions,
+  ConnectConfig, PoolConfig, QueryOptions, StreamOptions, TxOptions,
   QueryResult, ResultMode, Decoder, Field,
 } from './types.ts'
+export type { TxFn } from './connection.ts'

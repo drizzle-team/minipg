@@ -579,23 +579,20 @@ describe('session / SET state across pool checkouts (GUC behavior)', () => {
 })
 
 // ---------------------------------------------------------------------------
-describe('begin()/transaction helper sugar [roadmap]', () => {
-  test('public surface exposes no template-tag / begin() transaction helper', async () => {
+describe('begin()/transaction helper sugar', () => {
+  test('public surface exposes begin()/transaction() on pool + connection (template-tag sql still absent)', async () => {
     const pool = testPool({ max: 1 })
     const c = await testConnect()
     try {
-      // minipg drives transactions with raw query() only — no sugar methods exist.
-      expect((pool as unknown as Record<string, unknown>).begin).toBeUndefined()
-      expect((pool as unknown as Record<string, unknown>).transaction).toBeUndefined()
-      expect((c as unknown as Record<string, unknown>).begin).toBeUndefined()
-      expect((c as unknown as Record<string, unknown>).sql).toBeUndefined()
+      // COMMIT/ROLLBACK/return-value/nesting/isolation/pipelining behaviour is covered in transaction-api.test.ts.
+      expect(typeof (pool as unknown as Record<string, unknown>).begin).toBe('function')
+      expect(typeof (pool as unknown as Record<string, unknown>).transaction).toBe('function')
+      expect(typeof (c as unknown as Record<string, unknown>).begin).toBe('function')
+      expect(typeof (c as unknown as Record<string, unknown>).transaction).toBe('function')
+      expect((c as unknown as Record<string, unknown>).sql).toBeUndefined() // no template-tag API
     } finally { await c.end(); await pool.end() }
   })
 
-  test.todo('pool.begin(cb) COMMITs on resolve, ROLLBACKs on throw, rejects with the original PgError', () => {})
-  test.todo('an error handled inside begin() does not surface as an unhandled outer rejection', () => {})
-  test.todo('begin() acquires a dedicated connection for the whole span and always releases it', () => {})
-  test.todo('nested begin() issues SAVEPOINT; inner rollback rolls back only the savepoint', () => {})
   test.todo('graceful rollback sentinel rolls back without throwing and keeps the connection usable', () => {})
 })
 

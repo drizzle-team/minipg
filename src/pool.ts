@@ -5,8 +5,9 @@
 // recovering database. Dead idle connections are evicted on checkout; open transactions
 // are rolled back before reuse. In-flight queries are never silently replayed.
 import { Connection } from './connection.ts'
+import type { TxFn } from './connection.ts'
 import { resolveUrl } from './url.ts'
-import type { PoolConfig, QueryOptions, QueryResult } from './types.ts'
+import type { PoolConfig, QueryOptions, QueryResult, TxOptions } from './types.ts'
 
 interface Waiter { resolve: (c: Connection) => void; reject: (e: Error) => void }
 
@@ -221,24 +222,50 @@ export class Pool {
     return new PoolQuery(this, sql, params, opts).execute()
   }
 
-  /** Run a set of lazy `query()` objects together, results returned in input order. `'pipelined'` (the
-   *  default) runs them on ONE checked-out connection so they pipeline — 1 round trip, 1 connection, one
-   *  saturated backend. `'concurrently'` fans them out across connections — parallel backends, N connections. */
-  batch(queries: PoolQuery[]): Promise<QueryResult<never>[]>
-  batch(mode: 'pipelined' | 'concurrently', queries: PoolQuery[]): Promise<QueryResult<never>[]>
-  async batch(a: 'pipelined' | 'concurrently' | PoolQuery[], b?: PoolQuery[]): Promise<QueryResult<never>[]> {
-    const mode = typeof a === 'string' ? a : 'pipelined'
-    const queries = typeof a === 'string' ? b! : a
-    if (mode === 'concurrently') return Promise.all(queries) // each self-acquires -> fan out across connections
-    const conn = await this.acquire()                        // one reserved connection -> the set pipelines on it
+  /** Run a set of `query()` objects as ONE ATOMIC transaction on a single connection: BEGIN, pipeline
+   *  them, COMMIT — or ROLLBACK and reject if ANY fails (all-or-nothing). Results in input order. Reach
+   *  for pipeline() when the queries are independent (no atomicity), or parallel() to fan out. */
+  batch(queries: PoolQuery[]): Promise<QueryResult<never>[]> {
+    return this.begin((tx) => Promise.all(queries.map((q) => q.runOn(tx))))
+  }
+
+  /** Pipeline a set of queries on ONE connection with NO transaction: sent back-to-back (~1 round trip),
+   *  results in input order, each its OWN autocommit — a failure rejects that query but does NOT roll back
+   *  the others (they've already committed). Use batch() when you need all-or-nothing atomicity. */
+  async pipeline(queries: PoolQuery[]): Promise<QueryResult<never>[]> {
+    const conn = await this.acquire()
     try { return await Promise.all(queries.map((q) => q.runOn(conn))) }
     finally { this.release(conn) }
+  }
+
+  /** Run a set of queries concurrently, FANNED OUT across connections (parallel backends), results in
+   *  input order. Best when queries are independent and you have connections to spare — parallelizes
+   *  server-side execution, at the cost of N connections. */
+  parallel(queries: PoolQuery[]): Promise<QueryResult<never>[]> {
+    return Promise.all(queries) // each PoolQuery self-acquires its own connection
   }
 
   /** Check out a dedicated connection (e.g. for a transaction). `release()` is idempotent. */
   async connect(): Promise<{ client: Connection; release: () => void }> {
     const client = await this.acquire()
     return { client, release: () => this.release(client) }
+  }
+
+  /** Run `fn` inside a transaction on a reserved pool connection: checks out a connection, sends BEGIN
+   *  (with optional isolation/mode options), runs the callback, then COMMITs (returning its value) or
+   *  ROLLBACKs and rethrows — and always releases the connection. A nested `tx.begin(...)` uses a SAVEPOINT.
+   *  `transaction()` is an alias. Queries issued concurrently inside pipeline on the one reserved connection. */
+  begin<T>(fn: TxFn<T>): Promise<T>
+  begin<T>(options: TxOptions, fn: TxFn<T>): Promise<T>
+  begin<T>(a: TxOptions | TxFn<T>, b?: TxFn<T>): Promise<T> { return this.withTx(a, b) }
+  transaction<T>(fn: TxFn<T>): Promise<T>
+  transaction<T>(options: TxOptions, fn: TxFn<T>): Promise<T>
+  transaction<T>(a: TxOptions | TxFn<T>, b?: TxFn<T>): Promise<T> { return this.withTx(a, b) }
+
+  private async withTx<T>(a: TxOptions | TxFn<T>, b?: TxFn<T>): Promise<T> {
+    const conn = await this.acquire()
+    try { return await (typeof a === 'function' ? conn.begin(a) : conn.begin(a, b!)) }
+    finally { this.release(conn) } // release() rolls back if fn left the conn in a tx (defensive) and checks it back in
   }
 
   async end(): Promise<void> {

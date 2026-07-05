@@ -118,6 +118,17 @@ export interface ConnectConfig {
   plugins?: Plugin[]
 }
 
+/** Options for begin()/transaction(). A raw string is appended to `BEGIN` as-is (sanitized to letters/
+ *  spaces, postgres.js-style); the object form builds the ISOLATION LEVEL / READ ONLY·WRITE / DEFERRABLE
+ *  clauses for you. Applies only to the top-level BEGIN — a nested begin becomes a SAVEPOINT and ignores it. */
+export type TxOptions =
+  | string
+  | {
+      isolation?: 'serializable' | 'repeatable read' | 'read committed' | 'read uncommitted'
+      readOnly?: boolean
+      deferrable?: boolean
+    }
+
 export interface QueryOptions {
   /** Reuse a server-side prepared statement under this name (parse once, bind many). */
   name?: string

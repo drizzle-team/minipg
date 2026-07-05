@@ -5,7 +5,7 @@ import { W, Writer, writeParse, writeDescribe, writeBind, writeExecute, writeClo
 import { md5Password, scram, type Scram } from './auth.ts'
 import { buildDecoders, decoderFor, encodeParam } from './codec.ts'
 import { PgError, parseErrorFields } from './errors.ts'
-import type { ConnectConfig, Decoder, Field, QueryDebug, QueryOptions, QueryResult, ResultMode, StreamOptions } from './types.ts'
+import type { ConnectConfig, Decoder, Field, QueryDebug, QueryOptions, QueryResult, ResultMode, StreamOptions, TxOptions } from './types.ts'
 import { INSTANT_OIDS, BINARY_FAST, type CodegenCol } from './decode2.ts'
 import { buildMapperFactory, type RowMapper, type RowMapperFactory } from './mapper.ts'
 import { resolveUrl } from './url.ts'
@@ -44,6 +44,21 @@ const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms))
 const RTT_WINDOW = 5 // keep this many most-recent round-trip samples (ms) for connection.rtt
 const DEFAULT_PIPELINE_DEPTH = 100 // max in-flight queries on one connection when pipelining is on (matches postgres.js)
 const FLUSH_THRESHOLD = 64 * 1024  // flush the batch immediately once it reaches this many bytes, even in microtask mode (bounds memory, starts the transfer)
+
+/** The callback run inside begin()/transaction(), given the transaction-scoped connection. */
+export type TxFn<T> = (tx: Connection) => T | Promise<T>
+
+// Build the `BEGIN …` statement from TxOptions. String form is sanitized (letters/spaces only) like
+// postgres.js; the object form composes the standard clauses. Values are a fixed vocabulary, so safe.
+function beginClause(o: TxOptions | undefined): string {
+  if (o == null) return 'begin'
+  if (typeof o === 'string') { const s = o.replace(/[^a-zA-Z ]/g, '').trim(); return s ? 'begin ' + s : 'begin' }
+  const parts: string[] = []
+  if (o.isolation) parts.push('isolation level ' + o.isolation)
+  if (o.readOnly != null) parts.push(o.readOnly ? 'read only' : 'read write')
+  if (o.deferrable != null) parts.push(o.deferrable ? 'deferrable' : 'not deferrable')
+  return parts.length ? 'begin ' + parts.join(' ') : 'begin'
+}
 
 // Detect a transaction-mode pooler (where server-side NAMED prepared statements are unsafe — a Parse on
 // one backend may not exist on the next Bind). Used only to DEFAULT `prepare` off; explicit config wins.
@@ -189,6 +204,7 @@ export class Connection {
   private flushScheduled = false // a microtask flush is pending (guards against scheduling more than one)
   private _maxInflight = 0      // high-water mark of concurrent in-flight queries (diagnostics / tests)
   private _flushes = 0          // count of outbound socket writes for query batches (coalescing diagnostic)
+  private spCounter = 0         // monotonic counter for auto-generated SAVEPOINT names (nested begin)
   private rttSamples: number[] = [] // network round-trip samples (ms), oldest→newest, capped at RTT_WINDOW
   private lastPingAt = 0            // send time of the last handshake msg awaiting a reply (0 = none pending)
   private prepared = new Map<string, { sql: string; fields: Field[] }>()
@@ -783,6 +799,44 @@ export class Connection {
       this.processQueue()
     })
     return opts.trace ? this.retraced(p) : p
+  }
+
+  /** Run `fn` inside a transaction on THIS connection. Sends BEGIN (with optional isolation/mode options),
+   *  runs the callback with the transaction-scoped connection (`tx === this`), then COMMITs and resolves
+   *  with the callback's return value — or ROLLBACKs and rethrows if it throws. A begin() while already in
+   *  a transaction nests via SAVEPOINT (partial rollback). `transaction()` is an alias. Queries issued
+   *  concurrently inside (e.g. Promise.all) pipeline on this one connection. */
+  begin<T>(fn: TxFn<T>): Promise<T>
+  begin<T>(options: TxOptions, fn: TxFn<T>): Promise<T>
+  begin<T>(a: TxOptions | TxFn<T>, b?: TxFn<T>): Promise<T> {
+    return typeof a === 'function' ? this.runTx(undefined, a) : this.runTx(a, b!)
+  }
+  transaction<T>(fn: TxFn<T>): Promise<T>
+  transaction<T>(options: TxOptions, fn: TxFn<T>): Promise<T>
+  transaction<T>(a: TxOptions | TxFn<T>, b?: TxFn<T>): Promise<T> {
+    return typeof a === 'function' ? this.runTx(undefined, a) : this.runTx(a, b!)
+  }
+
+  private async runTx<T>(options: TxOptions | undefined, fn: TxFn<T>): Promise<T> {
+    if (this.inTransaction) {
+      // nested: a SAVEPOINT (options don't apply — the outermost BEGIN already set the tx's isolation/mode)
+      const sp = `minipg_sp_${++this.spCounter}`
+      await this.query(`savepoint ${sp}`)
+      try { const r = await fn(this); await this.query(`release savepoint ${sp}`); return r }
+      catch (e) {
+        // roll back to the savepoint (clears any aborted state) and release it; the outer tx continues.
+        try { await this.query(`rollback to savepoint ${sp}`); await this.query(`release savepoint ${sp}`) } catch { /* connection may be broken */ }
+        throw e
+      }
+    }
+    await this.query(beginClause(options))
+    try { const r = await fn(this); await this.query('commit'); return r }
+    catch (e) {
+      // COMMIT that failed already ended the tx server-side, so this ROLLBACK is a harmless no-op then;
+      // otherwise it undoes the work. Either way rethrow the ORIGINAL error.
+      try { await this.query('rollback') } catch { /* connection may be broken; release()/reconnect handles it */ }
+      throw e
+    }
   }
 
   // `trace`: run the query promise through an async wrapper so a rejection is re-thrown as a fresh error born
