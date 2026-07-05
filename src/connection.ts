@@ -30,6 +30,8 @@ export interface NormalizedConfig {
   ssl: Exclude<NonNullable<ConnectConfig['ssl']>, 'disable'> // 'disable' normalized to false
   applicationName: string; connectTimeout: number; decoders: Map<number, Decoder>
   prepare: boolean // false -> never use server-side named prepared statements (transaction-pooler safe)
+  pipelineDepth: number // max queries in flight on one connection at once (1 = gated / no pipelining)
+  pipelineFlush: 'sync' | 'microtask' // batch same-tick writes into one socket write ('microtask') or write per dispatch ('sync')
   temporal: 'date' | 'string' // default decode for date/timestamp(tz) columns without an explicit target
   reuseBinaryOids: Set<number> // BINARY_FAST minus config.types overrides: cols to upgrade to binary on prepared-statement reuse
   reconnect: { enabled: boolean; base: number; max: number; maxRetries: number | null }
@@ -39,6 +41,9 @@ export interface NormalizedConfig {
 }
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms))
+const RTT_WINDOW = 5 // keep this many most-recent round-trip samples (ms) for connection.rtt
+const DEFAULT_PIPELINE_DEPTH = 100 // max in-flight queries on one connection when pipelining is on (matches postgres.js)
+const FLUSH_THRESHOLD = 64 * 1024  // flush the batch immediately once it reaches this many bytes, even in microtask mode (bounds memory, starts the transfer)
 
 // Detect a transaction-mode pooler (where server-side NAMED prepared statements are unsafe — a Parse on
 // one backend may not exist on the next Bind). Used only to DEFAULT `prepare` off; explicit config wins.
@@ -76,6 +81,8 @@ interface Task {
   _retryErrors?: string[] // SQLSTATE codes of the swallowed attempts
   _repreparedSqlChanged?: boolean // the name was cached with DIFFERENT SQL -> old statement deallocated + re-Parsed
   _instrDone?: boolean // guard so onQueryEnd/Error fires exactly once across the settle paths
+  _wAt?: number // write timestamp (performance.now) — for the always-on live round-trip sample
+  _rttDone?: boolean // guard so a query contributes at most one RTT sample (its first response byte)
   fields?: Field[]
   mapper?: RowMapper
   command?: string | null
@@ -144,11 +151,46 @@ export class Connection {
   /** True if the connection is inside (or in a failed) transaction. */
   get inTransaction(): boolean { return this.txStatus === 'T' || this.txStatus === 'E' }
 
+  // The task currently receiving results — the head of the in-flight FIFO. Every backend message
+  // (RowDescription/DataRow/CommandComplete/Error) belongs to it until its ReadyForQuery arrives.
+  private get current(): Task | null { return this.inflight[0] ?? null }
+
+  /** Live scheduler snapshot: how many queries are queued, in flight now, and the max ever in flight
+   *  at once (a nonzero-above-1 max confirms pipelining actually engaged). */
+  get stats(): { queued: number; inflight: number; maxInflight: number; pipelineDepth: number; writes: number } {
+    return { queued: this.queue.length, inflight: this.inflight.length, maxInflight: this._maxInflight, pipelineDepth: this.cfg.pipelineDepth, writes: this._flushes }
+  }
+
+  /** Recent network round-trip samples in ms (oldest→newest, up to RTT_WINDOW). Seeded at connect
+   *  from the auth-handshake legs (the polluted startup→first-response leg is skipped), then kept
+   *  fresh by each query's time-to-first-byte. `min` ≈ the network floor; `avg` smooths jitter.
+   *  Handy for tuning things like pipelining. All fields are null/empty until the first sample. */
+  get rtt(): { avg: number | null; min: number | null; last: number | null; count: number; samples: number[] } {
+    const s = this.rttSamples
+    if (s.length === 0) return { avg: null, min: null, last: null, count: 0, samples: [] }
+    let sum = 0, min = Infinity
+    for (const x of s) { sum += x; if (x < min) min = x }
+    return { avg: sum / s.length, min, last: s[s.length - 1]!, count: s.length, samples: s.slice() }
+  }
+  private recordRtt(ms: number): void {
+    if (!Number.isFinite(ms) || ms < 0) return
+    this.rttSamples.push(ms)
+    if (this.rttSamples.length > RTT_WINDOW) this.rttSamples.shift()
+  }
+  private markPing(): void { this.lastPingAt = performance.now() }                                                    // sent a client msg that expects a reply
+  private pong(): void { if (this.lastPingAt > 0) { this.recordRtt(performance.now() - this.lastPingAt); this.lastPingAt = 0 } } // …its reply arrived: record + disarm
+
   private socket: Duplex | null = null
   private parser = new Parser()
-  private writer = new Writer() // reused per task: one growable buffer, no per-message allocs
   private queue: Task[] = []
-  private current: Task | null = null
+  private inflight: Task[] = [] // in-flight FIFO (oldest→newest); the backend replies in this order, so the
+                               // head (inflight[0]) is the task currently receiving results. length ≤ pipelineDepth
+  private outbuf = new Writer() // outbound batch: pipelined tasks serialize here, flushed once per dispatch pass
+  private flushScheduled = false // a microtask flush is pending (guards against scheduling more than one)
+  private _maxInflight = 0      // high-water mark of concurrent in-flight queries (diagnostics / tests)
+  private _flushes = 0          // count of outbound socket writes for query batches (coalescing diagnostic)
+  private rttSamples: number[] = [] // network round-trip samples (ms), oldest→newest, capped at RTT_WINDOW
+  private lastPingAt = 0            // send time of the last handshake msg awaiting a reply (0 = none pending)
   private prepared = new Map<string, { sql: string; fields: Field[] }>()
   private staleStatements = new Set<string>() // names invalidated by DDL (0A000/26000) — Close before re-Parse
   private mapperCache = new Map<string, RowMapper>() // per-shape row mappers (standard + typed queries)
@@ -174,6 +216,7 @@ export class Connection {
     const user = config.user || process.env.PGUSER || defaultUser()
     const host = config.host || process.env.PGHOST || 'localhost'
     const port = config.port || Number(process.env.PGPORT) || 5432
+    const pooled = transactionPoolerDetected(host, port) // gates the `prepare` + `pipeline` auto-defaults
     this.cfg = {
       host,
       port,
@@ -183,7 +226,11 @@ export class Connection {
       ssl: config.ssl && config.ssl !== 'disable' ? config.ssl : false, // 'disable'/falsy -> no TLS
       applicationName: config.applicationName || 'minipg',
       connectTimeout: config.connectTimeout ?? 30000,
-      prepare: config.prepare ?? !transactionPoolerDetected(host, port), // explicit wins; else off behind a pooler
+      prepare: config.prepare ?? !pooled, // explicit wins; else off behind a pooler
+      // Pipelining: default on (auto-off behind a transaction pooler, where multiple in-flight implicit
+      // transactions on one client conn confuse the pooler's per-tx server assignment). Explicit wins.
+      pipelineDepth: ((p) => (p === false ? 1 : p === true ? DEFAULT_PIPELINE_DEPTH : p == null ? (pooled ? 1 : DEFAULT_PIPELINE_DEPTH) : Math.max(1, p.depth ?? DEFAULT_PIPELINE_DEPTH)))(config.pipeline),
+      pipelineFlush: (typeof config.pipeline === 'object' && config.pipeline.flush) || 'microtask', // coalesce same-tick writes by default
       temporal: config.temporal ?? 'date',
       decoders: buildDecoders(config.types, config.jsonBigints),
       // types to auto-upgrade to binary on prepared-statement reuse — the bench-fast set, minus any OID the
@@ -298,7 +345,11 @@ export class Connection {
   private onData(chunk: Buffer | Uint8Array): void {
     // Web-stream transports (Deno/Cloudflare) deliver Uint8Array; wrap as a Buffer view (no copy).
     const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk.buffer, chunk.byteOffset, chunk.byteLength)
-    const p = this.current?.perf; if (p) { if (p.tFirst === undefined) p.tFirst = performance.now(); p.recv += buf.length }
+    const cur = this.current
+    // always-on live RTT: this query's first response byte -> round-trip = time-to-first-byte (network + the
+    // server's time to first byte). One sample per query (guarded), independent of the metrics/telemetry path.
+    if (cur && cur._wAt !== undefined && cur._rttDone !== true) { cur._rttDone = true; this.recordRtt(performance.now() - cur._wAt) }
+    const p = cur?.perf; if (p) { if (p.tFirst === undefined) p.tFirst = performance.now(); p.recv += buf.length }
     let messages
     try { messages = this.parser.push(buf) } catch (e) { return this.onSocketDown(e as Error) }
     // A throw in a handler (protocol desync) tears down the socket; recoverable per-row
@@ -333,17 +384,17 @@ export class Connection {
     const code = body.readInt32BE(0)
     const sock = this.socket!
     switch (code) {
-      case 0: return // AuthenticationOk
-      case 3: sock.write(W.password(this.cfg.password)); return // cleartext
-      case 5: sock.write(W.password(md5Password(this.cfg.user, this.cfg.password, body.subarray(4, 8)))); return // md5
+      case 0: this.pong(); return // AuthenticationOk — records the md5/cleartext password leg (SCRAM already recorded at 12)
+      case 3: this.markPing(); sock.write(W.password(this.cfg.password)); return // cleartext
+      case 5: this.markPing(); sock.write(W.password(md5Password(this.cfg.user, this.cfg.password, body.subarray(4, 8)))); return // md5
       case 10: { // SASL
         const mechs = readCstrings(body.subarray(4))
         if (!mechs.includes('SCRAM-SHA-256')) return this.failAttempt(Object.assign(new Error('unsupported SASL mechanisms: ' + mechs.join(', ')), { fatal: true }))
         this.scramState = scram(this.cfg.password)
-        sock.write(W.saslInitial(this.scramState.mechanism, this.scramState.clientFirst)); return
+        this.markPing(); sock.write(W.saslInitial(this.scramState.mechanism, this.scramState.clientFirst)); return
       }
-      case 11: sock.write(W.saslResponse(this.scramState!.continue(body.subarray(4).toString('utf8')))); return // SASLContinue
-      case 12: { try { this.scramState!.final(body.subarray(4).toString('utf8')) } catch (e) { this.failAttempt(Object.assign(e as Error, { fatal: true })) } return } // SASLFinal
+      case 11: this.pong(); this.markPing(); sock.write(W.saslResponse(this.scramState!.continue(body.subarray(4).toString('utf8')))); return // SASLContinue: record client-first→server-first, send client-final
+      case 12: { this.pong(); try { this.scramState!.final(body.subarray(4).toString('utf8')) } catch (e) { this.failAttempt(Object.assign(e as Error, { fatal: true })) } return } // SASLFinal: record client-final→server-final
       default: return this.failAttempt(Object.assign(new Error('unsupported authentication request: ' + code), { fatal: true }))
     }
   }
@@ -420,23 +471,61 @@ export class Connection {
     if (t.onRow) t.onRow(row); else t.rows.push(row)
   }
 
+  // Dispatch as many queued tasks as the pipeline depth allows, then flush them in one socket write.
+  // Depth 1 (pipelining off) makes this a strict one-at-a-time gate — identical to the pre-pipelining
+  // behaviour. A serialize failure rejects that task and the loop moves on (no re-entrancy needed).
   private processQueue(): void {
-    if (this.state !== 'ready' || this.current || !this.queue.length) return
-    this.startTask(this.queue.shift()!)
+    if (this.state !== 'ready') return
+    while (this.queue.length && this.inflight.length < this.cfg.pipelineDepth && this.canStartNext()) {
+      this.startTask(this.queue.shift()!)
+    }
+    // Coalesce writes: in 'microtask' mode, defer the flush so queries issued across SEPARATE query() calls
+    // in the same tick (e.g. Promise.all) leave in ONE socket write. Flush synchronously when pipelining is
+    // off (depth 1 — nothing to coalesce) or once the batch is already large (bound memory, start the wire
+    // transfer). A microtask that fires after a sync flush just finds an empty batch and no-ops.
+    if (this.cfg.pipelineFlush === 'microtask' && this.cfg.pipelineDepth > 1 && this.outbuf.mark() < FLUSH_THRESHOLD) this.scheduleFlush()
+    else this.flushWrites()
+  }
+
+  // Defer one flush to the microtask checkpoint (end of the current synchronous stack, before any I/O), so
+  // queries issued back-to-back in this tick batch into a single write. Only one is ever outstanding.
+  private scheduleFlush(): void {
+    if (this.flushScheduled) return
+    this.flushScheduled = true
+    queueMicrotask(() => { this.flushScheduled = false; this.flushWrites() })
+  }
+
+  // Barrier for stream queries: a stream pauses the socket for backpressure, which would stall every
+  // pipelined query behind it, so a stream runs SOLO — nothing else in flight while it runs, and it
+  // waits for the pipeline to drain before starting. (FIFO: we never dispatch past a queued stream.)
+  private canStartNext(): boolean {
+    if (this.inflight.length === 0) return true
+    if (this.inflight[0]!.stream) return false // a stream owns the connection until it ends
+    return !this.queue[0]!.stream               // don't start a stream while other queries are in flight
+  }
+
+  // Flush the accumulated outbound batch as one socket write. The buffer is copied (Node may retain the
+  // reference under backpressure) so the reusable Writer can be reset and refilled immediately.
+  private flushWrites(): void {
+    if (this.outbuf.mark() === 0) return
+    const bytes = Buffer.from(this.outbuf.slice())
+    this.outbuf.reset()
+    this._flushes++
+    this.socket?.write(bytes)
   }
 
   private startTask(t: Task): void {
-    // Serialize first: param/SQL encoding can throw (e.g. NUL bytes). Only commit
-    // `this.current` once we have bytes to write, so a throw can't wedge the queue.
-    let payload: Buffer
+    // Serialize into the shared outbound batch. Param/SQL encoding can throw (e.g. NUL bytes); we snapshot
+    // the batch offset first and rewind to it on a throw, so a bad task leaves earlier batched tasks intact
+    // and can't wedge the queue. The task only joins `inflight` once it has valid bytes.
     if (t.perf) t.perf.tStart = performance.now() // execution begins (queue wait ends here)
+    const w = this.outbuf
+    const mark = w.mark()
     try {
       if (!Array.isArray(t.params)) throw new TypeError('params must be an array')
       const enc = t.params.map(encodeParam)
       const name = t.name ?? ''
       let reuse = false
-      const w = this.writer
-      w.reset()
       if (t.name) {
         const cached = this.prepared.get(t.name)
         if (cached && cached.sql === t.sql) {
@@ -466,19 +555,17 @@ export class Connection {
       }
       t._reused = reuse; if (t.info) t.info.prepared = reuse
       writeBind(w, '', name, enc, t.resultFormat ?? 0); writeExecute(w, '', 0); writeSync(w)
-      // Safe to hand the reusable slice to write(): one query is in flight at a time,
-      // so the buffer isn't reset until ReadyForQuery (i.e. after the bytes flushed).
-      payload = w.slice()
-      if (t.perf) t.perf.sent = payload.length
+      if (t.perf) t.perf.sent = w.mark() - mark // bytes this query contributed to the batch
     } catch (e) {
+      w.rewind(mark) // discard this task's partial bytes; earlier batched tasks stay intact
       this.rejectTask(t, e as Error)
-      queueMicrotask(() => this.processQueue())
       return
     }
-    this.current = t
+    this.inflight.push(t)
+    if (this.inflight.length > this._maxInflight) this._maxInflight = this.inflight.length
     if (t.timeout != null) t.timer = setTimeout(() => this.cancelTask(t, Object.assign(new Error(`query timed out after ${t.timeout}ms`), { code: 'QUERY_TIMEOUT' })), t.timeout)
-    this.socket!.write(payload)
-    if (t.perf) { t.perf.tWrite = performance.now(); this.fireStart(t) } // query now in flight
+    t._wAt = performance.now() // stamp send time for the always-on live RTT sample (reused as tWrite when instrumented)
+    if (t.perf) { t.perf.tWrite = t._wAt; this.fireStart(t) } // query now in flight (the batch is flushed by processQueue)
   }
 
   // Arm an AbortSignal on a task. Returns true if it was already aborted (and settled now).
@@ -499,11 +586,18 @@ export class Connection {
     if (task.settled) return
     task.settled = true
     if (task.timer) clearTimeout(task.timer)
-    if (this.current === task) {
+    const idx = this.inflight.indexOf(task)
+    if (idx >= 0) {
+      // Already on the wire: settle the caller now; its result still streams back and finishTask discards
+      // it (it's settled). An out-of-band CancelRequest cancels whatever the backend is CURRENTLY running —
+      // accurate only for the head (idx 0); for a query queued behind the head in the pipeline we just let
+      // it run and drop the result (cancelling would hit the wrong query).
       this.fireEnd(task, reason)
       this.rejectTask(task, reason)
-      this.sendCancelRequest()
-      task.graceTimer = setTimeout(() => { try { this.socket?.destroy() } catch { /* */ } }, 5000) // dead-network fallback
+      if (idx === 0) {
+        this.sendCancelRequest()
+        task.graceTimer = setTimeout(() => { try { this.socket?.destroy() } catch { /* */ } }, 5000) // dead-network fallback
+      }
     } else {
       const i = this.queue.indexOf(task); if (i >= 0) this.queue.splice(i, 1)
       task.signalCleanup?.()
@@ -520,7 +614,7 @@ export class Connection {
   }
 
   private finishTask(): void {
-    const t = this.current; this.current = null
+    const t = this.inflight.shift() ?? null // the head completed (its ReadyForQuery arrived); the next in-flight becomes head
     if (!t) { this.processQueue(); return }
     // A prepared statement invalidated by DDL — 0A000 "cached plan must not change result type" or 26000
     // "prepared statement does not exist" — is dropped from the cache and transparently RE-RUN once. Both
@@ -541,7 +635,11 @@ export class Connection {
           t.error = undefined; t.rows = []; t.command = undefined; t.rowCount = undefined; t.fields = undefined; t._debugCols = undefined; t._reused = undefined
           if (t.perf) t.perf.tFirst = undefined // measure the retry's ttfb, not the failed attempt's error response
           if (!t.binary) t.resultFormat = undefined // plain query: re-run as text; { binary: true } keeps all-binary
-          this.queue.unshift(t); this.processQueue(); return // re-run next; onQueryStart/End still fire exactly once
+          // Re-run at the BACK of the queue (not the front) — one uniform mechanic for gated AND pipelined
+          // transport: under pipelining a front re-run can't preempt queries already in flight anyway, and
+          // the failed attempt had no side effects (0A000/26000 fire pre-execution) so the later position is
+          // correctness-safe. For the sequential-await case the queue is otherwise empty, so it's a no-op.
+          this.queue.push(t); this.processQueue(); return // onQueryStart/End still fire exactly once
         }
       }
     }
@@ -565,9 +663,10 @@ export class Connection {
   // Settle (reject) the in-flight query and everything queued — the "every
   // terminal event settles, no hung promise" invariant. Shared by fatal() and end().
   private settlePending(e: Error): void {
-    // Prefer an informative server error already received for the in-flight query
-    // (e.g. a FATAL 57P01 admin_shutdown that arrives just before the socket closes).
-    if (this.current) { const t = this.current; this.current = null; if (t.timer) clearTimeout(t.timer); if (t.graceTimer) clearTimeout(t.graceTimer); t.signalCleanup?.(); if (!t.settled) { const reason = t.error ?? e; this.fireEnd(t, reason); this.rejectTask(t, reason) } }
+    this.outbuf.reset() // drop any batched-but-unflushed bytes
+    // Reject every in-flight query. Prefer an informative server error already received for one (e.g. a
+    // FATAL 57P01 admin_shutdown that arrives just before the socket closes); the rest take the given error.
+    while (this.inflight.length) { const t = this.inflight.shift()!; if (t.timer) clearTimeout(t.timer); if (t.graceTimer) clearTimeout(t.graceTimer); t.signalCleanup?.(); if (!t.settled) { const reason = t.error ?? e; this.fireEnd(t, reason); this.rejectTask(t, reason) } }
     while (this.queue.length) { const t = this.queue.shift()!; t.signalCleanup?.(); if (!t.settled) { this.rejectTask(t, e) } }
   }
 
@@ -595,8 +694,9 @@ export class Connection {
     if (this.connecting) return this.failAttempt(err)
     const dead = this.socket; this.socket = null // claim the death; further events from `dead` are ignored
     try { dead?.destroy() } catch { /* */ }
-    const t = this.current; this.current = null
-    if (t) { if (t.timer) clearTimeout(t.timer); if (t.graceTimer) clearTimeout(t.graceTimer); t.signalCleanup?.(); if (!t.settled) { const reason = t.error ?? err; this.fireEnd(t, reason); this.rejectTask(t, reason) } }
+    this.outbuf.reset() // drop any batched-but-unflushed bytes
+    // Reject every in-flight query (NEVER replay). The head may carry a server error; the rest take `err`.
+    while (this.inflight.length) { const t = this.inflight.shift()!; if (t.timer) clearTimeout(t.timer); if (t.graceTimer) clearTimeout(t.graceTimer); t.signalCleanup?.(); if (!t.settled) { const reason = t.error ?? err; this.fireEnd(t, reason); this.rejectTask(t, reason) } }
     if (this.cfg.reconnect.enabled && !this.ended) {
       this.state = 'reconnecting'
       this.prepared.clear(); this.staleStatements.clear() // server-side prepared statements are gone after a drop/restart

@@ -21,7 +21,7 @@ describe('pool: single-flight reconnect', () => {
       m.killActive(); m.setAvailable(false) // database restarts
       await tick(30)
 
-      const first = pool.query('select 1') // this acquire trips the breaker
+      const first = pool.execute('select 1') // eager: this acquire trips the breaker (lazy query() wouldn't run yet)
       await tick(50)
       expect(pool.isDown).toBe(true)
 

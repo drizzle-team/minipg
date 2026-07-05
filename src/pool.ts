@@ -208,9 +208,30 @@ export class Pool {
 
   private failWaiters(err: Error): void { for (const w of this.waiters.splice(0)) w.reject(err) }
 
-  async query(sql: string, params: unknown[] = [], opts: QueryOptions = {}): Promise<QueryResult<never>> {
-    const conn = await this.acquire()
-    try { return await (conn.query as (s: string, p: unknown[], o: QueryOptions) => Promise<QueryResult<never>>)(sql, params, opts) }
+  /** Build a LAZY query. It does NOT run until awaited, `.execute()`d, or passed to `pool.batch(...)`.
+   *  Awaiting it (or `.execute()`) checks out a connection, runs it, and releases — so `await pool.query(x)`
+   *  behaves exactly like a one-shot query. Its value is composition: hand un-run queries to `pool.batch`. */
+  query(sql: string, params: unknown[] = [], opts: QueryOptions = {}): PoolQuery {
+    return new PoolQuery(this, sql, params, opts)
+  }
+
+  /** Run a query NOW and return a Promise (acquire → run → release). The eager sibling of `query()` —
+   *  use it for fire-and-forget or when you don't want lazy semantics. `pool.execute(x)` ≡ `pool.query(x).execute()`. */
+  execute(sql: string, params: unknown[] = [], opts: QueryOptions = {}): Promise<QueryResult<never>> {
+    return new PoolQuery(this, sql, params, opts).execute()
+  }
+
+  /** Run a set of lazy `query()` objects together, results returned in input order. `'pipelined'` (the
+   *  default) runs them on ONE checked-out connection so they pipeline — 1 round trip, 1 connection, one
+   *  saturated backend. `'concurrently'` fans them out across connections — parallel backends, N connections. */
+  batch(queries: PoolQuery[]): Promise<QueryResult<never>[]>
+  batch(mode: 'pipelined' | 'concurrently', queries: PoolQuery[]): Promise<QueryResult<never>[]>
+  async batch(a: 'pipelined' | 'concurrently' | PoolQuery[], b?: PoolQuery[]): Promise<QueryResult<never>[]> {
+    const mode = typeof a === 'string' ? a : 'pipelined'
+    const queries = typeof a === 'string' ? b! : a
+    if (mode === 'concurrently') return Promise.all(queries) // each self-acquires -> fan out across connections
+    const conn = await this.acquire()                        // one reserved connection -> the set pipelines on it
+    try { return await Promise.all(queries.map((q) => q.runOn(conn))) }
     finally { this.release(conn) }
   }
 
@@ -231,3 +252,32 @@ export class Pool {
     await Promise.all(conns.map((c) => c.end()))
   }
 }
+
+/** A lazy, awaitable query returned by `pool.query(...)`. Nothing runs until you `await` it, call
+ *  `.execute()`, or pass it to `pool.batch(...)`. Execution is memoized — awaiting more than once runs
+ *  it once. Standalone (`await` / `.execute()`) it checks out its own connection; `pool.batch(...)` runs
+ *  it on a shared connection via `runOn` so a set pipelines on one connection. */
+export class PoolQuery implements PromiseLike<QueryResult<never>> {
+  private promise?: Promise<QueryResult<never>>
+  constructor(private pool: Pool, private sql: string, private params: unknown[], private opts: QueryOptions) {}
+
+  /** Run now (acquire → run → release), returning the Promise. Idempotent — the same Promise every call. */
+  execute(): Promise<QueryResult<never>> {
+    return (this.promise ??= (async () => {
+      const conn = await this.pool.acquire()
+      try { return await (conn.query as Runner)(this.sql, this.params, this.opts) }
+      finally { this.pool.release(conn) }
+    })())
+  }
+
+  /** Run on an ALREADY checked-out connection (pool.batch uses this to pipeline a set on one connection). */
+  runOn(conn: Connection): Promise<QueryResult<never>> {
+    return (this.promise ??= (conn.query as Runner)(this.sql, this.params, this.opts))
+  }
+
+  // PromiseLike surface: awaiting (or .then/.catch/.finally) forces execution via the standalone path.
+  then<R1 = QueryResult<never>, R2 = never>(onF?: ((v: QueryResult<never>) => R1 | PromiseLike<R1>) | null, onR?: ((e: unknown) => R2 | PromiseLike<R2>) | null): Promise<R1 | R2> { return this.execute().then(onF, onR) }
+  catch<R = never>(onR?: ((e: unknown) => R | PromiseLike<R>) | null): Promise<QueryResult<never> | R> { return this.execute().catch(onR) }
+  finally(fn?: (() => void) | null): Promise<QueryResult<never>> { return this.execute().finally(fn) }
+}
+type Runner = (s: string, p: unknown[], o: QueryOptions) => Promise<QueryResult<never>>

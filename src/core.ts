@@ -18,6 +18,7 @@ export function createPool(config: string | PoolConfig = {}): Pool {
 }
 
 export { Connection, Pool }
+export { PoolQuery } from './pool.ts'
 export { parseConnectionString } from './url.ts'
 export { PgError } from './errors.ts'
 export { defaultDecoders } from './codec.ts'

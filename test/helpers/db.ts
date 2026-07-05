@@ -30,8 +30,9 @@ export async function withConn<T>(fn: (c: Awaited<ReturnType<typeof connect>>) =
   try { return await fn(c) } finally { await c.end() }
 }
 
-/** Capture a rejection; throws if the operation unexpectedly resolves. */
-export async function caught(fn: () => Promise<unknown>): Promise<unknown> {
+/** Capture a rejection; throws if the operation unexpectedly resolves. Accepts any thenable/value
+ *  (e.g. a lazy PoolQuery, which `await` forces to run), not just a Promise. */
+export async function caught(fn: () => unknown): Promise<unknown> {
   try { await fn() } catch (e) { return e }
   throw new Error('expected the operation to reject, but it resolved')
 }

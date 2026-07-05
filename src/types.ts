@@ -99,6 +99,14 @@ export interface ConnectConfig {
    *  Default: auto — off when a pooler is detected (Neon `-pooler` host, Supabase `pooler.supabase.com`
    *  / port 6543, or the Vercel serverless runtime), on otherwise. Explicit value always wins. */
   prepare?: boolean
+  /** Pipeline independent queries on a SINGLE connection: keep several in flight at once instead of
+   *  waiting a full round trip between each (collapses N round trips into ~1 for concurrently-issued
+   *  queries, e.g. `Promise.all`). Results still return in request order; the server executes them
+   *  serially (pipelining hides network latency, not server CPU). Default: on (depth 100), auto-off
+   *  behind a transaction-mode pooler. `false` = one query at a time (gated); `{ depth }` caps in-flight.
+   *  `flush` controls socket-write batching: `'microtask'` (default) coalesces queries issued in the same
+   *  tick into ONE write (fewer syscalls); `'sync'` writes each as it's dispatched (lowest latency). */
+  pipeline?: boolean | { depth?: number; flush?: 'sync' | 'microtask' }
   /** Auto-reconnect this connection after an unexpected drop (default off). Object
    *  tunes backoff (baseMs/maxMs) and maxRetries (null/omitted = retry forever). */
   reconnect?: boolean | { baseMs?: number; maxMs?: number; maxRetries?: number }

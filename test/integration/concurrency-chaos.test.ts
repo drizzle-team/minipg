@@ -102,7 +102,7 @@ describe('strict result-set integrity under load', () => {
   test('soak: 500 small select $1 on one connection stay complete & correct', async () => {
     const c = await testConnect()
     try {
-      const ps: Promise<{ rows: unknown[] }>[] = []
+      const ps: PromiseLike<{ rows: unknown[] }>[] = [] // pool.query() is lazy; Promise.all below runs them
       for (let i = 0; i < 500; i++) ps.push(c.query('select $1::int as v', [i]))
       const rs = await Promise.all(ps)
       for (let i = 0; i < 500; i++) {
@@ -220,7 +220,7 @@ describe('pool parallelism, contention & fairness', () => {
   test('20 concurrent pool.query on a max=4 pool all succeed with correct values', async () => {
     const pool = testPool({ max: 4 })
     try {
-      const ps: Promise<{ rows: unknown[] }>[] = []
+      const ps: PromiseLike<{ rows: unknown[] }>[] = [] // pool.query() is lazy; Promise.all below runs them
       for (let i = 0; i < 20; i++) ps.push(pool.query('select $1::int as v', [i]))
       const rs = await Promise.all(ps)
       for (let i = 0; i < 20; i++) expect(pcell0(rs[i]!)).toBe(i)
@@ -231,7 +231,7 @@ describe('pool parallelism, contention & fairness', () => {
   test('max=3: 5 concurrent queries, excess park in waiters, all 5 resolve', async () => {
     const pool = testPool({ max: 3 })
     try {
-      const ps: Promise<{ rows: unknown[] }>[] = []
+      const ps: PromiseLike<{ rows: unknown[] }>[] = [] // pool.query() is lazy; Promise.all below runs them
       for (let i = 0; i < 5; i++) ps.push(pool.query('select $1::int as v', [i]))
       const rs = await Promise.all(ps)
       const values = rs.map((r) => pcell0(r)).sort((x, y) => (x as number) - (y as number))

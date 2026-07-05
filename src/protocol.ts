@@ -84,6 +84,8 @@ export class Writer {
   start(type: string): void { this.byte(type.charCodeAt(0)); this.msgStart = this.off; this.ensure(4); this.off += 4 }
   end(): void { this.buf.writeInt32BE(this.off - this.msgStart, this.msgStart) }
   slice(): Buffer { return this.buf.subarray(0, this.off) }
+  mark(): number { return this.off }        // current length — snapshot before appending a message batch…
+  rewind(off: number): void { this.off = off } // …and roll back to it if that serialization throws midway
 }
 
 export function writeParse(w: Writer, name: string, sql: string): void {
