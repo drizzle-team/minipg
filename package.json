@@ -44,6 +44,14 @@
       "types": "./dist/cf.d.ts",
       "import": "./dist/cf.js"
     },
+    "./neon-ws": {
+      "types": "./dist/neon-ws.d.ts",
+      "import": "./dist/neon-ws.js"
+    },
+    "./neon-http": {
+      "types": "./dist/neon-http.d.ts",
+      "import": "./dist/neon-http.js"
+    },
     "./telemetry": {
       "types": "./dist/telemetry.d.ts",
       "import": "./dist/telemetry.js"
@@ -63,6 +71,8 @@
     "test:unit": "bun test test/unit",
     "test:integration": "bun test test/integration",
     "test:cf": "vitest run --config test/cf/vitest.config.ts",
+    "test:neon-ws": "bun test test/integration/neon-ws.test.ts",
+    "test:neon-http": "bun test test/integration/neon-http.test.ts test/integration/neon-http-parity.test.ts",
     "test:query": "bun test test/integration/results.test.ts test/integration/types-core.test.ts test/integration/types-advanced.test.ts test/integration/types-temporal-json.test.ts test/integration/parameters.test.ts test/integration/query-protocol.test.ts test/integration/prepared-statements.test.ts test/integration/regression.test.ts test/integration/query-shape.test.ts test/integration/shape-binary.test.ts test/integration/pipelining.test.ts test/integration/pool-batch.test.ts test/integration/transaction-api.test.ts",
     "test:query:interp": "MINIPG_VARIANT=interpreted bun run test:query",
     "test:query:both": "bun run test:query && bun run test:query:interp",

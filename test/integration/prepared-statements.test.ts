@@ -4,7 +4,7 @@
 // Grounded in src/connection.ts (startTask / handle) — see DOMAIN NOTES.
 // Requires a running cluster: `bun run test:setup`. public.t is READ-ONLY.
 import { test, expect, describe } from 'bun:test'
-import { testConnect, testPool, withConn, caught, PgError } from '../helpers/db.ts'
+import { testConnect, testPool, withConn, caught, PgError, TEST_TIMEOUT } from '../helpers/db.ts'
 
 // Unique per-process prefix so concurrently-running suites never collide on
 // statement names visible in pg_prepared_statements (names are per-session, but
@@ -166,7 +166,7 @@ describe('many distinct names & texts, no cross-contamination', () => {
       const pp = await c.query(`select count(*)::int from pg_prepared_statements where name like $1`, [`${K}_m%`])
       expect((pp.rows[0] as unknown[])[0]).toBe(100)
     })
-  })
+  }, TEST_TIMEOUT) // 100 sequential prepare+execute round-trips: needs headroom over a WAN link
 
   test('two named texts selecting different columns interleaved never reuse each other', async () => {
     await withConn(async (c) => {

@@ -5,7 +5,7 @@
 // Requires a running cluster: `bun run test:setup`. public.t is READ-ONLY.
 import { test, expect, describe, beforeAll, afterAll } from 'bun:test'
 import { createHash, randomBytes } from 'node:crypto'
-import { testConnect, caught, PgError } from '../helpers/db.ts'
+import { testConnect, caught, PgError, TEST_TIMEOUT } from '../helpers/db.ts'
 import { defaultDecoders } from '../../src/index.ts'
 import { buildDecoders } from '../../src/codec.ts'
 import type { Connection } from '../../src/index.ts'
@@ -452,7 +452,7 @@ describe('UTF-8 fidelity, multibyte & NUL guards', () => {
       const r = await c.query('select $1::text a', [s])
       expect(aCell(r)).toBe(s)
     }
-  })
+  }, TEST_TIMEOUT) // 300 sequential round-trips: needs headroom over a WAN link (see MINIPG_TEST_TIMEOUT_MS)
 
   test('NUL-byte param rejected client-side with /NUL/; connection stays usable', async () => {
     const err = await caught(() => c.query('select $1::text a', ['a\0b']))

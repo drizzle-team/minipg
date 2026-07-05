@@ -3,7 +3,7 @@
 // Isolation: public.t is READ-ONLY; all writes/DDL go to CONNECTION-SCOPED TEMP tables
 // or objects prefixed "qp_". Every connection/pool is ended.
 import { test, expect, describe } from 'bun:test'
-import { testConnect, withConn, caught, PgError } from '../helpers/db.ts'
+import { testConnect, withConn, caught, PgError, REMOTE } from '../helpers/db.ts'
 import { W, Parser } from '../../src/protocol.ts'
 import { encodeParam } from '../../src/codec.ts'
 
@@ -369,7 +369,9 @@ describe('extended-path error recovery & lifecycle', () => {
     })
   })
 
-  test('socket close mid-query (self-terminate) rejects in-flight; later query rejects "connection is closed"', async () => {
+  // relies on pg_terminate_backend(backendKey.pid) hitting a real, terminable backend — skip on a remote
+  // target (REMOTE) like Neon, which virtualizes the reported backend pid so external termination no-ops.
+  test.skipIf(REMOTE)('socket close mid-query (self-terminate) rejects in-flight; later query rejects "connection is closed"', async () => {
     const victim = await testConnect()
     const killer = await testConnect()
     try {
