@@ -72,7 +72,7 @@ rows/s (see `playground/inserts/README.md`).
 
 ## JIT exploration (`jit.bench.ts`, 2026-07-06 — NOT wired into src)
 
-When the param shape is known upfront (declared `params`, insertMany, prepared reuse), a
+When the param shape is known upfront (declared `params`, bulkInsert, prepared reuse), a
 per-statement codegen'd encoder (new Function) collapses the Bind framing into one constant
 Buffer memcpy (portal/statement/format-codes/count never change), inlines per-column guards +
 writes straight-line, and appends Execute+Sync as a second constant memcpy. Byte-identity vs
@@ -88,7 +88,7 @@ the shipped paths asserted at startup. Results (6-param row):
 3.1× over the shipped plan, below the hand-written 164 ns floor — the constant-prefix memcpy
 is the dominant win. **Counterpoint: the array path gains NOTHING** (10k-elem int8[]: 42.5 µs
 shipped vs 42.4 µs JIT) — the element loop is already monomorphic and memory-bound, so
-insertMany/unnest is NOT a JIT customer. If wired, the jit tier belongs in compileParamPlan
+bulkInsert/unnest is NOT a JIT customer. If wired, the jit tier belongs in compileParamPlan
 behind the same eval-availability gate as the decode mappers ('jit' | 'interpreted'), and pays
 off on scalar-row traffic: single-row prepared inserts, VALUES chunks, ORM per-row queries
 (~130 ns/row ≈ ~10% of the VALUES ×100 client budget).

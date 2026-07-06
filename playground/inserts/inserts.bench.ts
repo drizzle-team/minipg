@@ -148,9 +148,9 @@ const STRATS: Strat[] = [
     // the shipped helper: unnest + declared types -> binary array params from execution #1.
     // Rows pass through as RECORDS (no per-row conversion in the timed section); auto-chunks
     // at 10k rows/statement inside one transaction.
-    name: 'minipg · insertMany (unnest binary)',
+    name: 'minipg · bulkInsert (unnest binary)',
     run: async (rows) => {
-      await mc.insertMany('ins_bench', { id: 'int8', name: 'text', qty: 'int4', price: 'float8', flag: 'bool', created_at: 'timestamptz' }, rows)
+      await mc.bulkInsert('ins_bench', { id: 'int8', name: 'text', qty: 'int4', price: 'float8', flag: 'bool', created_at: 'timestamptz' }, rows)
     },
   },
   {

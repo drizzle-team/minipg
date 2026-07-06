@@ -54,13 +54,60 @@ interface PreparedEntry { sql: string; fields: Field[]; paramOids?: number[]; pl
 // param types (the parseInflight burst-dedup compares this key).
 const parseKey = (t: Task): string => (t.paramTypes && t.paramTypes.length ? t.sql + '\u0000' + t.paramTypes.join(',') : t.sql)
 
+/** Per-chunk progress for bulkInsert/bulkUpdate/copyMany. Fired as each chunk is CONFIRMED
+ *  by the server (FIFO, so cumulative fields are monotone). */
+export interface BulkProgress {
+  rows: number      // input rows whose chunks have been confirmed so far (cumulative)
+  totalRows: number
+  affected: number  // cumulative server rowCount (== rows for inserts; matched rows for updates)
+  bytes: number     // wire bytes written so far (exact, from per-query metrics)
+  elapsedMs: number // since the bulk call started
+  chunk: number     // 1-based index of the chunk that just completed
+  chunks: number
+}
+
 /** A COPY FROM STDIN payload source: any (async) iterable of raw COPY-format bytes/strings —
  *  arrays of chunks, generators, Node Readable streams. Chunks need not align with row boundaries. */
 export type CopySource = Iterable<string | Uint8Array> | AsyncIterable<string | Uint8Array>
 
 const qIdent = (s: string): string => '"' + s.replace(/"/g, '""') + '"'
 
-// merge per-chunk QueryResults (insertMany/copyMany chunked modes): rows concat in input order
+// Adaptive default chunk for bulkInsert (shape-sweep-derived). Two constraints bind, whichever
+// is smaller: ~1024 CELLS/statement (chunk x columns — per-element array_recv overhead) and
+// ~32KB/statement (array materialization memcpy), with row bytes estimated from a few sampled
+// rows of THIS batch. Measured vs fixed 256: ties on narrow tables, +5% on 6-col, +32% on
+// 24-col, +115% on fat-text rows (playground/inserts/adaptive-chunk.bench.ts).
+function adaptiveChunk(names: readonly string[], rows: readonly (readonly unknown[] | Readonly<Record<string, unknown>>)[]): number {
+  if (rows.length === 0) return 256
+  const idx = rows.length <= 4 ? [...rows.keys()] : [0, rows.length >> 2, rows.length >> 1, rows.length - 1]
+  let est = 0
+  for (const i of idx) {
+    const row = rows[i]!
+    let b = 24 // per-row fixed overhead (tuple + element headers)
+    for (let c = 0; c < names.length; c++) {
+      const v = Array.isArray(row) ? row[c] : (row as Record<string, unknown>)[names[c]!]
+      b += typeof v === 'string' ? v.length + 4 : v instanceof Uint8Array ? v.byteLength + 4 : 12
+    }
+    est += b
+  }
+  est /= idx.length
+  return Math.max(16, Math.min(Math.ceil(1024 / names.length), Math.max(16, Math.floor(32768 / est)), 2048))
+}
+
+// build the $n::type[] cast list + array OIDs for a bulk statement (aliases are validated by
+// paramTypeOid, so splicing them into SQL is safe)
+function bulkCasts(names: readonly string[], columns: Readonly<Record<string, string>>): { casts: string[]; oids: number[] } {
+  const casts: string[] = new Array(names.length)
+  const oids: number[] = new Array(names.length)
+  for (let i = 0; i < names.length; i++) {
+    const alias = columns[names[i]!]!
+    oids[i] = paramTypeOid(alias + '[]')
+    casts[i] = `$${i + 1}::${alias.toLowerCase()}[]`
+  }
+  return { casts, oids }
+}
+
+// merge per-chunk QueryResults (bulkInsert/copyMany chunked modes): rows concat in input order
 function mergeResults(rs: QueryResult<never>[]): QueryResult<never> {
   return {
     rows: ([] as never[]).concat(...rs.map((r) => r.rows)),
@@ -244,7 +291,7 @@ export class Connection {
   private parseInflight = new Map<string, string>()
   // per-declared-params binary plans, keyed by array identity (ORMs pass a stable array). WeakMap => auto-GC.
   private paramPlanCache = new WeakMap<readonly number[], ParamsEncoder | null>()
-  // insertMany: (table+columns+returning) -> generated unnest SQL + array OIDs (stable identity) + auto statement name
+  // bulkInsert: (table+columns+returning) -> generated unnest SQL + array OIDs (stable identity) + auto statement name
   private insertMeta = new Map<string, { sql: string; oids: number[]; name: string }>()
   private mapperCache = new Map<string, RowMapper>() // per-shape row mappers (standard + typed queries)
   private mapperFactory: RowMapperFactory            // interpreted or jit, chosen once from config.decode
@@ -587,6 +634,7 @@ export class Connection {
       if (w.mark() === 0) return
       const bytes = Buffer.from(w.slice()) // copy: the transport may retain the ref under backpressure
       w.reset()
+      if (t.perf) t.perf.sent += bytes.length // CopyData bytes count toward metrics.bytesSent
       await this.writeRaw(bytes)
     }
     try {
@@ -948,7 +996,8 @@ export class Connection {
   /** Batch-insert rows via `insert into t (…) select * from unnest($1::x[], …)` — ONE prepared
    *  statement regardless of row count, params encoded as BINARY arrays from the first
    *  execution (declared types), transaction-pooler safe. Rows are arrays (column order) or
-   *  records (keyed by column name). Large batches AUTO-CHUNK at ~1k rows per statement
+   *  records (keyed by column name). Large batches AUTO-CHUNK adaptively per batch (~1024
+   *  cells and <=~32KB per statement, row size sampled from the batch; explicit `chunk` wins)
    *  (giant single unnest statements make the server materialize whole arrays first) — the
    *  chunks pipeline on this connection and the call stays ATOMIC: it wraps itself in a
    *  transaction unless one is already open. `atomic: false` flips to the WAL-friendly mode:
@@ -957,30 +1006,85 @@ export class Connection {
    *  boundary, keeps prior chunks, and the error carries `insertedRows`. `returning` rows
    *  concatenate across chunks in input order. `chunk` overrides the chunk size; `metrics`
    *  applies to unchunked calls. */
-  insertMany(
+  bulkInsert(
     table: string,
     columns: Readonly<Record<string, PgType>>,
     rows: readonly (readonly unknown[] | Readonly<Record<string, unknown>>)[],
-    opts: { returning?: string; name?: string; chunk?: number; atomic?: boolean; metrics?: boolean | 'ms' | 'us'; timeout?: number; signal?: AbortSignal } = {},
+    opts: { returning?: string; name?: string; chunk?: number; atomic?: boolean; metrics?: boolean | 'ms' | 'us'; timeout?: number; signal?: AbortSignal; onProgress?: (p: BulkProgress) => void } = {},
   ): Promise<QueryResult<never>> {
     const names = Object.keys(columns)
-    if (names.length === 0) return Promise.reject(new Error('insertMany: columns must not be empty'))
-    const key = table + '\u0000' + names.join('\u0000') + '\u0000' + names.map((n) => columns[n]).join('\u0000') + (opts.returning ? '\u0000' + opts.returning : '')
+    if (names.length === 0) return Promise.reject(new Error('bulkInsert: columns must not be empty'))
+    const key = 'I\u0000' + table + '\u0000' + names.join('\u0000') + '\u0000' + names.map((n) => columns[n]).join('\u0000') + (opts.returning ? '\u0000' + opts.returning : '')
     let meta = this.insertMeta.get(key)
     if (!meta) {
-      const casts: string[] = new Array(names.length)
-      const oids: number[] = new Array(names.length)
-      for (let i = 0; i < names.length; i++) {
-        const alias = columns[names[i]!]!
-        oids[i] = paramTypeOid(alias + '[]') // also validates the alias -> safe to splice into SQL
-        casts[i] = `$${i + 1}::${alias.toLowerCase()}[]`
-      }
+      const { casts, oids } = bulkCasts(names, columns)
       const sql = `insert into ${table.split('.').map(qIdent).join('.')} (${names.map(qIdent).join(',')}) select * from unnest(${casts.join(',')})`
         + (opts.returning ? ` returning ${opts.returning}` : '')
       meta = { sql, oids, name: '_im' + this.insertMeta.size }
       this.insertMeta.set(key, meta)
     }
-    const m = meta
+    return this.runBulk('bulkInsert', meta, names, rows, opts, 'insertedRows')
+  }
+
+  /** Bulk-UPDATE rows matched by key column(s):
+   *  `update t set c = u.c, … from unnest($1::…[], …) u(cols…) where t.k = u.k`.
+   *  `columns` declares key + SET columns together (one record, like bulkInsert); `by` names
+   *  the key subset (string or array — composite keys allowed); the remaining columns are SET.
+   *  Same engine as bulkInsert: ONE immutable prepared statement, binary array params,
+   *  adaptive per-batch chunking, atomic by default; `atomic: false` = WAL-friendly per-chunk
+   *  commits (a failure keeps prior chunks; the error carries `updatedRows`). rowCount = rows
+   *  actually updated — keys that match nothing simply don't count. Caveats: a key appearing
+   *  TWICE in one call is indeterminate (Postgres silently picks one winner) — dedupe first;
+   *  NULL keys never match (SQL `=`); `returning` rows arrive in server order, not input order. */
+  bulkUpdate(
+    table: string,
+    columns: Readonly<Record<string, PgType>>,
+    rows: readonly (readonly unknown[] | Readonly<Record<string, unknown>>)[],
+    opts: { by: string | readonly string[]; returning?: string; name?: string; chunk?: number; atomic?: boolean; metrics?: boolean | 'ms' | 'us'; timeout?: number; signal?: AbortSignal; onProgress?: (p: BulkProgress) => void },
+  ): Promise<QueryResult<never>> {
+    const names = Object.keys(columns)
+    if (names.length === 0) return Promise.reject(new Error('bulkUpdate: columns must not be empty'))
+    const by = typeof opts.by === 'string' ? [opts.by] : [...(opts.by ?? [])]
+    if (by.length === 0) return Promise.reject(new Error('bulkUpdate: `by` must name at least one key column'))
+    for (const k of by) if (!names.includes(k)) return Promise.reject(new Error(`bulkUpdate: \`by\` column "${k}" is not in columns`))
+    const set = names.filter((n) => !by.includes(n))
+    if (set.length === 0) return Promise.reject(new Error('bulkUpdate: no SET columns (every column is in `by`)'))
+    const key = 'U\u0000' + table + '\u0000' + names.join('\u0000') + '\u0000' + names.map((n) => columns[n]).join('\u0000') + '\u0000' + by.join('\u0000') + (opts.returning ? '\u0000' + opts.returning : '')
+    let meta = this.insertMeta.get(key)
+    if (!meta) {
+      const { casts, oids } = bulkCasts(names, columns)
+      // unnest columns get POSITIONAL aliases (_c0.._cn) so user SQL in `returning` (and the
+      // SET/WHERE refs) can never be ambiguous against the real column names
+      const pos = (c: string) => `_c${names.indexOf(c)}`
+      const sql = `update ${table.split('.').map(qIdent).join('.')} _t set ${set.map((c) => `${qIdent(c)} = _u.${pos(c)}`).join(', ')}`
+        + ` from unnest(${casts.join(',')}) as _u(${names.map((n) => pos(n)).join(',')})`
+        + ` where ${by.map((k) => `_t.${qIdent(k)} = _u.${pos(k)}`).join(' and ')}`
+        + (opts.returning ? ` returning ${opts.returning}` : '')
+      meta = { sql, oids, name: '_um' + this.insertMeta.size }
+      this.insertMeta.set(key, meta)
+    }
+    return this.runBulk('bulkUpdate', meta, names, rows, opts, 'updatedRows')
+  }
+
+  // Shared chunked runner for bulkInsert/bulkUpdate: pivot rows column-major, chunk (explicit
+  // or adaptive), then single statement / atomic pipelined tx / WAL-friendly sequential commits.
+  private runBulk(
+    label: string,
+    m: { sql: string; oids: number[]; name: string },
+    names: readonly string[],
+    rows: readonly (readonly unknown[] | Readonly<Record<string, unknown>>)[],
+    opts: { name?: string; chunk?: number; atomic?: boolean; metrics?: boolean | 'ms' | 'us'; timeout?: number; signal?: AbortSignal; onProgress?: (p: BulkProgress) => void },
+    errProp: 'insertedRows' | 'updatedRows',
+  ): Promise<QueryResult<never>> {
+    const t0 = performance.now()
+    const onProgress = opts.onProgress
+    const track = onProgress ? { rows: 0, affected: 0, bytes: 0, chunk: 0 } : null
+    const report = (chunkRows: number, r: QueryResult<never>, chunks: number): void => {
+      if (!track || !onProgress) return
+      track.rows += chunkRows; track.affected += r.rowCount ?? 0
+      track.bytes += r.metrics?.bytesSent ?? 0; track.chunk += 1
+      try { onProgress({ rows: track.rows, totalRows: rows.length, affected: track.affected, bytes: track.bytes, elapsedMs: performance.now() - t0, chunk: track.chunk, chunks }) } catch { /* user callback errors never break the bulk op */ }
+    }
     // pivot a [start,end) row range -> one array per column (unnest is column-major)
     const pivot = (start: number, end: number): unknown[][] => {
       const cols: unknown[][] = new Array(names.length)
@@ -992,28 +1096,32 @@ export class Connection {
       }
       return cols
     }
-    // meta.oids is a stable array -> the params resolution + binary plan cache hit by identity
-    const qopts = { name: opts.name ?? m.name, params: m.oids, timeout: opts.timeout, signal: opts.signal }
-    const chunk = Math.max(1, opts.chunk ?? 1_000) // ~1k-row statements stay fast at EVERY scale (10k-row arrays degrade past ~100 statements/tx)
+    // m.oids is a stable array -> the params resolution + binary plan cache hit by identity
+    const qopts = { name: opts.name ?? m.name, params: m.oids, timeout: opts.timeout, signal: opts.signal, metrics: onProgress ? ('us' as const) : undefined }
+    const chunk = Math.max(1, opts.chunk ?? adaptiveChunk(names, rows)) // per-batch adaptive default; explicit opts.chunk always wins
     if (rows.length <= chunk) {
-      return this.query(m.sql, pivot(0, rows.length), { ...qopts, metrics: opts.metrics }) as Promise<QueryResult<never>>
+      const p = this.query(m.sql, pivot(0, rows.length), { ...qopts, metrics: opts.metrics ?? qopts.metrics }) as Promise<QueryResult<never>>
+      return onProgress ? p.then((r) => { report(rows.length, r, 1); return r }) : p
     }
+    const nChunks = Math.ceil(rows.length / chunk)
     // Chunked: the SAME statement serves every chunk (unnest SQL is row-count-independent, so
     // even the partial last chunk reuses it).
     if (opts.atomic === false) {
       // WAL-friendly mode: chunks run SEQUENTIALLY and each COMMITS on its own — incremental
       // WAL flushes + short transactions instead of one giant end-of-load flush. A failure
-      // stops at the chunk boundary, keeps prior chunks, and the error carries insertedRows.
-      if (this.inTransaction) return Promise.reject(new Error('insertMany: atomic:false inside an open transaction has no effect — chunks could not commit'))
+      // stops at the chunk boundary, keeps prior chunks, and the error carries insertedRows/updatedRows.
+      if (this.inTransaction) return Promise.reject(new Error(`${label}: atomic:false inside an open transaction has no effect — chunks could not commit`))
       return (async () => {
         const rs: QueryResult<never>[] = []
-        let inserted = 0
+        let done = 0
         for (let i = 0; i < rows.length; i += chunk) {
           try {
-            const r = (await this.query(m.sql, pivot(i, Math.min(i + chunk, rows.length)), qopts)) as QueryResult<never>
-            rs.push(r); inserted += r.rowCount ?? 0
+            const hi = Math.min(i + chunk, rows.length)
+            const r = (await this.query(m.sql, pivot(i, hi), qopts)) as QueryResult<never>
+            rs.push(r); done += r.rowCount ?? 0
+            report(hi - i, r, nChunks)
           } catch (e) {
-            throw Object.assign(e as Error, { insertedRows: inserted }) // chunks before this one are committed
+            throw Object.assign(e as Error, { [errProp]: done }) // chunks before this one are committed
           }
         }
         return mergeResults(rs)
@@ -1023,12 +1131,15 @@ export class Connection {
     const runAll = async (): Promise<QueryResult<never>> => {
       const ps: Promise<QueryResult<never>>[] = []
       for (let i = 0; i < rows.length; i += chunk) {
-        ps.push(this.query(m.sql, pivot(i, Math.min(i + chunk, rows.length)), qopts) as Promise<QueryResult<never>>)
+        const hi = Math.min(i + chunk, rows.length)
+        const p = this.query(m.sql, pivot(i, hi), qopts) as Promise<QueryResult<never>>
+        ps.push(onProgress ? p.then((r) => { report(hi - i, r, nChunks); return r }) : p) // FIFO resolution -> monotone progress
       }
       return mergeResults(await Promise.all(ps))
     }
     return this.inTransaction ? runAll() : this.begin(runAll)
   }
+
   /** COPY FROM STDIN. `sql` must be a `COPY … FROM STDIN` statement; `source` yields raw
    *  COPY-format payload (text/csv/binary, matching the SQL) as strings or bytes — chunk
    *  boundaries need not align with rows, and Node Readable streams / generators work as-is.
@@ -1058,7 +1169,7 @@ export class Connection {
     table: string,
     columns: Readonly<Record<string, PgType>>,
     rows: readonly (readonly unknown[] | Readonly<Record<string, unknown>>)[],
-    opts: { format?: 'binary' | 'text'; chunk?: number; atomic?: boolean; metrics?: boolean | 'ms' | 'us'; timeout?: number; signal?: AbortSignal } = {},
+    opts: { format?: 'binary' | 'text'; chunk?: number; atomic?: boolean; metrics?: boolean | 'ms' | 'us'; timeout?: number; signal?: AbortSignal; onProgress?: (p: BulkProgress) => void } = {},
   ): Promise<QueryResult<never>> {
     const names = Object.keys(columns)
     if (names.length === 0) return Promise.reject(new Error('copyMany: columns must not be empty'))
@@ -1068,16 +1179,31 @@ export class Connection {
     const sql = `copy ${table.split('.').map(qIdent).join('.')} (${names.map(qIdent).join(',')}) from stdin${format === 'binary' ? ' (format binary)' : ''}`
     const enc = (part: readonly (readonly unknown[] | Readonly<Record<string, unknown>>)[]) =>
       format === 'binary' ? copyRowsBinary(oids, names, part) : copyRowsText(names, part)
+    const t0 = performance.now()
+    const onProgress = opts.onProgress
+    const cOpts = { metrics: onProgress ? ('us' as const) : opts.metrics, timeout: opts.timeout, signal: opts.signal }
+    const track = onProgress ? { rows: 0, bytes: 0, chunk: 0 } : null
+    const report = (chunkRows: number, r: QueryResult<never>, chunks: number): void => {
+      if (!track || !onProgress) return
+      track.rows += chunkRows; track.bytes += r.metrics?.bytesSent ?? 0; track.chunk += 1
+      try { onProgress({ rows: track.rows, totalRows: rows.length, affected: track.rows, bytes: track.bytes, elapsedMs: performance.now() - t0, chunk: track.chunk, chunks }) } catch { /* user callback errors never break the copy */ }
+    }
     const chunk = opts.chunk ?? 0 // default: ONE COPY statement (optimal throughput at every scale)
-    if (chunk <= 0 || rows.length <= chunk) return this.copyFrom(sql, enc(rows), opts)
+    if (chunk <= 0 || rows.length <= chunk) {
+      const p = this.copyFrom(sql, enc(rows), cOpts)
+      return onProgress ? p.then((r) => { report(rows.length, r, 1); return r }) : p
+    }
+    const nChunks = Math.ceil(rows.length / chunk)
     // Chunked COPY: one COPY statement per chunk, SEQUENTIAL (COPY runs solo anyway).
     const runSeq = async (): Promise<QueryResult<never>> => {
       const rs: QueryResult<never>[] = []
       let inserted = 0
       for (let i = 0; i < rows.length; i += chunk) {
         try {
-          const r = await this.copyFrom(sql, enc(rows.slice(i, i + chunk)), opts)
+          const part = rows.slice(i, i + chunk)
+          const r = await this.copyFrom(sql, enc(part), cOpts)
           rs.push(r); inserted += r.rowCount ?? 0
+          report(part.length, r, nChunks)
         } catch (e) {
           if (opts.atomic === false) throw Object.assign(e as Error, { insertedRows: inserted }) // committed chunks stay
           throw e // atomic: the wrapping transaction rolls everything back

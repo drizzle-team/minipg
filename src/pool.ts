@@ -245,10 +245,16 @@ export class Pool {
     return Promise.all(queries) // each PoolQuery self-acquires its own connection
   }
 
-  /** Batch-insert via unnest on one checked-out connection — see Connection.insertMany. */
-  async insertMany(...args: Parameters<Connection['insertMany']>): Promise<QueryResult<never>> {
+  /** Batch-insert via unnest on one checked-out connection — see Connection.bulkInsert. */
+  async bulkInsert(...args: Parameters<Connection['bulkInsert']>): Promise<QueryResult<never>> {
     const { client, release } = await this.connect()
-    try { return await client.insertMany(...args) } finally { release() }
+    try { return await client.bulkInsert(...args) } finally { release() }
+  }
+
+  /** Bulk-UPDATE by key on one checked-out connection — see Connection.bulkUpdate. */
+  async bulkUpdate(...args: Parameters<Connection['bulkUpdate']>): Promise<QueryResult<never>> {
+    const { client, release } = await this.connect()
+    try { return await client.bulkUpdate(...args) } finally { release() }
   }
 
   /** COPY FROM STDIN on one checked-out connection — see Connection.copyFrom. */

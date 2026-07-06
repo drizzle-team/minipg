@@ -88,7 +88,7 @@ describe('copyMany', () => {
       const rows = Array.from({ length: 1000 }, (_, i) => mkRow(i))
       const r = await c.copyMany(`${K}_bin`, COLS, rows)
       expect(r.rowCount).toBe(1000)
-      await c.insertMany(`${K}_bin`, COLS, rows.slice(0, 100)) // binary array params as the reference encoding
+      await c.bulkInsert(`${K}_bin`, COLS, rows.slice(0, 100)) // binary array params as the reference encoding
       const chk = await c.query(`select count(*)::int4, count(distinct (id,name,qty,price,ok,at))::int4 from ${K}_bin`)
       expect((chk.rows[0] as unknown[])[0]).toBe(1100)
       expect((chk.rows[0] as unknown[])[1]).toBe(1000) // the re-inserted 100 matched byte-for-byte

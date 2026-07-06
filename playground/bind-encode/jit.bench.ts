@@ -1,4 +1,4 @@
-// JIT param-encoder exploration: when the param shape is declared upfront (insertMany, ORM
+// JIT param-encoder exploration: when the param shape is declared upfront (bulkInsert, ORM
 // `params`), a per-statement CODEGEN'd encoder can beat the generic compiled plan:
 //   - the Bind framing (portal, statement, format codes, param count) collapses to ONE constant
 //     Buffer memcpy (only the message length + values vary)
@@ -66,7 +66,7 @@ function jitRowEncoder(stmt: string, oids: readonly number[], binary: boolean): 
   return new Function('PREFIX', 'EXECSYNC', 'enc', `return (w, v) => { ${src.join('\n')} }`)(PREFIX, EXECSYNC, encodeValueInto) as never
 }
 
-/** Specialized binary-array column encoder (the insertMany/unnest hot loop), int8 elements. */
+/** Specialized binary-array column encoder (the bulkInsert/unnest hot loop), int8 elements. */
 function jitInt8Array(): (w: Writer, a: readonly unknown[]) => void {
   return new Function('MIS', `return (w, a) => {
     let hn = 0
@@ -118,7 +118,7 @@ group(`scalar rows: ${N.toLocaleString()}-row batch`, () => {
   })
 })
 
-// array column encode (the insertMany hot loop): 10k int8 elements
+// array column encode (the bulkInsert hot loop): 10k int8 elements
 const IDS: number[] = Array.from({ length: N }, (_, i) => i + 1)
 const ARR_PLAN = compileParamPlan([1016])!
 const jitArr = jitInt8Array()
