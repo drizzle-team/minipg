@@ -52,6 +52,10 @@
       "types": "./dist/neon-http.d.ts",
       "import": "./dist/neon-http.js"
     },
+    "./aurora": {
+      "types": "./dist/aurora.d.ts",
+      "import": "./dist/aurora.js"
+    },
     "./telemetry": {
       "types": "./dist/telemetry.d.ts",
       "import": "./dist/telemetry.js"
@@ -73,6 +77,8 @@
     "test:cf": "vitest run --config test/cf/vitest.config.ts",
     "test:neon-ws": "bun test test/integration/neon-ws.test.ts",
     "test:neon-http": "bun test test/integration/neon-http.test.ts test/integration/neon-http-parity.test.ts",
+    "test:aurora": "bun test test/unit/aurora.test.ts",
+    "test:aurora:live": "bun test test/integration/aurora.test.ts",
     "test:query": "bun test test/integration/results.test.ts test/integration/types-core.test.ts test/integration/types-advanced.test.ts test/integration/types-temporal-json.test.ts test/integration/parameters.test.ts test/integration/query-protocol.test.ts test/integration/prepared-statements.test.ts test/integration/regression.test.ts test/integration/query-shape.test.ts test/integration/shape-binary.test.ts test/integration/pipelining.test.ts test/integration/pool-batch.test.ts test/integration/transaction-api.test.ts",
     "test:query:interp": "MINIPG_VARIANT=interpreted bun run test:query",
     "test:query:both": "bun run test:query && bun run test:query:interp",

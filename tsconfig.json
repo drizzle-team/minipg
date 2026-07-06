@@ -29,5 +29,5 @@
   },
   // test/cf runs only under @cloudflare/vitest-pool-workers (its own vitest + workerd types); keep it
   // out of the project-wide `tsc --noEmit` so the core typecheck doesn't require those deps.
-  "exclude": ["test/cf", "dist"]
+  "exclude": ["test/cf", "dist", "infra"]
 }
