@@ -728,10 +728,11 @@ describe('out-of-scope surface guards', () => {
     void pool.end()
   })
 
-  test('Pool exposes no COPY / cursor / native-libpq methods', () => {
+  test('Pool exposes no COPY TO / cursor / native-libpq methods (copyFrom/copyMany ARE supported)', () => {
     const pool = testPool({ applicationName: appName() })
     const p = pool as unknown as Record<string, unknown>
-    expect(p.copyFrom).toBeUndefined()
+    expect(typeof p.copyFrom).toBe('function')
+    expect(typeof p.copyMany).toBe('function')
     expect(p.copyTo).toBeUndefined()
     expect(p.cursor).toBeUndefined()
     void pool.end()

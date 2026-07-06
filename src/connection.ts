@@ -1,15 +1,15 @@
 // A single PostgreSQL connection: transport (net/tls), auth, and the extended
 // query protocol. One query in flight at a time (queries queue). No LISTEN/NOTIFY.
 import type { Duplex } from 'node:stream'
-import { W, Writer, writeParse, writeDescribe, writeBind, writeExecute, writeClose, writeSync, Parser, parseRowDescription, parseDataRow } from './protocol.ts'
+import { W, Writer, writeParse, writeDescribe, writeBindWith, writeExecute, writeClose, writeSync, writeQuery, Parser, parseRowDescription, parseDataRow, parseParameterDescription, type ParamsEncoder } from './protocol.ts'
 import { md5Password, scram, type Scram } from './auth.ts'
-import { buildDecoders, decoderFor, encodeParam } from './codec.ts'
+import { buildDecoders, decoderFor, encodeValueInto, compileParamPlan, copyRowsBinary, copyRowsText, copyBinarySupported } from './codec.ts'
 import { PgError, parseErrorFields } from './errors.ts'
 import type { ConnectConfig, Decoder, Field, QueryDebug, QueryOptions, QueryResult, ResultMode, StreamOptions, TxOptions } from './types.ts'
 import { INSTANT_OIDS, BINARY_FAST, type CodegenCol } from './decode2.ts'
 import { buildMapperFactory, type RowMapper, type RowMapperFactory } from './mapper.ts'
 import { resolveUrl } from './url.ts'
-import { shapeCols, type ShapeSpec, type ShapeOf } from './spec.ts'
+import { shapeCols, resolveParamTypes, paramTypeOid, type ShapeSpec, type ShapeOf, type ParamType, type PgType } from './spec.ts'
 import type { ShapeMapper } from './shape.ts'
 import type { Plugin, QueryInfo, QueryMetrics } from './plugin.ts'
 
@@ -30,6 +30,7 @@ export interface NormalizedConfig {
   ssl: Exclude<NonNullable<ConnectConfig['ssl']>, 'disable'> // 'disable' normalized to false
   applicationName: string; connectTimeout: number; decoders: Map<number, Decoder>
   prepare: boolean // false -> never use server-side named prepared statements (transaction-pooler safe)
+  binaryParams: boolean // upgrade fast-type params to binary on prepared reuse (OIDs from ParameterDescription)
   pipelineDepth: number // max queries in flight on one connection at once (1 = gated / no pipelining)
   pipelineFlush: 'sync' | 'microtask' // batch same-tick writes into one socket write ('microtask') or write per dispatch ('sync')
   temporal: 'date' | 'string' // default decode for date/timestamp(tz) columns without an explicit target
@@ -44,6 +45,30 @@ const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms))
 const RTT_WINDOW = 5 // keep this many most-recent round-trip samples (ms) for connection.rtt
 const DEFAULT_PIPELINE_DEPTH = 100 // max in-flight queries on one connection when pipelining is on (matches postgres.js)
 const FLUSH_THRESHOLD = 64 * 1024  // flush the batch immediately once it reaches this many bytes, even in microtask mode (bounds memory, starts the transfer)
+
+// Per-name statement cache. paramOids come from ParameterDescription; the binary param plan is
+// compiled from them LAZILY on first reuse (null = compiled, nothing binary-able -> plain text path).
+interface PreparedEntry { sql: string; fields: Field[]; paramOids?: number[]; plan?: ParamsEncoder | null }
+
+// Identity of a Parse on the wire: same name may NOT be reused for different sql OR different declared
+// param types (the parseInflight burst-dedup compares this key).
+const parseKey = (t: Task): string => (t.paramTypes && t.paramTypes.length ? t.sql + '\u0000' + t.paramTypes.join(',') : t.sql)
+
+/** A COPY FROM STDIN payload source: any (async) iterable of raw COPY-format bytes/strings —
+ *  arrays of chunks, generators, Node Readable streams. Chunks need not align with row boundaries. */
+export type CopySource = Iterable<string | Uint8Array> | AsyncIterable<string | Uint8Array>
+
+const qIdent = (s: string): string => '"' + s.replace(/"/g, '""') + '"'
+
+// merge per-chunk QueryResults (insertMany/copyMany chunked modes): rows concat in input order
+function mergeResults(rs: QueryResult<never>[]): QueryResult<never> {
+  return {
+    rows: ([] as never[]).concat(...rs.map((r) => r.rows)),
+    columns: rs[0]?.columns ?? [],
+    rowCount: rs.reduce((s, r) => s + (r.rowCount ?? 0), 0),
+    command: rs[0]?.command ?? null,
+  }
+}
 
 /** The callback run inside begin()/transaction(), given the transaction-scoped connection. */
 export type TxFn<T> = (tx: Connection) => T | Promise<T>
@@ -95,6 +120,9 @@ interface Task {
   _retries?: number // transparent auto-retries performed (DDL-invalidated prepared statement)
   _retryErrors?: string[] // SQLSTATE codes of the swallowed attempts
   _repreparedSqlChanged?: boolean // the name was cached with DIFFERENT SQL -> old statement deallocated + re-Parsed
+  _paramOids?: number[] // ParameterDescription ('t') OIDs from THIS response cycle (cached with the statement on 'T'/'n')
+  paramTypes?: readonly number[] // caller-declared param OIDs: sent in Parse + binary plan from the FIRST execution
+  copySource?: CopySource // COPY FROM STDIN payload source — marks the task as a copy (simple 'Q', runs solo)
   _instrDone?: boolean // guard so onQueryEnd/Error fires exactly once across the settle paths
   _wAt?: number // write timestamp (performance.now) — for the always-on live round-trip sample
   _rttDone?: boolean // guard so a query contributes at most one RTT sample (its first response byte)
@@ -207,8 +235,17 @@ export class Connection {
   private spCounter = 0         // monotonic counter for auto-generated SAVEPOINT names (nested begin)
   private rttSamples: number[] = [] // network round-trip samples (ms), oldest→newest, capped at RTT_WINDOW
   private lastPingAt = 0            // send time of the last handshake msg awaiting a reply (0 = none pending)
-  private prepared = new Map<string, { sql: string; fields: Field[] }>()
+  private prepared = new Map<string, PreparedEntry>()
   private staleStatements = new Set<string>() // names invalidated by DDL (0A000/26000) — Close before re-Parse
+  // (name -> sql) of a NAMED Parse written to the wire but not yet confirmed by its Describe response.
+  // A concurrent burst of first-uses of the same name would otherwise each write their own Parse and
+  // the server rejects the duplicate with 42P05 — later tasks in the burst skip Parse and Bind against
+  // the name directly (the server processes the pipeline in order, so the statement exists by then).
+  private parseInflight = new Map<string, string>()
+  // per-declared-params binary plans, keyed by array identity (ORMs pass a stable array). WeakMap => auto-GC.
+  private paramPlanCache = new WeakMap<readonly number[], ParamsEncoder | null>()
+  // insertMany: (table+columns+returning) -> generated unnest SQL + array OIDs (stable identity) + auto statement name
+  private insertMeta = new Map<string, { sql: string; oids: number[]; name: string }>()
   private mapperCache = new Map<string, RowMapper>() // per-shape row mappers (standard + typed queries)
   private mapperFactory: RowMapperFactory            // interpreted or jit, chosen once from config.decode
   // query-builder fast path: a chunks array (tagged template / builder) has stable identity, so cache
@@ -243,6 +280,7 @@ export class Connection {
       applicationName: config.applicationName || 'minipg',
       connectTimeout: config.connectTimeout ?? 30000,
       prepare: config.prepare ?? !pooled, // explicit wins; else off behind a pooler
+      binaryParams: config.binaryParams ?? true,
       // Pipelining: default on (auto-off behind a transaction pooler, where multiple in-flight implicit
       // transactions on one client conn confuse the pooler's per-tx server assignment). Explicit wins.
       pipelineDepth: ((p) => (p === false ? 1 : p === true ? DEFAULT_PIPELINE_DEPTH : p == null ? (pooled ? 1 : DEFAULT_PIPELINE_DEPTH) : Math.max(1, p.depth ?? DEFAULT_PIPELINE_DEPTH)))(config.pipeline),
@@ -384,16 +422,30 @@ export class Connection {
       // CopyIn/CopyBoth: abort instead of hanging. CopyFail ends copy mode (server
       // replies ErrorResponse); the trailing Sync guarantees a ReadyForQuery, since
       // the Sync we already sent was swallowed by copy-in mode.
-      case 'G': case 'W': { try { this.socket?.write(Buffer.concat([W.copyFail('COPY is not supported by minipg'), W.sync()])) } catch { /* */ } return }
-      case 'T': if (this.current) { this.current.fields = parseRowDescription(body); if (!this.current._typed) { const bin = this.current.binary; try { const cols = this.current.fields.map((f) => (bin ? { name: f.name, oid: f.dataTypeOid, format: 'binary' as const } : { name: f.name, oid: f.dataTypeOid })); this.assignMapper(this.current, cols) } catch (e) { this.current.error = e as Error } /* e.g. { binary: true } on a type with no binary decoder */ } if (this.current._cacheName) this.prepared.set(this.current._cacheName, { sql: this.current.sql, fields: this.current.fields }) } return
-      case 'n': if (this.current) { this.current.fields = []; if (this.current._cacheName) this.prepared.set(this.current._cacheName, { sql: this.current.sql, fields: [] }) } return
+      case 'G': { // CopyInResponse: pump a copyFrom() source; a plain query('COPY … FROM STDIN') is aborted (extended path -> CopyFail + Sync)
+        const t = this.current
+        if (t && t.copySource) { void this.pumpCopy(t) }
+        else { try { this.socket?.write(Buffer.concat([W.copyFail('use copyFrom() for COPY FROM STDIN'), W.sync()])) } catch { /* */ } }
+        return
+      }
+      case 'W': { try { this.socket?.write(Buffer.concat([W.copyFail('CopyBoth is not supported by minipg'), W.sync()])) } catch { /* */ } return }
+      case 't': if (this.current) this.current._paramOids = parseParameterDescription(body); return
+      case 'T': if (this.current) { this.current.fields = parseRowDescription(body); if (!this.current._typed) { const bin = this.current.binary; try { const cols = this.current.fields.map((f) => (bin ? { name: f.name, oid: f.dataTypeOid, format: 'binary' as const } : { name: f.name, oid: f.dataTypeOid })); this.assignMapper(this.current, cols) } catch (e) { this.current.error = e as Error } /* e.g. { binary: true } on a type with no binary decoder */ } if (this.current._cacheName) this.cacheStatement(this.current) } return
+      case 'n': if (this.current) { this.current.fields = []; if (this.current._cacheName) this.cacheStatement(this.current) } return
       case 'D': return this.dataRow(body)
       case 'C': if (this.current) { const tag = firstCstr(body); this.current.command = tag.split(' ')[0]; const m = tag.match(/(\d+)\s*$/); this.current.rowCount = m ? parseInt(m[1]!, 10) : null } return
       case 'E': { const err = new PgError(parseErrorFields(body)); if (this.connecting) return this.failAttempt(err); if (this.current) this.current.error = err; return }
       case 'N': return // NoticeResponse — ignored
       case 'A': return // NotificationResponse — ignored (no LISTEN/NOTIFY)
-      default: return // ParseComplete/BindComplete/CloseComplete/ParameterDescription/PortalSuspended
+      default: return // ParseComplete/BindComplete/CloseComplete/PortalSuspended
     }
+  }
+
+  // The Describe(S) response arrived ('T' or 'n'): the named statement now provably exists server-side.
+  // Cache fields + param OIDs (fields may be [] for row-less statements) and clear the in-flight-Parse marker.
+  private cacheStatement(t: Task): void {
+    this.prepared.set(t._cacheName!, { sql: t.sql, fields: t.fields ?? [], paramOids: t._paramOids })
+    this.parseInflight.delete(t._cacheName!)
   }
 
   private auth(body: Buffer): void {
@@ -516,8 +568,59 @@ export class Connection {
   // waits for the pipeline to drain before starting. (FIFO: we never dispatch past a queued stream.)
   private canStartNext(): boolean {
     if (this.inflight.length === 0) return true
-    if (this.inflight[0]!.stream) return false // a stream owns the connection until it ends
-    return !this.queue[0]!.stream               // don't start a stream while other queries are in flight
+    const head = this.inflight[0]!
+    if (head.stream || head.copySource) return false // a stream/COPY owns the connection until it ends
+    const next = this.queue[0]!
+    return !next.stream && !next.copySource          // don't start one while other queries are in flight
+  }
+
+  // COPY FROM STDIN pump: stream the task's source out as CopyData frames (small chunks coalesce
+  // into ~256KB frames) with socket drain backpressure, then CopyDone. ALWAYS terminates the copy
+  // with CopyDone or CopyFail — after a mid-copy error the backend discards messages until one of
+  // them arrives, so bailing out silently would hang the connection.
+  private async pumpCopy(t: Task): Promise<void> {
+    const CHUNK = 1 << 18
+    const w = new Writer(CHUNK + 4096)
+    let open = false // an unclosed 'd' frame in w
+    const flush = async (): Promise<void> => {
+      if (open) { w.end(); open = false }
+      if (w.mark() === 0) return
+      const bytes = Buffer.from(w.slice()) // copy: the transport may retain the ref under backpressure
+      w.reset()
+      await this.writeRaw(bytes)
+    }
+    try {
+      for await (const chunk of t.copySource!) {
+        if (t.settled || t.error || t.cancelled) break // timeout/abort/server error -> stop reading; CopyFail below
+        const buf = typeof chunk === 'string' ? Buffer.from(chunk, 'utf8')
+          : Buffer.isBuffer(chunk) ? chunk
+          : Buffer.from((chunk as Uint8Array).buffer, (chunk as Uint8Array).byteOffset, (chunk as Uint8Array).byteLength)
+        if (buf.length === 0) continue
+        if (!open) { w.start('d'); open = true }
+        w.bytes(buf)
+        if (w.mark() >= CHUNK) await flush()
+      }
+      if (t.settled || t.error || t.cancelled) { w.reset(); open = false; w.start('f'); w.cstr('COPY aborted by client'); w.end() }
+      else { if (open) { w.end(); open = false } w.start('c'); w.end() } // CopyDone (after closing a pending frame)
+      await flush()
+    } catch (e) {
+      // the source threw or the socket died mid-copy: end copy mode; the server answers with an
+      // ErrorResponse quoting the reason, which settles the task through the normal error path
+      try { this.socket?.write(W.copyFail(`COPY aborted: ${e instanceof Error ? e.message : String(e)}`)) } catch { /* socket gone; the task settles via the socket-down path */ }
+    }
+  }
+
+  // Direct socket write with drain backpressure — COPY payloads bypass the outbuf batching.
+  private writeRaw(bytes: Buffer): Promise<void> {
+    const s = this.socket
+    if (!s) return Promise.reject(new Error('connection is closed'))
+    if (s.write(bytes)) return Promise.resolve()
+    return new Promise<void>((resolve, reject) => {
+      const ok = (): void => { cleanup(); resolve() }
+      const bad = (e?: unknown): void => { cleanup(); reject(e instanceof Error ? e : new Error('socket closed during COPY')) }
+      const cleanup = (): void => { s.off('drain', ok); s.off('close', bad); s.off('error', bad) }
+      s.once('drain', ok); s.once('close', bad); s.once('error', bad)
+    })
   }
 
   // Flush the accumulated outbound batch as one socket write. The buffer is copied (Node may retain the
@@ -537,15 +640,18 @@ export class Connection {
     if (t.perf) t.perf.tStart = performance.now() // execution begins (queue wait ends here)
     const w = this.outbuf
     const mark = w.mark()
+    let parsedName: string | undefined // this task wrote a NAMED Parse (recorded in parseInflight only once the whole task serialized)
     try {
+      if (t.copySource) { writeQuery(w, t.sql) } // COPY: simple 'Q' (cleanest copy state machine); the 'G' handler pumps the source
+      else { // ---- everything below is the extended-protocol serialization ----
       if (!Array.isArray(t.params)) throw new TypeError('params must be an array')
-      const enc = t.params.map(encodeParam)
       const name = t.name ?? ''
       let reuse = false
+      let entry: PreparedEntry | undefined
       if (t.name) {
         const cached = this.prepared.get(t.name)
         if (cached && cached.sql === t.sql) {
-          reuse = true; t.fields = cached.fields
+          reuse = true; entry = cached; t.fields = cached.fields
           if (t._typed) {
             // shape / queryTyped: the caller already chose per-column formats + mapper in query(); keep them.
           } else if (t.binary) {
@@ -567,10 +673,39 @@ export class Connection {
         // a name invalidated by DDL still exists server-side (0A000) — deallocate it before re-Parsing, or
         // the Parse errors 42P05 "already exists". Close of an absent statement (26000 case) is a harmless no-op.
         if (t.name && this.staleStatements.has(t.name)) { writeClose(w, 'S', t.name); this.staleStatements.delete(t.name) }
-        writeParse(w, name, t.sql); writeDescribe(w, 'S', name); if (t.name) t._cacheName = t.name
+        // A Parse for this exact (name, sql, declared types) is already queued ahead in this pipeline
+        // (concurrent burst of first uses): DON'T Parse again — the server would 42P05 the duplicate. Still
+        // Describe: the server processes the pipeline in order, so the statement exists by then, and the
+        // response fills the cache.
+        const myKey = parseKey(t)
+        const inflightKey = t.name ? this.parseInflight.get(t.name) : undefined
+        if (!t.name || inflightKey !== myKey) {
+          if (t.name && inflightKey !== undefined) { writeClose(w, 'S', t.name); this.parseInflight.delete(t.name) } // same name, DIFFERENT sql/types still in flight
+          writeParse(w, name, t.sql, t.paramTypes)
+          if (t.name) parsedName = t.name
+        }
+        writeDescribe(w, 'S', name); if (t.name) t._cacheName = t.name
       }
       t._reused = reuse; if (t.info) t.info.prepared = reuse
-      writeBind(w, '', name, enc, t.resultFormat ?? 0); writeExecute(w, '', 0); writeSync(w)
+      // Write-through params: values encode DIRECTLY into the outbound batch (no per-value Buffers or
+      // wrapper objects). Fast types upgrade to BINARY via a compiled per-statement plan — the encode-side
+      // mirror of reuseBinaryOids — from caller-declared paramTypes (first execution, unnamed too) or from
+      // cached ParameterDescription OIDs on reuse. On reuse the SERVER-echoed OIDs win: they are the
+      // statement's actual types, so a paramTypes drift across calls can never binary-misencode.
+      let enc: ParamsEncoder = encodeValueInto
+      if (this.cfg.binaryParams) {
+        if (reuse && entry!.paramOids) {
+          if (entry!.plan === undefined) entry!.plan = compileParamPlan(entry!.paramOids)
+          if (entry!.plan) enc = entry!.plan
+        } else if (t.paramTypes) {
+          let plan = this.paramPlanCache.get(t.paramTypes)
+          if (plan === undefined) { plan = compileParamPlan(t.paramTypes); this.paramPlanCache.set(t.paramTypes, plan) }
+          if (plan) enc = plan
+        }
+      }
+      writeBindWith(w, '', name, t.params, enc, t.resultFormat ?? 0); writeExecute(w, '', 0); writeSync(w)
+      if (parsedName) this.parseInflight.set(parsedName, parseKey(t))
+      } // ---- end extended-protocol serialization ----
       if (t.perf) t.perf.sent = w.mark() - mark // bytes this query contributed to the batch
     } catch (e) {
       w.rewind(mark) // discard this task's partial bytes; earlier batched tasks stay intact
@@ -632,6 +767,14 @@ export class Connection {
   private finishTask(): void {
     const t = this.inflight.shift() ?? null // the head completed (its ReadyForQuery arrived); the next in-flight becomes head
     if (!t) { this.processQueue(); return }
+    // This task wrote the burst's Parse but its cycle errored before the Describe response cached the name:
+    // clear the in-flight marker (later first-uses must Parse again) and flag the name stale — if the Parse
+    // itself DID succeed server-side, the next Parse would 42P05 without a Close first (Close of an absent
+    // statement is a no-op, so over-flagging is harmless).
+    if (t.error && t._cacheName && !this.prepared.has(t._cacheName)) {
+      if (this.parseInflight.get(t._cacheName) === parseKey(t)) this.parseInflight.delete(t._cacheName)
+      this.staleStatements.add(t._cacheName)
+    }
     // A prepared statement invalidated by DDL — 0A000 "cached plan must not change result type" or 26000
     // "prepared statement does not exist" — is dropped from the cache and transparently RE-RUN once. Both
     // are raised before execution (no rows affected), so the retry is side-effect-safe. It Close+re-Parses
@@ -648,7 +791,7 @@ export class Connection {
             ; (t._retryErrors ??= []).push(code)
           if (t.timer) clearTimeout(t.timer) // old timer cleared here; startTask re-arms a fresh one (else it leaks)
           if (t.graceTimer) clearTimeout(t.graceTimer)
-          t.error = undefined; t.rows = []; t.command = undefined; t.rowCount = undefined; t.fields = undefined; t._debugCols = undefined; t._reused = undefined
+          t.error = undefined; t.rows = []; t.command = undefined; t.rowCount = undefined; t.fields = undefined; t._debugCols = undefined; t._reused = undefined; t._paramOids = undefined
           if (t.perf) t.perf.tFirst = undefined // measure the retry's ttfb, not the failed attempt's error response
           if (!t.binary) t.resultFormat = undefined // plain query: re-run as text; { binary: true } keeps all-binary
           // Re-run at the BACK of the queue (not the front) — one uniform mechanic for gated AND pipelined
@@ -680,6 +823,7 @@ export class Connection {
   // terminal event settles, no hung promise" invariant. Shared by fatal() and end().
   private settlePending(e: Error): void {
     this.outbuf.reset() // drop any batched-but-unflushed bytes
+    this.parseInflight.clear() // any recorded Parse may never have reached the wire
     // Reject every in-flight query. Prefer an informative server error already received for one (e.g. a
     // FATAL 57P01 admin_shutdown that arrives just before the socket closes); the rest take the given error.
     while (this.inflight.length) { const t = this.inflight.shift()!; if (t.timer) clearTimeout(t.timer); if (t.graceTimer) clearTimeout(t.graceTimer); t.signalCleanup?.(); if (!t.settled) { const reason = t.error ?? e; this.fireEnd(t, reason); this.rejectTask(t, reason) } }
@@ -715,7 +859,7 @@ export class Connection {
     while (this.inflight.length) { const t = this.inflight.shift()!; if (t.timer) clearTimeout(t.timer); if (t.graceTimer) clearTimeout(t.graceTimer); t.signalCleanup?.(); if (!t.settled) { const reason = t.error ?? err; this.fireEnd(t, reason); this.rejectTask(t, reason) } }
     if (this.cfg.reconnect.enabled && !this.ended) {
       this.state = 'reconnecting'
-      this.prepared.clear(); this.staleStatements.clear() // server-side prepared statements are gone after a drop/restart
+      this.prepared.clear(); this.staleStatements.clear(); this.parseInflight.clear() // server-side prepared statements are gone after a drop/restart
       void this.startReconnect(err)
     } else {
       this.state = 'closed'
@@ -741,10 +885,10 @@ export class Connection {
   // a shape (without an explicit non-object mode) decodes to objects — matches the runtime default.
   // generic over the shape's column names so editors autocomplete each value to the known type list.
   query<K extends string>(sql: string | readonly string[], params: unknown[], opts: { shape: ShapeOf<K> | ShapeMapper; mode?: 'object'; name?: string; metrics?: boolean | 'ms' | 'us'; debug?: boolean; timeout?: number; signal?: AbortSignal }): Promise<QueryResult<Record<string, unknown>>>
-  query(sql: string | readonly string[], params?: unknown[], opts?: { name?: string; mode?: 'array'; metrics?: boolean | 'ms' | 'us'; debug?: boolean; timeout?: number; signal?: AbortSignal; trace?: boolean; shape?: ShapeSpec | ShapeMapper; binary?: boolean }): Promise<QueryResult<unknown[]>>
-  query(sql: string | readonly string[], params: unknown[], opts: { name?: string; mode: 'object'; metrics?: boolean | 'ms' | 'us'; debug?: boolean; timeout?: number; signal?: AbortSignal; trace?: boolean; shape?: ShapeSpec | ShapeMapper; binary?: boolean }): Promise<QueryResult<Record<string, unknown>>>
-  query(sql: string | readonly string[], params: unknown[], opts: { name?: string; mode: 'buffer'; metrics?: boolean | 'ms' | 'us'; debug?: boolean; timeout?: number; signal?: AbortSignal; trace?: boolean; binary?: boolean }): Promise<QueryResult<(Buffer | null)[]>>
-  query(sql: string | readonly string[], params: unknown[], opts: { name?: string; mode: 'raw'; metrics?: boolean | 'ms' | 'us'; debug?: boolean; timeout?: number; signal?: AbortSignal; trace?: boolean; binary?: boolean }): Promise<QueryResult<Buffer>>
+  query(sql: string | readonly string[], params?: unknown[], opts?: { name?: string; params?: readonly ParamType[]; mode?: 'array'; metrics?: boolean | 'ms' | 'us'; debug?: boolean; timeout?: number; signal?: AbortSignal; trace?: boolean; shape?: ShapeSpec | ShapeMapper; binary?: boolean }): Promise<QueryResult<unknown[]>>
+  query(sql: string | readonly string[], params: unknown[], opts: { name?: string; params?: readonly ParamType[]; mode: 'object'; metrics?: boolean | 'ms' | 'us'; debug?: boolean; timeout?: number; signal?: AbortSignal; trace?: boolean; shape?: ShapeSpec | ShapeMapper; binary?: boolean }): Promise<QueryResult<Record<string, unknown>>>
+  query(sql: string | readonly string[], params: unknown[], opts: { name?: string; params?: readonly ParamType[]; mode: 'buffer'; metrics?: boolean | 'ms' | 'us'; debug?: boolean; timeout?: number; signal?: AbortSignal; trace?: boolean; binary?: boolean }): Promise<QueryResult<(Buffer | null)[]>>
+  query(sql: string | readonly string[], params: unknown[], opts: { name?: string; params?: readonly ParamType[]; mode: 'raw'; metrics?: boolean | 'ms' | 'us'; debug?: boolean; timeout?: number; signal?: AbortSignal; trace?: boolean; binary?: boolean }): Promise<QueryResult<Buffer>>
   query(sql: string | readonly string[], params: unknown[] = [], opts: QueryOptions = {}): Promise<QueryResult<never>> {
     const p = new Promise<QueryResult<never>>((resolve, reject) => {
       if (this.state === 'closed') return reject(new Error('connection is closed'))
@@ -757,7 +901,7 @@ export class Connection {
       }
       if (!this.cfg.prepare) name = undefined // pooler-safe: never a server-side named prepared statement
       const mode = opts.mode ?? (opts.shape ? 'object' : 'array') // a shape implies named columns -> object
-      const task: Task = { sql: text, params, name, mode, rows: [], resolve, reject, timeout: opts.timeout, signal: opts.signal, debug: opts.debug }
+      const task: Task = { sql: text, params, name, mode, rows: [], resolve, reject, timeout: opts.timeout, signal: opts.signal, debug: opts.debug, paramTypes: opts.params && resolveParamTypes(opts.params) }
       if (opts.shape) {
         // declared column shape: decode with the SAME cached jit/interpreted mapper as any query, and
         // request binary wire format for any column marked format:'binary'. (mode is array|object here.)
@@ -799,6 +943,155 @@ export class Connection {
       this.processQueue()
     })
     return opts.trace ? this.retraced(p) : p
+  }
+
+  /** Batch-insert rows via `insert into t (…) select * from unnest($1::x[], …)` — ONE prepared
+   *  statement regardless of row count, params encoded as BINARY arrays from the first
+   *  execution (declared types), transaction-pooler safe. Rows are arrays (column order) or
+   *  records (keyed by column name). Large batches AUTO-CHUNK at ~1k rows per statement
+   *  (giant single unnest statements make the server materialize whole arrays first) — the
+   *  chunks pipeline on this connection and the call stays ATOMIC: it wraps itself in a
+   *  transaction unless one is already open. `atomic: false` flips to the WAL-friendly mode:
+   *  chunks run SEQUENTIALLY and each COMMITS on its own — incremental WAL flushes and short
+   *  transactions instead of one giant end-of-load flush; a failure stops at the chunk
+   *  boundary, keeps prior chunks, and the error carries `insertedRows`. `returning` rows
+   *  concatenate across chunks in input order. `chunk` overrides the chunk size; `metrics`
+   *  applies to unchunked calls. */
+  insertMany(
+    table: string,
+    columns: Readonly<Record<string, PgType>>,
+    rows: readonly (readonly unknown[] | Readonly<Record<string, unknown>>)[],
+    opts: { returning?: string; name?: string; chunk?: number; atomic?: boolean; metrics?: boolean | 'ms' | 'us'; timeout?: number; signal?: AbortSignal } = {},
+  ): Promise<QueryResult<never>> {
+    const names = Object.keys(columns)
+    if (names.length === 0) return Promise.reject(new Error('insertMany: columns must not be empty'))
+    const key = table + '\u0000' + names.join('\u0000') + '\u0000' + names.map((n) => columns[n]).join('\u0000') + (opts.returning ? '\u0000' + opts.returning : '')
+    let meta = this.insertMeta.get(key)
+    if (!meta) {
+      const casts: string[] = new Array(names.length)
+      const oids: number[] = new Array(names.length)
+      for (let i = 0; i < names.length; i++) {
+        const alias = columns[names[i]!]!
+        oids[i] = paramTypeOid(alias + '[]') // also validates the alias -> safe to splice into SQL
+        casts[i] = `$${i + 1}::${alias.toLowerCase()}[]`
+      }
+      const sql = `insert into ${table.split('.').map(qIdent).join('.')} (${names.map(qIdent).join(',')}) select * from unnest(${casts.join(',')})`
+        + (opts.returning ? ` returning ${opts.returning}` : '')
+      meta = { sql, oids, name: '_im' + this.insertMeta.size }
+      this.insertMeta.set(key, meta)
+    }
+    const m = meta
+    // pivot a [start,end) row range -> one array per column (unnest is column-major)
+    const pivot = (start: number, end: number): unknown[][] => {
+      const cols: unknown[][] = new Array(names.length)
+      for (let c = 0; c < names.length; c++) cols[c] = new Array(end - start)
+      for (let r = start; r < end; r++) {
+        const row = rows[r]!
+        if (Array.isArray(row)) for (let c = 0; c < names.length; c++) cols[c]![r - start] = row[c]
+        else for (let c = 0; c < names.length; c++) cols[c]![r - start] = (row as Record<string, unknown>)[names[c]!]
+      }
+      return cols
+    }
+    // meta.oids is a stable array -> the params resolution + binary plan cache hit by identity
+    const qopts = { name: opts.name ?? m.name, params: m.oids, timeout: opts.timeout, signal: opts.signal }
+    const chunk = Math.max(1, opts.chunk ?? 1_000) // ~1k-row statements stay fast at EVERY scale (10k-row arrays degrade past ~100 statements/tx)
+    if (rows.length <= chunk) {
+      return this.query(m.sql, pivot(0, rows.length), { ...qopts, metrics: opts.metrics }) as Promise<QueryResult<never>>
+    }
+    // Chunked: the SAME statement serves every chunk (unnest SQL is row-count-independent, so
+    // even the partial last chunk reuses it).
+    if (opts.atomic === false) {
+      // WAL-friendly mode: chunks run SEQUENTIALLY and each COMMITS on its own — incremental
+      // WAL flushes + short transactions instead of one giant end-of-load flush. A failure
+      // stops at the chunk boundary, keeps prior chunks, and the error carries insertedRows.
+      if (this.inTransaction) return Promise.reject(new Error('insertMany: atomic:false inside an open transaction has no effect — chunks could not commit'))
+      return (async () => {
+        const rs: QueryResult<never>[] = []
+        let inserted = 0
+        for (let i = 0; i < rows.length; i += chunk) {
+          try {
+            const r = (await this.query(m.sql, pivot(i, Math.min(i + chunk, rows.length)), qopts)) as QueryResult<never>
+            rs.push(r); inserted += r.rowCount ?? 0
+          } catch (e) {
+            throw Object.assign(e as Error, { insertedRows: inserted }) // chunks before this one are committed
+          }
+        }
+        return mergeResults(rs)
+      })()
+    }
+    // atomic (default): chunks PIPELINE inside ONE transaction (the caller's, or our own)
+    const runAll = async (): Promise<QueryResult<never>> => {
+      const ps: Promise<QueryResult<never>>[] = []
+      for (let i = 0; i < rows.length; i += chunk) {
+        ps.push(this.query(m.sql, pivot(i, Math.min(i + chunk, rows.length)), qopts) as Promise<QueryResult<never>>)
+      }
+      return mergeResults(await Promise.all(ps))
+    }
+    return this.inTransaction ? runAll() : this.begin(runAll)
+  }
+  /** COPY FROM STDIN. `sql` must be a `COPY … FROM STDIN` statement; `source` yields raw
+   *  COPY-format payload (text/csv/binary, matching the SQL) as strings or bytes — chunk
+   *  boundaries need not align with rows, and Node Readable streams / generators work as-is.
+   *  Runs SOLO on the connection (pipelined queries wait for it). Resolves with the server's
+   *  `COPY n` row count. For a rows-in-memory one-liner see copyMany(). */
+  copyFrom(sql: string, source: CopySource, opts: { metrics?: boolean | 'ms' | 'us'; timeout?: number; signal?: AbortSignal } = {}): Promise<QueryResult<never>> {
+    return new Promise<QueryResult<never>>((resolve, reject) => {
+      if (this.state === 'closed') return reject(new Error('connection is closed'))
+      const task: Task = { sql, params: [], mode: 'array', rows: [], resolve, reject, timeout: opts.timeout, signal: opts.signal, copySource: source }
+      this.beginPerf(task, [], opts.metrics)
+      if (this.armSignal(task)) return
+      this.queue.push(task)
+      this.processQueue()
+    })
+  }
+
+  /** Bulk-load rows with COPY — the fastest insert path. Uses FORMAT BINARY when every column
+   *  type supports it (strict client-side typing; a mismatched value rejects with its row and
+   *  column named), else the universal text format (the server parses/validates each field).
+   *  COPY is all-or-nothing (one bad row aborts the whole load) and has no ON CONFLICT /
+   *  RETURNING — for those, COPY into a temp/unlogged table and `insert … select`.
+   *  `chunk` splits huge loads into one COPY statement per chunk (default: one COPY, which is
+   *  fastest); with `atomic: false` each chunk COMMITS on its own — the WAL-friendly mode for
+   *  very large loads (incremental WAL flushes, short transactions; a failure keeps prior
+   *  chunks and the error carries `insertedRows`), otherwise chunks share one transaction. */
+  copyMany(
+    table: string,
+    columns: Readonly<Record<string, PgType>>,
+    rows: readonly (readonly unknown[] | Readonly<Record<string, unknown>>)[],
+    opts: { format?: 'binary' | 'text'; chunk?: number; atomic?: boolean; metrics?: boolean | 'ms' | 'us'; timeout?: number; signal?: AbortSignal } = {},
+  ): Promise<QueryResult<never>> {
+    const names = Object.keys(columns)
+    if (names.length === 0) return Promise.reject(new Error('copyMany: columns must not be empty'))
+    let oids: number[]
+    try { oids = names.map((n) => paramTypeOid(columns[n]!)) } catch (e) { return Promise.reject(e as Error) } // also validates aliases
+    const format = opts.format ?? (copyBinarySupported(oids) ? 'binary' : 'text')
+    const sql = `copy ${table.split('.').map(qIdent).join('.')} (${names.map(qIdent).join(',')}) from stdin${format === 'binary' ? ' (format binary)' : ''}`
+    const enc = (part: readonly (readonly unknown[] | Readonly<Record<string, unknown>>)[]) =>
+      format === 'binary' ? copyRowsBinary(oids, names, part) : copyRowsText(names, part)
+    const chunk = opts.chunk ?? 0 // default: ONE COPY statement (optimal throughput at every scale)
+    if (chunk <= 0 || rows.length <= chunk) return this.copyFrom(sql, enc(rows), opts)
+    // Chunked COPY: one COPY statement per chunk, SEQUENTIAL (COPY runs solo anyway).
+    const runSeq = async (): Promise<QueryResult<never>> => {
+      const rs: QueryResult<never>[] = []
+      let inserted = 0
+      for (let i = 0; i < rows.length; i += chunk) {
+        try {
+          const r = await this.copyFrom(sql, enc(rows.slice(i, i + chunk)), opts)
+          rs.push(r); inserted += r.rowCount ?? 0
+        } catch (e) {
+          if (opts.atomic === false) throw Object.assign(e as Error, { insertedRows: inserted }) // committed chunks stay
+          throw e // atomic: the wrapping transaction rolls everything back
+        }
+      }
+      return mergeResults(rs)
+    }
+    if (opts.atomic === false) {
+      // WAL-friendly mode: each COPY commits on its own — incremental WAL flushes, short
+      // transactions, and a failure keeps prior chunks (error carries insertedRows).
+      if (this.inTransaction) return Promise.reject(new Error('copyMany: atomic:false inside an open transaction has no effect — chunks could not commit'))
+      return runSeq()
+    }
+    return this.inTransaction ? runSeq() : this.begin(runSeq)
   }
 
   /** Run `fn` inside a transaction on THIS connection. Sends BEGIN (with optional isolation/mode options),

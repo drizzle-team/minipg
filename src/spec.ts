@@ -18,6 +18,37 @@ const TYPE_OID = {
 
 /** A known PG type alias (e.g. 'int4', 'bigint', 'timestamptz'). */
 export type PgType = keyof typeof TYPE_OID
+
+// scalar OID -> its array-type OID (pg_type.typarray), for `params: ['int8[]']` & insertMany casts
+const ARRAY_OID: Record<number, number> = {
+  16: 1000, 21: 1005, 23: 1007, 26: 1028, 20: 1016, 700: 1021, 701: 1022, 1700: 1231, 790: 791,
+  25: 1009, 1043: 1015, 1042: 1014, 18: 1002, 19: 1003, 114: 199, 3802: 3807, 17: 1001, 2950: 2951,
+  1082: 1182, 1083: 1183, 1114: 1115, 1184: 1185, 1186: 1187,
+}
+
+/** A declared param type: a PG alias, its array form, or a raw OID. */
+export type ParamType = number | PgType | `${PgType}[]`
+
+/** Resolve ONE declared param type ('int8', 'text[]', or a raw OID) to its wire OID. */
+export function paramTypeOid(t: number | string): number {
+  if (typeof t === 'number') return t
+  const arr = t.endsWith('[]')
+  const base = (TYPE_OID as Record<string, number | undefined>)[(arr ? t.slice(0, -2) : t).toLowerCase()]
+  if (base === undefined) throw new Error(`minipg: unknown param type ${JSON.stringify(t)} (known: ${Object.keys(TYPE_OID).join(', ')}, each also with [])`)
+  if (!arr) return base
+  const a = ARRAY_OID[base]
+  if (a === undefined) throw new Error(`minipg: no array type known for ${JSON.stringify(t)}`)
+  return a
+}
+
+// declared-params arrays are meant to be module-scope constants — cache resolution by identity
+const resolvedParams = new WeakMap<readonly (number | string)[], number[]>()
+export function resolveParamTypes(ts: readonly (number | string)[]): readonly number[] {
+  let r = resolvedParams.get(ts)
+  if (!r) { r = ts.map(paramTypeOid); resolvedParams.set(ts, r) }
+  return r
+}
+
 // Per-type JS-target overrides (mirrors the runtime groups in json.ts). Every type also accepts `:string`
 // (its exact PG text). Temporal adds `:date` (default) / `:ms` (epoch number); precision adds `:number`;
 // text adds `:latin1`. So e.g. `timestamptz` offers date/ms/string — NOT :number/:latin1.

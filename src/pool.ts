@@ -245,6 +245,24 @@ export class Pool {
     return Promise.all(queries) // each PoolQuery self-acquires its own connection
   }
 
+  /** Batch-insert via unnest on one checked-out connection — see Connection.insertMany. */
+  async insertMany(...args: Parameters<Connection['insertMany']>): Promise<QueryResult<never>> {
+    const { client, release } = await this.connect()
+    try { return await client.insertMany(...args) } finally { release() }
+  }
+
+  /** COPY FROM STDIN on one checked-out connection — see Connection.copyFrom. */
+  async copyFrom(...args: Parameters<Connection['copyFrom']>): Promise<QueryResult<never>> {
+    const { client, release } = await this.connect()
+    try { return await client.copyFrom(...args) } finally { release() }
+  }
+
+  /** Bulk-load rows with COPY on one checked-out connection — see Connection.copyMany. */
+  async copyMany(...args: Parameters<Connection['copyMany']>): Promise<QueryResult<never>> {
+    const { client, release } = await this.connect()
+    try { return await client.copyMany(...args) } finally { release() }
+  }
+
   /** Check out a dedicated connection (e.g. for a transaction). `release()` is idempotent. */
   async connect(): Promise<{ client: Connection; release: () => void }> {
     const client = await this.acquire()

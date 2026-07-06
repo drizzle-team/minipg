@@ -34,13 +34,14 @@ describe('absence of the sql`` template tag & other DSL surfaces', () => {
     const c = await testConnect()
     try {
       const inst = c as unknown as Record<string, unknown>
-      for (const absent of ['sql', 'listen', 'notify', 'subscribe', 'copyTo', 'copyFrom', 'cursor', 'fetch']) {
+      for (const absent of ['sql', 'listen', 'notify', 'subscribe', 'copyTo', 'cursor', 'fetch']) {
         expect(inst[absent]).toBeUndefined()
       }
-      // the supported surface is plain query/stream/end
+      // the supported surface is plain query/stream/end (+ copyFrom/copyMany since the COPY feature)
       expect(typeof c.query).toBe('function')
       expect(typeof c.stream).toBe('function')
       expect(typeof c.end).toBe('function')
+      expect(typeof c.copyFrom).toBe('function')
     } finally {
       await c.end()
     }
@@ -50,7 +51,7 @@ describe('absence of the sql`` template tag & other DSL surfaces', () => {
     const pool = testPool({ max: 1 })
     try {
       const inst = pool as unknown as Record<string, unknown>
-      for (const absent of ['sql', 'listen', 'notify', 'subscribe', 'copyTo', 'copyFrom', 'cursor']) {
+      for (const absent of ['sql', 'listen', 'notify', 'subscribe', 'copyTo', 'cursor']) {
         expect(inst[absent]).toBeUndefined()
       }
     } finally {

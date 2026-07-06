@@ -80,6 +80,48 @@ export class Writer {
   int32(n: number): void { this.ensure(4); this.buf.writeInt32BE(n, this.off); this.off += 4 }
   cstr(s: string): void { const len = Buffer.byteLength(s, 'utf8'); this.ensure(len + 1); this.buf.write(s, this.off, 'utf8'); this.off += len; this.buf[this.off++] = 0 }
   bytes(b: Buffer): void { this.ensure(b.length); b.copy(this.buf, this.off); this.off += b.length }
+  patch16(pos: number, n: number): void { this.buf.writeUInt16BE(n, pos) } // back-patch a reserved int16 slot (offsets survive growth: contents are copied)
+  patch32(pos: number, n: number): void { this.buf.writeInt32BE(n, pos) } // back-patch a reserved int32 slot (e.g. a binary array param's total length)
+
+  // ---- length-prefixed param values (write-through encoding: value -> wire bytes in ONE pass, ----
+  // ---- no intermediate strings/Buffers/wrapper objects on the Bind hot path)                  ----
+  /** int32 length + raw bytes. */
+  lpBytes(b: Buffer): void { this.int32(b.length); this.bytes(b) }
+  /** int32 length + utf8 bytes; the length is BACK-PATCHED after buf.write (single pass — no
+   *  Buffer.byteLength pre-walk of the string). */
+  lpStr(s: string): void {
+    this.ensure(4 + s.length * 3) // utf8 worst case: 3 bytes per UTF-16 code unit
+    const n = this.buf.write(s, this.off + 4, 'utf8')
+    this.buf.writeInt32BE(n, this.off)
+    this.off += 4 + n
+  }
+  /** A SAFE integer as text-format ASCII digits — matches String(v) byte-for-byte, zero string alloc. */
+  lpAsciiInt(v: number): void {
+    this.ensure(25)
+    let n = v
+    const neg = n < 0
+    if (neg) n = -n
+    let d = 1
+    for (let t = n; t >= 10; t = Math.floor(t / 10)) d++
+    const len = d + (neg ? 1 : 0)
+    this.buf.writeInt32BE(len, this.off)
+    let p = this.off + 4 + len - 1
+    for (let i = 0; i < d; i++) { this.buf[p--] = 48 + (n % 10); n = Math.floor(n / 10) }
+    if (neg) this.buf[p] = 45 // '-'
+    this.off += 4 + len
+  }
+  /** Binary int8/timestamp(tz): int32 len=8 + big-endian int64 as signed-high/unsigned-low 32-bit
+   *  halves — exact for every SAFE integer (incl. negatives), no BigInt allocation. */
+  lpI64(v: number): void {
+    this.ensure(12)
+    this.buf.writeInt32BE(8, this.off)
+    this.buf.writeInt32BE(Math.floor(v / 4294967296), this.off + 4) // floor division = signed high word
+    this.buf.writeUInt32BE(v >>> 0, this.off + 8)                   // ToUint32 = v mod 2^32 = low word
+    this.off += 12
+  }
+  lpI64Big(v: bigint): void { this.ensure(12); this.buf.writeInt32BE(8, this.off); this.buf.writeBigInt64BE(v, this.off + 4); this.off += 12 }
+  /** Binary float8: int32 len=8 + big-endian IEEE double. */
+  lpF8(v: number): void { this.ensure(12); this.buf.writeInt32BE(8, this.off); this.buf.writeDoubleBE(v, this.off + 4); this.off += 12 }
   // type byte + reserved int32 length (back-patched in end() to cover itself + payload)
   start(type: string): void { this.byte(type.charCodeAt(0)); this.msgStart = this.off; this.ensure(4); this.off += 4 }
   end(): void { this.buf.writeInt32BE(this.off - this.msgStart, this.msgStart) }
@@ -88,9 +130,12 @@ export class Writer {
   rewind(off: number): void { this.off = off } // …and roll back to it if that serialization throws midway
 }
 
-export function writeParse(w: Writer, name: string, sql: string): void {
+export function writeParse(w: Writer, name: string, sql: string, paramOids?: readonly number[]): void {
   guardNul(sql, 'query text')
-  w.start('P'); w.cstr(name); w.cstr(sql); w.int16(0); w.end() // 0 param-type oids => server infers
+  w.start('P'); w.cstr(name); w.cstr(sql)
+  if (paramOids && paramOids.length) { w.int16(paramOids.length); for (const o of paramOids) w.int32(o) } // caller-declared types: pins them server-side (no inference)
+  else w.int16(0) // 0 param-type oids => server infers
+  w.end()
 }
 export function writeDescribe(w: Writer, kind: 'S' | 'P', name: string): void {
   w.start('D'); w.byte(kind.charCodeAt(0)); w.cstr(name); w.end()
@@ -110,6 +155,30 @@ export function writeBind(w: Writer, portal: string, statement: string, params: 
   else { w.int16(1); w.int16(resultFormat) }
   w.end()
 }
+/** One param value written straight into the Bind message being built in `w` (int32 length +
+ *  payload, or int32 -1 for NULL). Returns the format code actually used (0 text / 1 binary) —
+ *  per-value, so a binary encoder can fall back to text when the JS value doesn't match. */
+export type ParamsEncoder = (w: Writer, v: unknown, i: number) => number
+
+/** Bind with WRITE-THROUGH param encoding: values serialize directly into the Writer via `enc`
+ *  (no EncodedParam array / per-value Buffers). Format codes are reserved up front and
+ *  back-patched as each value reports the format it chose. */
+export function writeBindWith(w: Writer, portal: string, statement: string, params: readonly unknown[], enc: ParamsEncoder, resultFormat: number | number[] = 0): void {
+  if (params.length > 65535) throw new Error(`too many bind parameters: ${params.length} (max 65535)`)
+  w.start('B'); w.cstr(portal); w.cstr(statement)
+  w.int16(params.length)
+  const fmtPos = w.mark()
+  for (let i = 0; i < params.length; i++) w.int16(0) // reserved format-code slots
+  w.int16(params.length)
+  for (let i = 0; i < params.length; i++) {
+    const f = enc(w, params[i], i)
+    if (f !== 0) w.patch16(fmtPos + i * 2, f)
+  }
+  if (Array.isArray(resultFormat)) { w.int16(resultFormat.length); for (const f of resultFormat) w.int16(f) }
+  else { w.int16(1); w.int16(resultFormat) }
+  w.end()
+}
+
 export function writeExecute(w: Writer, portal: string, maxRows = 0): void {
   w.start('E'); w.cstr(portal); w.int32(maxRows); w.end()
 }
@@ -117,6 +186,12 @@ export function writeClose(w: Writer, kind: 'S' | 'P', name: string): void {
   w.start('C'); w.byte(kind.charCodeAt(0)); w.cstr(name); w.end()
 }
 export function writeSync(w: Writer): void { w.start('S'); w.end() }
+/** Simple-protocol Query ('Q') — used for COPY FROM STDIN, where simple protocol has the
+ *  cleanest state machine (no Sync bookkeeping; errors always drain to ReadyForQuery). */
+export function writeQuery(w: Writer, sql: string): void {
+  guardNul(sql, 'query text')
+  w.start('Q'); w.cstr(sql); w.end()
+}
 
 export interface RawMessage { type: string; body: Buffer }
 
@@ -162,6 +237,14 @@ export function parseRowDescription(body: Buffer): Field[] {
     off += 18
   }
   return fields
+}
+
+/** Decode a ParameterDescription ('t') body into param-type OIDs. */
+export function parseParameterDescription(body: Buffer): number[] {
+  const n = body.readInt16BE(0)
+  const oids: number[] = new Array(n)
+  for (let i = 0; i < n; i++) oids[i] = body.readInt32BE(2 + i * 4)
+  return oids
 }
 
 /** Decode a DataRow ('D') body into raw (Buffer|null) field values. */

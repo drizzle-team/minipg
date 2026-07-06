@@ -1,7 +1,7 @@
 import type * as tls from 'node:tls'
 import type { Duplex } from 'node:stream'
 import type { Plugin, QueryMetrics } from './plugin.ts'
-import type { ShapeSpec } from './spec.ts'
+import type { ShapeSpec, ParamType } from './spec.ts'
 import type { ShapeMapper } from './shape.ts'
 
 /** Row-shape of a query result. */
@@ -99,6 +99,12 @@ export interface ConnectConfig {
    *  Default: auto — off when a pooler is detected (Neon `-pooler` host, Supabase `pooler.supabase.com`
    *  / port 6543, or the Vercel serverless runtime), on otherwise. Explicit value always wins. */
   prepare?: boolean
+  /** Encode params in BINARY wire format for the fast types (int2/int4/int8, float8, bool,
+   *  timestamp/timestamptz) when a named prepared statement is REUSED — the param OIDs are then
+   *  known from the first round trip's ParameterDescription. A value whose JS type/range doesn't
+   *  match its column falls back to text for that one value, so server semantics (including
+   *  out-of-range errors) are unchanged. First executions always go out text. Default: on. */
+  binaryParams?: boolean
   /** Pipeline independent queries on a SINGLE connection: keep several in flight at once instead of
    *  waiting a full round trip between each (collapses N round trips into ~1 for concurrently-issued
    *  queries, e.g. `Promise.all`). Results still return in request order; the server executes them
@@ -133,6 +139,13 @@ export interface QueryOptions {
   /** Reuse a server-side prepared statement under this name (parse once, bind many). */
   name?: string
   mode?: ResultMode
+  /** Declare the param types upfront — the input-side mirror of `shape`. Aliases ('int8',
+   *  'timestamptz'), array forms ('int8[]', 'text[]'), or raw OIDs. Sent in Parse — pinning the
+   *  types server-side instead of inference — and fast types (plus whole ARRAYS of them, the
+   *  unnest batch path) encode BINARY from the FIRST execution, no ParameterDescription round
+   *  trip needed. Works for unnamed statements too (transaction-pooler safe). Pass a stable
+   *  array (module-scope constant) — resolution + plans are cached by array identity. */
+  params?: readonly ParamType[]
   /** Decode this query's result with a declared column shape (a `ShapeSpec` object, or a `Shape()` mapper —
    *  its `$cols` are reused). Enables typed/binary decode via the same cached jit/interpreted mapper the
    *  driver uses for every query; columns marked `format:'binary'` request the binary wire format. */
