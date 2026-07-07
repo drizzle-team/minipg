@@ -13,6 +13,15 @@ export default defineWorkersConfig({
       workers: {
         // read compatibility_date / compatibility_flags from the sibling wrangler config
         wrangler: { configPath: './wrangler.jsonc' },
+        // workerd's process.env comes from bindings, not the host shell — inject the (optional) Neon URLs
+        // so the serverless-driver tests can reach a real endpoint from inside workerd. Empty => those
+        // tests skip. Pass at run time: NEON_WS_URL=… NEON_HTTP_URL=… vitest run --config …
+        miniflare: {
+          bindings: {
+            NEON_WS_URL: process.env.NEON_WS_URL ?? '',
+            NEON_HTTP_URL: process.env.NEON_HTTP_URL ?? '',
+          },
+        },
       },
     },
   },
