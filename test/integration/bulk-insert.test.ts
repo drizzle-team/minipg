@@ -140,6 +140,78 @@ describe('bulkInsert', () => {
   }, TEST_TIMEOUT)
 })
 
+describe('bulkInsert defaults:true', () => {
+  const DCOLS = { id: 'int8', name: 'text', status: 'text', n: 'int4', at: 'timestamptz' } as const
+  const DDDL = (t: string) => `create temp table ${t}(
+    id int8 primary key, name text not null,
+    status text default 'pending', n int4 not null default 7, at timestamptz default now())`
+
+  test('without defaults:true, an undefined cell still becomes NULL (opt-in)', async () => {
+    await withConn(async (c) => {
+      await c.query(DDDL(`${K}_d0`))
+      // n is NOT NULL with a default; the unnest path sends undefined as NULL -> 23502
+      const e = (await caught(() => c.bulkInsert(`${K}_d0`, DCOLS, [{ id: 1, name: 'a' }]))) as PgError
+      expect(e.code).toBe('23502')
+    })
+  }, TEST_TIMEOUT)
+
+  test('undefined→DEFAULT, null→NULL, NOT NULL+default column no longer crashes', async () => {
+    await withConn(async (c) => {
+      await c.query(DDDL(`${K}_d1`))
+      const rows = [
+        { id: 1, name: 'a' },                                                    // status/n/at undefined -> DEFAULT
+        { id: 2, name: 'b', status: null, n: 3 },                                // explicit null -> NULL; at -> DEFAULT
+        { id: 3, name: 'c', status: 'x', n: 9, at: new Date('2020-01-01T00:00:00Z') },
+      ]
+      const r = await c.bulkInsert(`${K}_d1`, DCOLS, rows, { defaults: true })
+      expect(r.rowCount).toBe(3)
+      const got = await c.query(`select id, status, n, (at >= date '2024-01-01') as recent from ${K}_d1 order by id`, [], { mode: 'object' })
+      expect(got.rows[0]).toMatchObject({ status: 'pending', n: 7, recent: true })  // all three defaults applied
+      expect(got.rows[1]).toMatchObject({ status: null, n: 3, recent: true })       // null preserved, at still defaulted
+      expect(got.rows[2]).toMatchObject({ status: 'x', n: 9, recent: false })       // provided values pass through
+    })
+  }, TEST_TIMEOUT)
+
+  test('per-row volatile default: each DEFAULT cell gets its own nextval', async () => {
+    await withConn(async (c) => {
+      await c.query(`create temp sequence ${K}_seq`)
+      await c.query(`create temp table ${K}_d2(id int8 primary key, tok int8 default nextval('${K}_seq'))`)
+      const rows = Array.from({ length: 20 }, (_, i) => ({ id: i + 1 })) // tok undefined -> DEFAULT on every row
+      await c.bulkInsert(`${K}_d2`, { id: 'int8', tok: 'int8' }, rows, { defaults: true })
+      const d = await c.query(`select count(distinct tok)::int4 from ${K}_d2`)
+      expect((d.rows[0] as unknown[])[0]).toBe(20) // 20 distinct sequence values, not one shared value
+    })
+  }, TEST_TIMEOUT)
+
+  test('uniform pattern: full chunks reuse ONE prepared statement, returning stays ordered', async () => {
+    await withConn(async (c) => {
+      await c.query(DDDL(`${K}_d3`))
+      const rows = Array.from({ length: 300 }, (_, i) => ({ id: i + 1, name: `r${i}` })) // same DEFAULT pattern, exact multiple of chunk
+      const r = await c.bulkInsert(`${K}_d3`, DCOLS, rows, { defaults: true, chunk: 100, returning: 'id' })
+      expect(r.rowCount).toBe(300)
+      expect((r.rows[0] as unknown[])[0]).toBe(1n)
+      expect((r.rows[299] as unknown[])[0]).toBe(300n) // chunk results merged in input order
+      const pp = await c.query("select count(*)::int4 from pg_prepared_statements where name like '\\_iv%'")
+      expect((pp.rows[0] as unknown[])[0]).toBe(1) // 3 identical 100-row chunks share one statement
+    })
+  }, TEST_TIMEOUT)
+
+  test('array rows work, and pool.bulkInsert forwards the option', async () => {
+    const pool = testPool({ max: 2 })
+    try {
+      await pool.execute(`create table ${K}_d4(id int8 primary key, name text not null, status text default 'pending', n int4 not null default 7)`)
+      const rows = Array.from({ length: 10 }, (_, i) => [i + 1, `a_${i}`, undefined, undefined]) // status+n -> DEFAULT
+      const r = await pool.bulkInsert(`${K}_d4`, { id: 'int8', name: 'text', status: 'text', n: 'int4' }, rows, { defaults: true })
+      expect(r.rowCount).toBe(10)
+      const chk = await pool.query(`select count(*)::int4 from ${K}_d4 where status = 'pending' and n = 7`, [], { mode: 'array' })
+      expect((chk.rows[0] as unknown[])[0]).toBe(10)
+    } finally {
+      await pool.execute(`drop table if exists ${K}_d4`)
+      await pool.end()
+    }
+  }, TEST_TIMEOUT)
+})
+
 describe('array params on plain queries', () => {
   test('declared array param, first unnamed execution', async () => {
     await withConn(async (c) => {

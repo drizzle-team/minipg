@@ -107,6 +107,19 @@ function bulkCasts(names: readonly string[], columns: Readonly<Record<string, st
   return { casts, oids }
 }
 
+// pivot a [start,end) row range -> one array per column (unnest is column-major). Shared by the
+// bulkInsert/bulkUpdate unnest paths.
+function pivotRows(names: readonly string[], rows: readonly (readonly unknown[] | Readonly<Record<string, unknown>>)[], start: number, end: number): unknown[][] {
+  const cols: unknown[][] = new Array(names.length)
+  for (let c = 0; c < names.length; c++) cols[c] = new Array(end - start)
+  for (let r = start; r < end; r++) {
+    const row = rows[r]!
+    if (Array.isArray(row)) for (let c = 0; c < names.length; c++) cols[c]![r - start] = row[c]
+    else for (let c = 0; c < names.length; c++) cols[c]![r - start] = (row as Record<string, unknown>)[names[c]!]
+  }
+  return cols
+}
+
 // merge per-chunk QueryResults (bulkInsert/copyMany chunked modes): rows concat in input order
 function mergeResults(rs: QueryResult<never>[]): QueryResult<never> {
   return {
@@ -293,6 +306,12 @@ export class Connection {
   private paramPlanCache = new WeakMap<readonly number[], ParamsEncoder | null>()
   // bulkInsert: (table+columns+returning) -> generated unnest SQL + array OIDs (stable identity) + auto statement name
   private insertMeta = new Map<string, { sql: string; oids: number[]; name: string }>()
+  // bulkInsert({ defaults:true }): VALUES-with-DEFAULT SQL -> auto statement name. Keyed by the full SQL
+  // (default-token positions + row count), so identical patterns reuse one prepared statement. EVERY
+  // distinct pattern is named — re-Parsing per chunk instead costs ~2.5x at scale (defaults-prepare.bench),
+  // so naming always wins. The common (uniform) case is 1-2 statements; only a pathological per-row-varying
+  // batch accrues one statement per distinct chunk SQL. (On a transaction pooler query() drops names anyway.)
+  private valuesMeta = new Map<string, string>()
   private mapperCache = new Map<string, RowMapper>() // per-shape row mappers (standard + typed queries)
   private mapperFactory: RowMapperFactory            // interpreted or jit, chosen once from config.decode
   // query-builder fast path: a chunks array (tagged template / builder) has stable identity, so cache
@@ -1005,15 +1024,52 @@ export class Connection {
    *  transactions instead of one giant end-of-load flush; a failure stops at the chunk
    *  boundary, keeps prior chunks, and the error carries `insertedRows`. `returning` rows
    *  concatenate across chunks in input order. `chunk` overrides the chunk size; `metrics`
-   *  applies to unchunked calls. */
+   *  applies to unchunked calls.
+   *
+   *  `defaults: true` opts OUT of unnest into a multi-row VALUES insert so per-cell column
+   *  DEFAULTs can be requested: a cell that is `undefined` (or a missing object key) emits the
+   *  literal `DEFAULT` keyword (the server applies the column default — a constant, `now()`,
+   *  `nextval(…)`, anything), while an explicit `null` still inserts SQL NULL. (The unnest path
+   *  can't express this: it sends every column, so an undefined there becomes NULL and OVERRIDES
+   *  the default.) Trade-off: the statement text encodes the DEFAULT positions, so instead of one
+   *  immutable statement you get one prepared statement per distinct (default-pattern, chunk-size)
+   *  — the common case (the same columns omitted on every row) stays a single reusable statement.
+   *  Params go out text-encoded with server type inference (no declared OIDs); every other option
+   *  (chunking, atomic/WAL, returning, onProgress) behaves the same. */
   bulkInsert(
     table: string,
     columns: Readonly<Record<string, PgType>>,
     rows: readonly (readonly unknown[] | Readonly<Record<string, unknown>>)[],
-    opts: { returning?: string; name?: string; chunk?: number; atomic?: boolean; metrics?: boolean | 'ms' | 'us'; timeout?: number; signal?: AbortSignal; onProgress?: (p: BulkProgress) => void } = {},
+    opts: { returning?: string; name?: string; chunk?: number; atomic?: boolean; defaults?: boolean; metrics?: boolean | 'ms' | 'us'; timeout?: number; signal?: AbortSignal; onProgress?: (p: BulkProgress) => void } = {},
   ): Promise<QueryResult<never>> {
     const names = Object.keys(columns)
     if (names.length === 0) return Promise.reject(new Error('bulkInsert: columns must not be empty'))
+    if (opts.defaults) {
+      // VALUES codegen: undefined cell -> literal DEFAULT, null -> SQL NULL, value -> $n param.
+      const prefix = `insert into ${table.split('.').map(qIdent).join('.')} (${names.map(qIdent).join(',')}) values `
+      const suffix = opts.returning ? ` returning ${opts.returning}` : ''
+      const makeChunk = (start: number, end: number) => {
+        const params: unknown[] = []
+        const tuples: string[] = new Array(end - start)
+        for (let r = start; r < end; r++) {
+          const row = rows[r]!
+          const isArr = Array.isArray(row)
+          const cells: string[] = new Array(names.length)
+          for (let c = 0; c < names.length; c++) {
+            const v = isArr ? (row as readonly unknown[])[c] : (row as Record<string, unknown>)[names[c]!]
+            if (v === undefined) cells[c] = 'DEFAULT'
+            else { params.push(v); cells[c] = '$' + params.length }
+          }
+          tuples[r - start] = '(' + cells.join(',') + ')'
+        }
+        const sql = prefix + tuples.join(',') + suffix
+        // one prepared-statement name per distinct SQL — naming always beats re-Parsing (measured ~2.5x)
+        let name = this.valuesMeta.get(sql)
+        if (name === undefined) { name = '_iv' + this.valuesMeta.size; this.valuesMeta.set(sql, name) }
+        return { sql, params, name, oids: undefined }
+      }
+      return this.runBulk('bulkInsert', names, rows, opts, 'insertedRows', makeChunk)
+    }
     const key = 'I\u0000' + table + '\u0000' + names.join('\u0000') + '\u0000' + names.map((n) => columns[n]).join('\u0000') + (opts.returning ? '\u0000' + opts.returning : '')
     let meta = this.insertMeta.get(key)
     if (!meta) {
@@ -1023,7 +1079,9 @@ export class Connection {
       meta = { sql, oids, name: '_im' + this.insertMeta.size }
       this.insertMeta.set(key, meta)
     }
-    return this.runBulk('bulkInsert', meta, names, rows, opts, 'insertedRows')
+    const m = meta
+    return this.runBulk('bulkInsert', names, rows, opts, 'insertedRows',
+      (start, end) => ({ sql: m.sql, params: pivotRows(names, rows, start, end), name: opts.name ?? m.name, oids: m.oids }))
   }
 
   /** Bulk-UPDATE rows matched by key column(s):
@@ -1063,18 +1121,22 @@ export class Connection {
       meta = { sql, oids, name: '_um' + this.insertMeta.size }
       this.insertMeta.set(key, meta)
     }
-    return this.runBulk('bulkUpdate', meta, names, rows, opts, 'updatedRows')
+    const m = meta
+    return this.runBulk('bulkUpdate', names, rows, opts, 'updatedRows',
+      (start, end) => ({ sql: m.sql, params: pivotRows(names, rows, start, end), name: opts.name ?? m.name, oids: m.oids }))
   }
 
-  // Shared chunked runner for bulkInsert/bulkUpdate: pivot rows column-major, chunk (explicit
-  // or adaptive), then single statement / atomic pipelined tx / WAL-friendly sequential commits.
+  // Shared chunked runner for bulkInsert/bulkUpdate. `makeChunk(start,end)` yields the SQL +
+  // params + prepared-statement name (+ declared OIDs, if any) for one row range — the unnest
+  // paths return a fixed SQL with column-pivoted params, the defaults path a VALUES statement.
+  // Then: single statement / atomic pipelined tx / WAL-friendly sequential commits.
   private runBulk(
     label: string,
-    m: { sql: string; oids: number[]; name: string },
     names: readonly string[],
     rows: readonly (readonly unknown[] | Readonly<Record<string, unknown>>)[],
-    opts: { name?: string; chunk?: number; atomic?: boolean; metrics?: boolean | 'ms' | 'us'; timeout?: number; signal?: AbortSignal; onProgress?: (p: BulkProgress) => void },
+    opts: { chunk?: number; atomic?: boolean; metrics?: boolean | 'ms' | 'us'; timeout?: number; signal?: AbortSignal; onProgress?: (p: BulkProgress) => void },
     errProp: 'insertedRows' | 'updatedRows',
+    makeChunk: (start: number, end: number) => { sql: string; params: unknown[]; name: string | undefined; oids: readonly number[] | undefined },
   ): Promise<QueryResult<never>> {
     const t0 = performance.now()
     const onProgress = opts.onProgress
@@ -1085,27 +1147,19 @@ export class Connection {
       track.bytes += r.metrics?.bytesSent ?? 0; track.chunk += 1
       try { onProgress({ rows: track.rows, totalRows: rows.length, affected: track.affected, bytes: track.bytes, elapsedMs: performance.now() - t0, chunk: track.chunk, chunks }) } catch { /* user callback errors never break the bulk op */ }
     }
-    // pivot a [start,end) row range -> one array per column (unnest is column-major)
-    const pivot = (start: number, end: number): unknown[][] => {
-      const cols: unknown[][] = new Array(names.length)
-      for (let c = 0; c < names.length; c++) cols[c] = new Array(end - start)
-      for (let r = start; r < end; r++) {
-        const row = rows[r]!
-        if (Array.isArray(row)) for (let c = 0; c < names.length; c++) cols[c]![r - start] = row[c]
-        else for (let c = 0; c < names.length; c++) cols[c]![r - start] = (row as Record<string, unknown>)[names[c]!]
-      }
-      return cols
+    // run one [start,end) range: build its statement, execute it (declared OIDs -> binary plan
+    // cache hit by identity; undefined -> text-encoded params with server type inference)
+    const run = (start: number, end: number, metrics: boolean | 'ms' | 'us' | undefined): Promise<QueryResult<never>> => {
+      const c = makeChunk(start, end)
+      return this.query(c.sql, c.params, { name: c.name, params: c.oids, timeout: opts.timeout, signal: opts.signal, metrics }) as Promise<QueryResult<never>>
     }
-    // m.oids is a stable array -> the params resolution + binary plan cache hit by identity
-    const qopts = { name: opts.name ?? m.name, params: m.oids, timeout: opts.timeout, signal: opts.signal, metrics: onProgress ? ('us' as const) : undefined }
+    const chunkMetrics = onProgress ? ('us' as const) : undefined
     const chunk = Math.max(1, opts.chunk ?? adaptiveChunk(names, rows)) // per-batch adaptive default; explicit opts.chunk always wins
     if (rows.length <= chunk) {
-      const p = this.query(m.sql, pivot(0, rows.length), { ...qopts, metrics: opts.metrics ?? qopts.metrics }) as Promise<QueryResult<never>>
+      const p = run(0, rows.length, opts.metrics ?? chunkMetrics)
       return onProgress ? p.then((r) => { report(rows.length, r, 1); return r }) : p
     }
     const nChunks = Math.ceil(rows.length / chunk)
-    // Chunked: the SAME statement serves every chunk (unnest SQL is row-count-independent, so
-    // even the partial last chunk reuses it).
     if (opts.atomic === false) {
       // WAL-friendly mode: chunks run SEQUENTIALLY and each COMMITS on its own — incremental
       // WAL flushes + short transactions instead of one giant end-of-load flush. A failure
@@ -1117,7 +1171,7 @@ export class Connection {
         for (let i = 0; i < rows.length; i += chunk) {
           try {
             const hi = Math.min(i + chunk, rows.length)
-            const r = (await this.query(m.sql, pivot(i, hi), qopts)) as QueryResult<never>
+            const r = await run(i, hi, chunkMetrics)
             rs.push(r); done += r.rowCount ?? 0
             report(hi - i, r, nChunks)
           } catch (e) {
@@ -1132,7 +1186,7 @@ export class Connection {
       const ps: Promise<QueryResult<never>>[] = []
       for (let i = 0; i < rows.length; i += chunk) {
         const hi = Math.min(i + chunk, rows.length)
-        const p = this.query(m.sql, pivot(i, hi), qopts) as Promise<QueryResult<never>>
+        const p = run(i, hi, chunkMetrics)
         ps.push(onProgress ? p.then((r) => { report(hi - i, r, nChunks); return r }) : p) // FIFO resolution -> monotone progress
       }
       return mergeResults(await Promise.all(ps))
