@@ -149,8 +149,10 @@ describe('binary param plans', () => {
   })
 
   test('plan is null when nothing is binary-able; extra params beyond the plan fall back', () => {
-    expect(compileParamPlan([25, 1700, 3802])).toBeNull() // text, numeric, jsonb
+    expect(compileParamPlan([25, 1700])).toBeNull() // text, numeric: no binary encoder -> null plan
     expect(compileParamPlan([])).toBeNull()
+    expect(compileParamPlan([3802])).not.toBeNull() // jsonb NOW has a JSON-forcing encoder (declared json wins over the array-literal default)
+    expect(compileParamPlan([1231])).not.toBeNull() // numeric[] NOW routes through arrayEnc (text-literal fallback)
     const { fmts, vals } = planBind([20], [1, 'extra'])
     expect(fmts).toEqual([1, 0])
     expect(vals[1]!.toString()).toBe('extra')

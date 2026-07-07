@@ -3,7 +3,7 @@
 // numeric default to STRING (the #1 silent-corruption footgun in pg & postgres.js),
 // and timestamps stay strings (Date conversion is lossy). Everything is overridable.
 import type { Decoder } from './types.ts'
-import { Writer, type ParamsEncoder } from './protocol.ts' // protocol.ts only type-imports from here -> no runtime cycle
+import { Writer, W, type ParamsEncoder } from './protocol.ts' // protocol.ts only type-imports from here -> no runtime cycle
 import { parseJsonBuffer } from './jsonparse.ts'
 
 const asString: Decoder = (b) => b.toString('utf8')
@@ -83,6 +83,7 @@ export function encodeParam(v: unknown): EncodedParam {
   if (Buffer.isBuffer(v)) return { format: 1, bytes: v }
   if (v instanceof Date) return { format: 0, bytes: Buffer.from(v.toISOString(), 'utf8') }
   if (typeof v === 'boolean') return { format: 0, bytes: Buffer.from(v ? 't' : 'f', 'utf8') }
+  if (Array.isArray(v)) return { format: 0, bytes: Buffer.from(arrayLiteral(v), 'utf8') } // JS array -> PG '{…}' literal, not JSON
   if (typeof v === 'object') return { format: 0, bytes: Buffer.from(JSON.stringify(v), 'utf8') }
   const s = String(v)
   if (s.indexOf('\0') !== -1) throw new Error(NUL_MSG)
@@ -101,7 +102,7 @@ export function encodeValueInto(w: Writer, v: unknown): number {
   switch (typeof v) {
     case 'number':
       if (Number.isSafeInteger(v)) w.lpAsciiInt(v)
-      else w.lpStr(String(v)) // fraction/exponent/NaN/Infinity forms can't contain NUL
+      else w.lpAsc(String(v)) // fraction/exponent/NaN/Infinity: ASCII digits, no NUL — latin1
       return 0
     case 'string':
       if (v.indexOf('\0') !== -1) throw new Error(NUL_MSG)
@@ -111,13 +112,14 @@ export function encodeValueInto(w: Writer, v: unknown): number {
       w.int32(1); w.byte(v ? 0x74 : 0x66) // 't' / 'f'
       return 0
     case 'object':
-      if (v instanceof Date) w.lpStr(v.toISOString())
-      else w.lpStr(JSON.stringify(v)) // stringify escapes control chars — no raw NUL possible
+      if (v instanceof Date) { const lp = w.mark(); w.int32(0); const s = w.mark(); writeIso(w, v); w.patch32(lp, w.mark() - s) } // write-through ISO-8601, no toISOString() string
+      else if (Array.isArray(v)) arrayLiteralInto(w, v) // write-through PG '{…}' literal (NOT JSON); server uses the declared array OID or infers the element type
+      else w.lpStr(JSON.stringify(v)) // plain object -> json/jsonb text; stringify escapes control chars — no raw NUL possible
       return 0
-    default: { // bigint (digits), symbol/function (String() throws / nonsense — same as encodeParam)
+    default: { // bigint (digits), symbol/function (String() nonsense — same as encodeParam)
       const s = String(v)
       if (s.indexOf('\0') !== -1) throw new Error(NUL_MSG)
-      w.lpStr(s)
+      if (typeof v === 'bigint') w.lpAsc(s); else w.lpStr(s) // bigint digits are ASCII (latin1); symbol/function may be unicode
       return 0
     }
   }
@@ -134,6 +136,14 @@ const PG_EPOCH_MS = 946684800000 // 2000-01-01T00:00:00Z
 const MS_SAFE = 9007199254740    // |ms since PG epoch| below this, ms*1000 stays a safe integer
 const I64_MIN = -9223372036854775808n
 const I64_MAX = 9223372036854775807n
+
+// Array type OID -> element type OID (pg_type.typelem), the inverse of spec.ts's ARRAY_OID. Kept LOCAL to
+// avoid a codec<->spec runtime import cycle (spec -> decode2 -> codec); these are stable PG built-in OIDs.
+const ELEM_OID: Record<number, number> = {
+  1000: 16, 1005: 21, 1007: 23, 1028: 26, 1016: 20, 1021: 700, 1022: 701, 1231: 1700, 791: 790,
+  1009: 25, 1015: 1043, 1014: 1042, 1002: 18, 1003: 19, 199: 114, 3807: 3802, 1001: 17, 2951: 2950,
+  1182: 1082, 1183: 1083, 1115: 1114, 1185: 1184, 1187: 1186,
+}
 
 type BinEnc = (w: Writer, v: unknown) => number
 
@@ -158,19 +168,15 @@ function binEncoderFor(oid: number): BinEnc | null {
       else w.lpI64Big(BigInt(ms) * 1000n) // >±285yr from 2000: exact via BigInt
       return 1
     }
-    // ---- array types (the unnest batch-insert path): JS array -> binary array wire format ----
-    case 1000: return arrayEnc(16)   // bool[]
-    case 1005: return arrayEnc(21)   // int2[]
-    case 1007: return arrayEnc(23)   // int4[]
-    case 1016: return arrayEnc(20)   // int8[]
-    case 1022: return arrayEnc(701)  // float8[]
-    case 1009: return arrayEnc(25)   // text[]
-    case 1015: return arrayEnc(1043) // varchar[]
-    case 1115: return arrayEnc(1114) // timestamp[]
-    case 1185: return arrayEnc(1184) // timestamptz[]
-    // NOT upgraded on purpose: float4 (binary would silently clamp out-of-range to ±Infinity where
-    // text raises 22003), numeric/uuid (later), text/varchar scalars (binary == text bytes, no win).
-    default: return null
+    // json/jsonb: a DECLARED json type wins over the value's shape — always JSON text, even for a JS array
+    // (which encodeValueInto would otherwise arrayLiteral). A string passes through (pre-serialized json).
+    case 114: case 3802: return (w, v) => { w.lpStr(typeof v === 'string' ? v : JSON.stringify(v)); return 0 }
+    // ---- array types: route EVERY declared array OID through arrayEnc via the element-OID map. It BINARY-
+    // encodes the fast element types (bool/int2/int4/int8/float8/text/varchar/timestamp(tz)[]); for any
+    // other element type (numeric/uuid/date/time/interval/bytea/json/jsonb/oid/float4/money/bpchar/char/
+    // name[]) the element encoder throws MISMATCH, so arrayEnc rewinds to a correct '{…}' arrayLiteral()
+    // TEXT literal. A scalar OID without a binary encoder isn't in ELEM_OID -> null -> encodeValueInto text.
+    default: { const elem = ELEM_OID[oid]; return elem !== undefined ? arrayEnc(elem) : null }
   }
 }
 
@@ -228,7 +234,7 @@ function arrayEnc(elemOid: number): BinEnc {
     } catch (e) {
       if (e !== MISMATCH) throw e
       w.rewind(mark)
-      return encodeValueInto(w, arrayLiteral(v)) // text literal: the server parses + raises the proper error if truly invalid
+      arrayLiteralInto(w, v); return 0 // text literal (write-through): the server parses + raises the proper error if truly invalid
     }
   }
 }
@@ -271,34 +277,41 @@ export function* copyRowsBinary(oids: readonly number[], names: readonly string[
   yield Buffer.from(w.slice())
 }
 
-const escCopyText = (s: string) => s.replace(/\\/g, '\\\\').replace(/\t/g, '\\t').replace(/\n/g, '\\n').replace(/\r/g, '\\r')
-function copyTextCell(v: unknown): string {
-  if (typeof v === 'string') return escCopyText(v)
-  if (typeof v === 'number' || typeof v === 'bigint') return String(v)
-  if (typeof v === 'boolean') return v ? 't' : 'f'
-  if (v instanceof Date) return v.toISOString()
-  if (Buffer.isBuffer(v)) return '\\\\x' + v.toString('hex') // literal backslash-x…: escaped \ + hex
-  return escCopyText(typeof v === 'object' ? JSON.stringify(v) : String(v))
+/** Write s COPY-text-escaped ('\'->'\\', TAB->'\t', LF->'\n', CR->'\r') straight into w (user text is
+ *  utf8) — no intermediate .replace() strings. Only the 4 special chars break the fast utf8 run. */
+function writeEscCopy(w: Writer, s: string): void {
+  let start = 0
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i)
+    const e = c === 0x5c ? 0x5c : c === 0x09 ? 0x74 : c === 0x0a ? 0x6e : c === 0x0d ? 0x72 : 0 // '\','t','n','r'
+    if (e) { if (i > start) w.str(s.slice(start, i)); w.byte(0x5c); w.byte(e); start = i + 1 }
+  }
+  if (start < s.length) w.str(s.slice(start))
+}
+function copyTextCellInto(w: Writer, v: unknown): void {
+  if (typeof v === 'string') { writeEscCopy(w, v); return }
+  if (typeof v === 'number' || typeof v === 'bigint') { w.asc(String(v)); return } // ASCII digits -> latin1
+  if (typeof v === 'boolean') { w.byte(v ? 0x74 : 0x66); return } // 't'/'f'
+  if (v instanceof Date) { writeIso(w, v); return }
+  if (Buffer.isBuffer(v)) { w.asc('\\\\x'); w.asc(v.toString('hex')); return } // literal '\\x' + hex (already COPY-escaped)
+  writeEscCopy(w, typeof v === 'object' ? JSON.stringify(v) : String(v))
 }
 
-/** Rows -> COPY text-format payload chunks (tab-separated, \N for NULL). Universal: works for
- *  every column type — the server parses each field with the type's input function. */
+/** Rows -> COPY text-format payload chunks (tab-separated, \N for NULL). Write-through into ONE reused
+ *  Writer — no per-line string, no parts.join(''), no per-cell .replace(). Universal: the server parses
+ *  each field with the column type's input function. */
 export function* copyRowsText(names: readonly string[], rows: readonly CopyRow[], chunkBytes = 1 << 18): Generator<Buffer> {
-  let parts: string[] = []
-  let size = 0
+  const w = new Writer(chunkBytes + 1024)
   for (const row of rows) {
-    let line = ''
     for (let c = 0; c < names.length; c++) {
-      if (c) line += '\t'
+      if (c) w.byte(0x09) // '\t'
       const v = cell(row, names, c)
-      line += v == null ? '\\N' : copyTextCell(v)
+      if (v == null) w.asc('\\N'); else copyTextCellInto(w, v)
     }
-    line += '\n'
-    parts.push(line)
-    size += line.length
-    if (size >= chunkBytes) { yield Buffer.from(parts.join(''), 'utf8'); parts = []; size = 0 }
+    w.byte(0x0a) // '\n'
+    if (w.mark() >= chunkBytes) { yield Buffer.from(w.slice()); w.reset() }
   }
-  if (parts.length) yield Buffer.from(parts.join(''), 'utf8')
+  if (w.mark() > 0) yield Buffer.from(w.slice())
 }
 
 /** JS array -> PG text array literal ('{…}'), the fallback when an element can't go binary.
@@ -312,10 +325,52 @@ export function arrayLiteral(arr: readonly unknown[]): string {
     if (Array.isArray(v)) { s += arrayLiteral(v); continue }
     if (typeof v === 'number' || typeof v === 'bigint') { s += String(v); continue }
     if (typeof v === 'boolean') { s += v ? 't' : 'f'; continue }
-    const str = v instanceof Date ? v.toISOString() : Buffer.isBuffer(v) ? '\\x' + v.toString('hex') : String(v)
+    const str = v instanceof Date ? v.toISOString() : Buffer.isBuffer(v) ? '\\x' + v.toString('hex') : typeof v === 'object' ? JSON.stringify(v) : String(v) // object element (json[]/jsonb[]) -> its JSON text
     s += '"' + str.replace(/\\/g, '\\\\').replace(/"/g, '\\"') + '"'
   }
   return s + '}'
+}
+
+// ---- write-through text encoders: bytes straight into the buffer, no intermediate JS string ----
+function p2(w: Writer, n: number): void { w.byte(48 + ((n / 10) | 0)); w.byte(48 + (n % 10)) } // 2-digit zero-padded
+/** ISO-8601 UTC bytes, byte-identical to Date.toISOString() for years 0000-9999. Extended years (±YYYYYY)
+ *  and Invalid Date fall back to toISOString — which throws on Invalid Date, exactly as the old text path. */
+function writeIso(w: Writer, d: Date): void {
+  const y = d.getUTCFullYear()
+  if (!(y >= 0 && y <= 9999)) { w.asc(d.toISOString()); return }
+  w.byte(48 + (((y / 1000) | 0) % 10)); w.byte(48 + (((y / 100) | 0) % 10)); w.byte(48 + (((y / 10) | 0) % 10)); w.byte(48 + (y % 10)) // YYYY
+  w.byte(45); p2(w, d.getUTCMonth() + 1); w.byte(45); p2(w, d.getUTCDate()) // -MM-DD
+  w.byte(84); p2(w, d.getUTCHours()); w.byte(58); p2(w, d.getUTCMinutes()); w.byte(58); p2(w, d.getUTCSeconds()) // THH:mm:ss
+  const ms = d.getUTCMilliseconds()
+  w.byte(46); w.byte(48 + ((ms / 100) | 0)); w.byte(48 + (((ms / 10) | 0) % 10)); w.byte(48 + (ms % 10)); w.byte(90) // .sssZ
+}
+/** Write s with '"' and '\' backslash-escaped (no surrounding quotes); user text stays utf8. */
+function writeEscQuoted(w: Writer, s: string): void {
+  let start = 0
+  for (let i = 0; i < s.length; i++) { const c = s.charCodeAt(i); if (c === 0x22 || c === 0x5c) { if (i > start) w.str(s.slice(start, i)); w.byte(0x5c); start = i } }
+  if (start < s.length) w.str(s.slice(start))
+}
+function writeArrayBody(w: Writer, arr: readonly unknown[]): void {
+  w.byte(0x7b) // '{'
+  for (let i = 0; i < arr.length; i++) {
+    if (i) w.byte(0x2c) // ','
+    const v = arr[i]
+    if (v == null) { w.asc('NULL'); continue }
+    if (Array.isArray(v)) { writeArrayBody(w, v); continue }
+    if (typeof v === 'number' || typeof v === 'bigint') { w.asc(String(v)); continue }
+    if (typeof v === 'boolean') { w.byte(v ? 0x74 : 0x66); continue } // 't'/'f'
+    w.byte(0x22) // '"'
+    if (v instanceof Date) writeIso(w, v) // ISO-8601 has no '"'/'\' -> no escaping
+    else writeEscQuoted(w, Buffer.isBuffer(v) ? '\\x' + v.toString('hex') : typeof v === 'object' ? JSON.stringify(v) : String(v))
+    w.byte(0x22) // '"'
+  }
+  w.byte(0x7d) // '}'
+}
+/** Write-through equivalent of w.lpStr(arrayLiteral(arr)): int32 length + '{…}' bytes, no JS string. */
+export function arrayLiteralInto(w: Writer, arr: readonly unknown[]): void {
+  const lp = w.mark(); w.int32(0); const s = w.mark()
+  writeArrayBody(w, arr)
+  w.patch32(lp, w.mark() - s)
 }
 
 /** Compile the per-statement param plan from cached ParameterDescription OIDs. Returns null when
@@ -325,4 +380,76 @@ export function compileParamPlan(oids: readonly number[]): ParamsEncoder | null 
   const encs = oids.map((o) => { const e = binEncoderFor(o); if (e) any = true; return e })
   if (!any) return null
   return (w, v, i) => { const e = i < encs.length ? encs[i] : null; return e ? e(w, v) : encodeValueInto(w, v) }
+}
+
+// ---- JIT param encoder ('jit' tier, needs eval) -------------------------------------------
+// When the param shape is known upfront (declared `params`, or cached ParameterDescription OIDs on
+// prepared reuse), a per-statement codegen'd encoder collapses the entire Bind+Execute+Sync into two
+// constant memcpys (the framing — portal/statement/format-codes/counts/result-format never change) and
+// inlines the FAST scalar columns straight-line (no per-value closure dispatch, no loop). It is
+// BYTE-IDENTICAL to writeBindWith(w,'',name,params,compileParamPlan(oids),rf)+writeExecute(w,'',0)+
+// writeSync(w): the fast inlines exactly mirror binEncoderFor (incl. the text fallback, which patches the
+// baked binary format code back to what encodeValueInto returns), and every non-fast/array/json column
+// runs the SAME per-column closure the generic plan would. Arrays gain nothing from inlining (memory-bound
+// element loop) so they stay on the closure; the win is the constant framing + inlined scalar rows.
+export type BindEncoder = (w: Writer, params: readonly unknown[]) => void
+const JIT_FAST = new Set([16, 21, 23, 20, 701, 1114, 1184]) // OIDs inlined straight-line (exact binEncoderFor replicas)
+const JIT_MAX_PERIOD = 64 // cap on the ROW WIDTH (repeating period), not total params — an N-row VALUES chunk still qualifies
+
+// Smallest p | n with oids[i] === oids[i-p] for all i>=p — the row width of a repeating plan. So ONE compiled
+// row body serves a 1-row insert AND an N-row VALUES chunk of the same columns (looped n/p times), instead of
+// a giant unrolled function. = n when the OIDs don't repeat (irregular statement).
+function paramPeriod(oids: readonly number[]): number {
+  const n = oids.length
+  for (let p = 1; p < n; p++) {
+    if (n % p !== 0) continue
+    let ok = true
+    for (let i = p; i < n; i++) if (oids[i] !== oids[i - p]) { ok = false; break }
+    if (ok) return p
+  }
+  return n
+}
+
+/** Returns null (=> caller uses the generic write-through plan) when the row width exceeds JIT_MAX_PERIOD. */
+export function compileBindEncoder(name: string, oids: readonly number[], resultFormat: number | number[]): BindEncoder | null {
+  const n = oids.length
+  const p = n === 0 ? 0 : paramPeriod(oids) // row width; the compiled body encodes p columns, looped rowCount times
+  if (p > JIT_MAX_PERIOD) return null // irregular-wide statement: not worth a giant unrolled body
+  const rowCount = p === 0 ? 0 : n / p
+  const i16 = (x: number) => { const b = Buffer.allocUnsafe(2); b.writeUInt16BE(x); return b }
+  const nameBuf = Buffer.from(name, 'utf8')
+  const fmtSection = Buffer.allocUnsafe(n * 2)
+  for (let i = 0; i < n; i++) fmtSection.writeUInt16BE(JIT_FAST.has(oids[i % p]!) ? 1 : 0, i * 2) // baked intended formats (row pattern repeated)
+  const PREFIX = Buffer.concat([Buffer.from([0]), nameBuf, Buffer.from([0]), i16(n), fmtSection, i16(n)]) // portal '' + stmt + count + formats + count
+  const FMT0 = 1 + nameBuf.length + 1 + 2 // offset of format slot 0 within PREFIX
+  const RESULTFMT = Array.isArray(resultFormat) ? Buffer.concat([i16(resultFormat.length), ...resultFormat.map(i16)]) : Buffer.concat([i16(1), i16(resultFormat)])
+  const EXECSYNC = Buffer.concat([W.execute('', 0), W.sync()])
+  const C: (BinEnc | null)[] = [] // per-row-column closures (non-fast columns)
+  for (let c = 0; c < p; c++) C.push(JIT_FAST.has(oids[c]!) ? null : (binEncoderFor(oids[c]!) ?? encodeValueInto))
+  const cols: string[] = []
+  for (let c = 0; c < p; c++) {
+    const off = `fb + ${c * 2}` // format slot for this row's column c (fb = base + FMT0 + r*p*2)
+    const fb = `{ const f = enc(w, x); if (f !== 1) w.patch16(${off}, f) }` // fast-column fallback (baked 1)
+    let s: string
+    switch (oids[c]) {
+      case 16: s = `if (typeof x !== 'boolean') ${fb} else { w.int32(1); w.byte(x ? 1 : 0) }`; break
+      case 21: s = `if (typeof x !== 'number' || !Number.isInteger(x) || x < -32768 || x > 32767) ${fb} else { w.int32(2); w.int16(x & 0xffff) }`; break
+      case 23: s = `if (typeof x !== 'number' || !Number.isInteger(x) || x < -2147483648 || x > 2147483647) ${fb} else { w.int32(4); w.int32(x) }`; break
+      case 20: s = `if (typeof x === 'number' && Number.isSafeInteger(x)) w.lpI64(x); else if (typeof x === 'bigint' && x >= I64_MIN && x <= I64_MAX) w.lpI64Big(x); else ${fb}`; break
+      case 701: s = `if (typeof x !== 'number') ${fb} else w.lpF8(x)`; break
+      case 1114: case 1184: s = `if (!(x instanceof Date)) ${fb} else { const ms = x.getTime() - PG_EPOCH_MS; if (Number.isNaN(ms)) ${fb} else if (ms >= -MS_SAFE && ms <= MS_SAFE) w.lpI64(ms * 1000); else w.lpI64Big(BigInt(ms) * 1000n) }`; break
+      // text/varchar are TEXT-format (baked 0): inline encodeValueInto's string fast-path (lpStr + NUL guard);
+      // a non-string value falls to the full encodeValueInto (number->digits etc.), patching format if != 0.
+      case 25: case 1043: s = `if (typeof x === 'string') { if (x.indexOf('\\u0000') !== -1) throw new Error(NUL_MSG); w.lpStr(x) } else { const f = enc(w, x); if (f !== 0) w.patch16(${off}, f) }`; break
+      default: s = `const f = C[${c}](w, x); if (f !== 0) w.patch16(${off}, f)` // non-fast (baked 0): exact writeBindWith semantics
+    }
+    cols.push(`{ const x = v[vb + ${c}]; ${s} }`)
+  }
+  const body = cols.join('\n')
+  const loop = rowCount > 1
+    ? `for (let r = 0; r < ${rowCount}; r++) { const vb = r * ${p}, fb = base + ${FMT0} + r * ${p * 2}; ${body} }`
+    : `{ const vb = 0, fb = base + ${FMT0}; ${body} }` // single row (or zero): no loop overhead
+  const src = `w.start("B"); const base = w.mark(); w.bytes(PREFIX); ${loop} w.bytes(RESULTFMT); w.end(); w.bytes(EXECSYNC);`
+  return new Function('PREFIX', 'RESULTFMT', 'EXECSYNC', 'enc', 'C', 'PG_EPOCH_MS', 'MS_SAFE', 'I64_MIN', 'I64_MAX', 'NUL_MSG',
+    `return (w, v) => { ${src} }`)(PREFIX, RESULTFMT, EXECSYNC, encodeValueInto, C, PG_EPOCH_MS, MS_SAFE, I64_MIN, I64_MAX, NUL_MSG) as BindEncoder
 }

@@ -51,10 +51,10 @@ describe('encodeParam (unit) — JS value -> Bind bytes', () => {
     expect(encodeParam(withToJSON).bytes?.toString('utf8')).toBe('{"x":1}')
   })
 
-  test('footgun: a JS array encodes as JSON [1,2,3], NOT a PG array literal {1,2,3}', () => {
-    expect(encodeParam([1, 2, 3]).bytes?.toString('utf8')).toBe('[1,2,3]')
-    // a null element survives JSON.stringify as JSON null
-    expect(encodeParam([1, null, 2]).bytes?.toString('utf8')).toBe('[1,null,2]')
+  test('a JS array encodes as a PG array literal {1,2,3} (Option A), NOT JSON', () => {
+    expect(encodeParam([1, 2, 3]).bytes?.toString('utf8')).toBe('{1,2,3}')
+    // a null element becomes an unquoted SQL NULL inside the array literal
+    expect(encodeParam([1, null, 2]).bytes?.toString('utf8')).toBe('{1,NULL,2}')
   })
 
   test('footgun: Set / Map serialize to {} (their members are lost), silently', () => {
@@ -193,10 +193,11 @@ describe('NULL and undefined binding', () => {
     } finally { await c.end() }
   })
 
-  test('a null element inside an array/object param is preserved as JSON null (not SQL NULL)', async () => {
+  test('a null element inside a jsonb-declared array param is JSON null (params:[jsonb] keeps it JSON)', async () => {
     const c = await testConnect()
     try {
-      const r = await c.query('select $1::jsonb as j', [[1, null, 2]])
+      // untyped, a JS array now encodes as a PG '{…}' literal (Option A); declare jsonb to keep it JSON
+      const r = await c.query('select $1 as j', [[1, null, 2]], { params: ['jsonb'] })
       expect(cell0(r)).toEqual([1, null, 2])
     } finally { await c.end() }
   })
@@ -315,12 +316,11 @@ describe('object / JSON & the JS-array footgun', () => {
     } finally { await c.end() }
   })
 
-  test('footgun: a JS array to ::int[] / =ANY($1) FAILS (it is JSON [1,2,3], not {1,2,3})', async () => {
+  test('a JS array to ::int[] / =ANY($1) now WORKS (Option A: encoded as {1,2,3})', async () => {
     const c = await testConnect()
     try {
-      const err = await caught(() => c.query('select 2 = any($1::int[])', [[1, 2, 3]]))
-      expect((err as PgError).code).toBe('22P02') // malformed array literal: "[1,2,3]"
-      expect((err as Error).message).toMatch(/\[1,2,3\]/)
+      expect(cell0(await c.query('select 2 = any($1::int[])', [[1, 2, 3]]))).toBe(true)
+      expect(cell0(await c.query('select 9 = any($1::int[])', [[1, 2, 3]]))).toBe(false)
     } finally { await c.end() }
   })
 
@@ -332,11 +332,12 @@ describe('object / JSON & the JS-array footgun', () => {
     } finally { await c.end() }
   })
 
-  test('a JS array bound to a jsonb column stores a JSON array (correct for jsonb)', async () => {
+  test('a JS array into a jsonb column: DECLARE jsonb (an untyped array is now a PG literal)', async () => {
     const c = await testConnect()
     try {
       await c.query('create temp table param_json_t (j jsonb)')
-      await c.query('insert into param_json_t (j) values ($1)', [[1, 2, 3]])
+      // untyped, a JS array is now a PG array literal '{1,2,3}' (invalid jsonb) — declare jsonb to store a JSON array
+      await c.query('insert into param_json_t (j) values ($1)', [[1, 2, 3]], { params: ['jsonb'] })
       const r = await c.query('select j from param_json_t')
       expect(cell0(r)).toEqual([1, 2, 3])
     } finally { await c.end() }
@@ -623,6 +624,7 @@ describe('public API surface (out-of-scope guard)', () => {
 
   // roadmap (pending specs) — written as todos so the suite never goes red:
   test.todo('explicit per-query param type-OID hints (query.types) — Parse currently always sends 0 OIDs', () => {})
-  test.todo('built-in JS-array -> PG-array-literal encoding so =ANY($1) works from a JS array', () => {})
+  // (SHIPPED) JS-array -> PG-array-literal encoding (Option A) + declared params:['<t>[]'] — see the
+  // 'object / JSON & the JS-array footgun' group above and test/integration/param-arrays.test.ts.
   test.todo('throw on a Promise/thenable param instead of silently binding {}', () => {})
 })

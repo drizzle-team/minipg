@@ -216,17 +216,14 @@ describe('parameter count, binding & server-side type inference', () => {
     })
   })
 
-  test('array param: JS array via JSON text is malformed for native int[] (documented encoding limit)', async () => {
+  test('array param: a JS array binds to a native int[] (Option A: PG array literal)', async () => {
     await withConn(async (c) => {
-      // encodeParam JSON.stringifies arrays -> "[1,2]" which is NOT a Postgres array literal "{1,2}"
-      const err = await caught(() => c.query('select id from public.t where id = any($1::int[])', [[1, 2]]))
-      expect((err as PgError).code).toBe('22P02') // malformed array literal
-      // Workaround: pass the Postgres array literal string yourself.
-      const ok = await c.query('select id from public.t where id = any($1::int[]) order by id', ['{1,2}'])
+      // a JS array now encodes as the PG array literal '{1,2}' — works directly against int[]
+      const ok = await c.query('select id from public.t where id = any($1::int[]) order by id', [[1, 2]])
       expect(ok.rows.map((r) => (r as unknown[])[0])).toEqual([1, 2])
-      // connection recovered after the error
-      const live = await c.query('select 1 as a')
-      expect((live.rows[0] as unknown[])[0]).toBe(1)
+      // the array-literal string form still works too
+      const ok2 = await c.query('select id from public.t where id = any($1::int[]) order by id', ['{1,2}'])
+      expect(ok2.rows.map((r) => (r as unknown[])[0])).toEqual([1, 2])
     })
   })
 })

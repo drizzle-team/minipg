@@ -90,34 +90,31 @@ describe('array decode — opt-in / built-in array parser (roadmap)', () => {
   test.todo('custom array parser in config.types overrides built-in', () => {})
 })
 
-describe('array encode — current JSON.stringify baseline & footgun', () => {
-  test('JS array bound to text[] fails server-side (JSON, not PG literal)', async () => {
-    const err = await caught(() => c.query('select $1::text[] as a', [['a', 'b', 'c']]))
-    // encodeParam -> JSON.stringify(['a','b','c']) = '["a","b","c"]' -> 22P02
-    expect((err as PgError).code).toBe('22P02')
+describe('array encode — JS array -> PG array literal (Option A / declared params)', () => {
+  test("JS ['a','b','c'] -> text[] '{a,b,c}' round-trips", async () => {
+    expect(cell0(await c.query('select $1::text[] as a', [['a', 'b', 'c']]))).toBe('{a,b,c}')
   })
 
-  test('working escape hatch: bind a PG array literal STRING and cast', async () => {
-    const r = await c.query('select $1::int4[] as a', ['{1,2,3}'])
-    expect(cell0(r)).toBe('{1,2,3}')
+  test('escape hatch still works: a PG array literal STRING casts', async () => {
+    expect(cell0(await c.query('select $1::int4[] as a', ['{1,2,3}']))).toBe('{1,2,3}')
   })
 
-  test('array of bigints: JSON.stringify throws on BigInt (current limitation)', async () => {
-    // encodeParam hits the typeof === 'object' branch -> JSON.stringify -> throws.
-    const err = await caught(() => c.query('select $1::int8[] as a', [[1n, 2n]]))
-    expect(err).toBeInstanceOf(Error)
-    expect((err as Error).message).toMatch(/BigInt/i)
+  test('array of bigints -> int8[] (arrayLiteral handles BigInt, no throw)', async () => {
+    expect(cell0(await c.query('select $1::int8[] as a', [[1n, 9223372036854775807n]]))).toBe('{1,9223372036854775807}')
   })
-})
 
-describe('array encode — opt-in array-literal serializer (roadmap)', () => {
-  test.todo("JS ['a','b','c'] -> text[] '{a,b,c}' round-trips", () => {})
-  test.todo("null elements ['A',null,'B'] -> '{A,NULL,B}'; [] -> '{}'", () => {})
-  test.todo('quoting on encode round-trips byte-exact', () => {})
-  test.todo("nested [['a'],['b']] -> '{{a},{b}}'", () => {})
-  test.todo('uuid-string array -> uuid[]', () => {})
-  test.todo('UNNEST($1::text[],$2::int4[]) bulk insert', () => {})
-  test.todo('= ANY($1::int4[]) membership with JS array param', () => {})
+  test("null elements & empty: ['A',null,'B'] -> {A,NULL,B}; [] -> {}", async () => {
+    expect(cell0(await c.query('select $1::text[] as a', [['A', null, 'B']]))).toBe('{A,NULL,B}')
+    expect(cell0(await c.query('select $1::int4[] as a', [[]]))).toBe('{}')
+  })
+
+  test("nested [['a'],['b']] -> {{a},{b}}", async () => {
+    expect(cell0(await c.query('select $1::text[] as a', [[['a'], ['b']]]))).toBe('{{a},{b}}')
+  })
+
+  test('= ANY($1::int4[]) membership with a JS array param', async () => {
+    expect(cell0(await c.query('select 2 = any($1::int4[]) as a', [[1, 2, 3]]))).toBe(true)
+  })
 })
 
 // ---------------------------------------------------------------------------

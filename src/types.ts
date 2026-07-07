@@ -80,6 +80,11 @@ export interface ConnectConfig {
    *  (fastest, needs eval — Node/Bun/Deno); 'interpreted' resolves per-column decoders and loops (no eval —
    *  CSP / Cloudflare Workers); 'auto' (default) uses jit where eval is available, else interpreted. */
   decode?: 'auto' | 'jit' | 'interpreted'
+  /** Param-encode strategy when a binary plan applies (declared `params` or prepared reuse): 'jit'
+   *  compiles a per-statement Bind+Execute+Sync encoder with new Function (fastest, needs eval); 'interpreted'
+   *  uses the generic write-through plan (no eval — CSP / Cloudflare Workers); 'auto' (default) uses jit where
+   *  eval is available, else interpreted. Byte-identical output either way; this only trades compile for speed. */
+  encode?: 'auto' | 'jit' | 'interpreted'
   /** How date/timestamp/timestamptz columns decode by default: 'date' (default) = a JS Date (like
    *  pg/postgres.js); 'string' = the exact PG text, lossless (keeps µs, BC eras, 5-digit years, and
    *  infinity, none of which a JS Date can hold). Per-column `:string`/`:date`/`:ms` targets in a

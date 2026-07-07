@@ -3,11 +3,11 @@
 import type { Duplex } from 'node:stream'
 import { W, Writer, writeParse, writeDescribe, writeBindWith, writeExecute, writeClose, writeSync, writeQuery, Parser, parseRowDescription, parseDataRow, parseParameterDescription, type ParamsEncoder } from './protocol.ts'
 import { md5Password, scram, type Scram } from './auth.ts'
-import { buildDecoders, decoderFor, encodeValueInto, compileParamPlan, copyRowsBinary, copyRowsText, copyBinarySupported } from './codec.ts'
+import { buildDecoders, decoderFor, encodeValueInto, compileParamPlan, compileBindEncoder, type BindEncoder, copyRowsBinary, copyRowsText, copyBinarySupported } from './codec.ts'
 import { PgError, parseErrorFields } from './errors.ts'
 import type { ConnectConfig, Decoder, Field, QueryDebug, QueryOptions, QueryResult, ResultMode, StreamOptions, TxOptions } from './types.ts'
 import { INSTANT_OIDS, BINARY_FAST, type CodegenCol } from './decode2.ts'
-import { buildMapperFactory, type RowMapper, type RowMapperFactory } from './mapper.ts'
+import { buildMapperFactory, isEvalAvailable, type RowMapper, type RowMapperFactory } from './mapper.ts'
 import { resolveUrl } from './url.ts'
 import { shapeCols, resolveParamTypes, paramTypeOid, type ShapeSpec, type ShapeOf, type ParamType, type PgType } from './spec.ts'
 import type { ShapeMapper } from './shape.ts'
@@ -304,6 +304,10 @@ export class Connection {
   private parseInflight = new Map<string, string>()
   // per-declared-params binary plans, keyed by array identity (ORMs pass a stable array). WeakMap => auto-GC.
   private paramPlanCache = new WeakMap<readonly number[], ParamsEncoder | null>()
+  // JIT Bind+Execute+Sync encoders, keyed by binary-plan identity (stable per statement/paramTypes). Rebuilt
+  // only when the statement name or result-format changes for that plan. Empty unless encode:'jit'/'auto'+eval.
+  private jitEncodeCache = new Map<ParamsEncoder, { jit: BindEncoder | null; name: string; rfSig: number | string }>()
+  private jitEncode = false // eval available AND encode !== 'interpreted'
   // bulkInsert: (table+columns+returning) -> generated unnest SQL + array OIDs (stable identity) + auto statement name
   private insertMeta = new Map<string, { sql: string; oids: number[]; name: string }>()
   // bulkInsert({ defaults:true }): VALUES-with-DEFAULT SQL -> auto statement name. Keyed by the full SQL
@@ -365,9 +369,24 @@ export class Connection {
       plugins: config.plugins ?? [],
     }
     this.instrumented = this.cfg.plugins.length > 0
-    this.mapperFactory = buildMapperFactory(config.decode) // 'auto' (default): jit where eval available, else interpreted
+    const hasEval = isEvalAvailable()
+    this.mapperFactory = buildMapperFactory(config.decode, hasEval) // 'auto' (default): jit where eval available, else interpreted
+    const encMode = config.encode ?? 'auto'
+    if (encMode === 'jit' && !hasEval) throw new Error("minipg: encode:'jit' needs eval (new Function), which this runtime disallows — use encode:'interpreted' or 'auto'")
+    this.jitEncode = encMode === 'interpreted' ? false : encMode === 'jit' ? true : hasEval
     // keep the password out of console.log / JSON / inspection of the connection
     Object.defineProperty(this.cfg, 'password', { value: this.cfg.password, enumerable: false, writable: true, configurable: true })
+  }
+
+  /** Cached JIT Bind+Execute+Sync encoder for a binary plan. Keyed by plan identity (stable per
+   *  statement/paramTypes); recompiled only if the statement name or result-format changes for that plan. */
+  private jitFor(plan: ParamsEncoder, name: string, oids: readonly number[], rf: number | number[]): BindEncoder | null {
+    const rfSig = typeof rf === 'number' ? rf : rf.join(',')
+    const je = this.jitEncodeCache.get(plan)
+    if (je !== undefined && je.name === name && je.rfSig === rfSig) return je.jit
+    const jit = compileBindEncoder(name, oids, rf) // null when the row width exceeds the JIT cap -> caller falls back
+    this.jitEncodeCache.set(plan, { jit, name, rfSig })
+    return jit
   }
 
   private rejectTask(t: Task, err: Error): void {
@@ -760,17 +779,21 @@ export class Connection {
       // cached ParameterDescription OIDs on reuse. On reuse the SERVER-echoed OIDs win: they are the
       // statement's actual types, so a paramTypes drift across calls can never binary-misencode.
       let enc: ParamsEncoder = encodeValueInto
+      let planOids: readonly number[] | undefined // set to the plan's OIDs when `enc` is a binary plan -> JIT-eligible
       if (this.cfg.binaryParams) {
         if (reuse && entry!.paramOids) {
           if (entry!.plan === undefined) entry!.plan = compileParamPlan(entry!.paramOids)
-          if (entry!.plan) enc = entry!.plan
+          if (entry!.plan) { enc = entry!.plan; planOids = entry!.paramOids }
         } else if (t.paramTypes) {
           let plan = this.paramPlanCache.get(t.paramTypes)
           if (plan === undefined) { plan = compileParamPlan(t.paramTypes); this.paramPlanCache.set(t.paramTypes, plan) }
-          if (plan) enc = plan
+          if (plan) { enc = plan; planOids = t.paramTypes }
         }
       }
-      writeBindWith(w, '', name, t.params, enc, t.resultFormat ?? 0); writeExecute(w, '', 0); writeSync(w)
+      const rf = t.resultFormat ?? 0
+      const jitEnc = (this.jitEncode && planOids !== undefined && t.params.length === planOids.length) ? this.jitFor(enc, name, planOids, rf) : null
+      if (jitEnc) jitEnc(w, t.params) // whole Bind+Execute+Sync from the compiled encoder (one row body, looped for VALUES chunks)
+      else { writeBindWith(w, '', name, t.params, enc, rf); writeExecute(w, '', 0); writeSync(w) }
       if (parsedName) this.parseInflight.set(parsedName, parseKey(t))
       } // ---- end extended-protocol serialization ----
       if (t.perf) t.perf.sent = w.mark() - mark // bytes this query contributed to the batch
@@ -968,6 +991,7 @@ export class Connection {
       }
       if (!this.cfg.prepare) name = undefined // pooler-safe: never a server-side named prepared statement
       const mode = opts.mode ?? (opts.shape ? 'object' : 'array') // a shape implies named columns -> object
+      if (opts.params && params.length !== opts.params.length) return reject(new Error(`minipg: ${params.length} param value(s) but ${opts.params.length} type(s) declared in params:[…] — they must match one-to-one`))
       const task: Task = { sql: text, params, name, mode, rows: [], resolve, reject, timeout: opts.timeout, signal: opts.signal, debug: opts.debug, paramTypes: opts.params && resolveParamTypes(opts.params) }
       if (opts.shape) {
         // declared column shape: decode with the SAME cached jit/interpreted mapper as any query, and

@@ -360,25 +360,27 @@ describe('json / jsonb param serialization', () => {
     })
   })
 
-  test('array binds to $1::jsonb as a JSON array [1,2,3], not a PG array literal', async () => {
+  // NOTE: since Option A, an UNTYPED JS array encodes as a PG '{…}' literal, so binding a JS array to jsonb
+  // must DECLARE it (params:['jsonb']) — otherwise '{1,2,3}' is invalid jsonb.
+  test('a jsonb-declared array binds as a JSON array [1,2,3] (params:[jsonb])', async () => {
     await withConn(async (c) => {
-      const r = await c.query('SELECT $1::jsonb AS j', [[1, 2, 3]], { mode: 'object' })
+      const r = await c.query('SELECT $1 AS j', [[1, 2, 3]], { params: ['jsonb'], mode: 'object' })
       expect(objRow(r).j).toEqual([1, 2, 3])
     })
   })
 
-  test('empty array binds and reads back as JS [] (not {})', async () => {
+  test('empty jsonb-declared array reads back as JS [] (params:[jsonb])', async () => {
     await withConn(async (c) => {
-      const r = await c.query('SELECT $1::jsonb AS j', [[]], { mode: 'object' })
+      const r = await c.query('SELECT $1 AS j', [[]], { params: ['jsonb'], mode: 'object' })
       expect(objRow(r).j).toEqual([])
     })
   })
 
-  test('nested arrays/objects and boolean arrays round-trip as proper JSON', async () => {
+  test('nested/object/boolean jsonb-declared arrays round-trip as proper JSON (params:[jsonb])', async () => {
     await withConn(async (c) => {
-      const r1 = await c.query('SELECT $1::jsonb AS j', [[{ x: 1 }, { y: 2 }]], { mode: 'object' })
+      const r1 = await c.query('SELECT $1 AS j', [[{ x: 1 }, { y: 2 }]], { params: ['jsonb'], mode: 'object' })
       expect(objRow(r1).j).toEqual([{ x: 1 }, { y: 2 }])
-      const r2 = await c.query('SELECT $1::jsonb AS j', [[true, false]], { mode: 'object' })
+      const r2 = await c.query('SELECT $1 AS j', [[true, false]], { params: ['jsonb'], mode: 'object' })
       expect(objRow(r2).j).toEqual([true, false])
     })
   })
@@ -518,11 +520,12 @@ describe('double-encoding footgun guard', () => {
 
 // ============================================================================
 describe('jsonb[] (array-of-json column)', () => {
-  test('direct bind of a JS array to a jsonb[] column fails (no PG array codec)', async () => {
+  test('a JS array of objects now binds to a jsonb[] column (Option A + object-element JSON)', async () => {
     await withConn(async (c) => {
       await c.query('CREATE TEMP TABLE ja(id int4 primary key, jba jsonb[])')
-      const err = await caught(() => c.query('INSERT INTO ja VALUES (1, $1)', [[{ x: 1 }]]))
-      expect(err).toBeInstanceOf(PgError)
+      // untyped array -> arrayLiteral, object elements JSON.stringify'd -> {"{\"x\":1}","{\"y\":2}"}; the INSERT target types $1 as jsonb[]
+      await c.query('INSERT INTO ja VALUES (1, $1)', [[{ x: 1 }, { y: 2 }]])
+      expect((await c.query('SELECT cardinality(jba) FROM ja WHERE id = 1')).rows[0]![0]).toBe(2)
     })
   })
 

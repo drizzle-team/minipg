@@ -235,10 +235,10 @@ describe('array params on plain queries', () => {
     })
   }, TEST_TIMEOUT)
 
-  test('jsonb param semantics unchanged (JS array still JSON.stringify, NOT array literal)', async () => {
+  test('a JS array into jsonb: DECLARE jsonb (untyped array is now a PG literal, Option A)', async () => {
     await withConn(async (c) => {
-      const r = await c.query('select ($1::jsonb)::text as v', [[1, { a: 2 }]])
-      expect((r.rows[0] as unknown[])[0]).toBe('[1, {"a": 2}]')
+      const r = await c.query('select ($1)::text as v', [[1, { a: 2 }]], { params: ['jsonb'] })
+      expect((r.rows[0] as unknown[])[0]).toBe('[1, {"a": 2}]') // declared jsonb -> JSON.stringify, not a '{…}' literal
     })
   }, TEST_TIMEOUT)
 })

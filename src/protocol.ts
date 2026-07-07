@@ -80,6 +80,11 @@ export class Writer {
   int32(n: number): void { this.ensure(4); this.buf.writeInt32BE(n, this.off); this.off += 4 }
   cstr(s: string): void { const len = Buffer.byteLength(s, 'utf8'); this.ensure(len + 1); this.buf.write(s, this.off, 'utf8'); this.off += len; this.buf[this.off++] = 0 }
   bytes(b: Buffer): void { this.ensure(b.length); b.copy(this.buf, this.off); this.off += b.length }
+  /** utf8 bytes, NO length prefix — for USER text that may be non-ASCII (array string elements, JSON, COPY strings). */
+  str(s: string): void { this.ensure(s.length * 3); this.off += this.buf.write(s, this.off, 'utf8') } // utf8 worst case 3 bytes/UTF-16 unit
+  /** latin1 bytes (1/char), NO length prefix — KNOWN-ASCII only (digits, keywords, ISO dates, hex, escapes):
+   *  skips utf8's multi-byte encoding path. WRONG for non-ASCII text — use str() there. */
+  asc(s: string): void { this.ensure(s.length); this.off += this.buf.write(s, this.off, 'latin1') }
   patch16(pos: number, n: number): void { this.buf.writeUInt16BE(n, pos) } // back-patch a reserved int16 slot (offsets survive growth: contents are copied)
   patch32(pos: number, n: number): void { this.buf.writeInt32BE(n, pos) } // back-patch a reserved int32 slot (e.g. a binary array param's total length)
 
@@ -95,6 +100,8 @@ export class Writer {
     this.buf.writeInt32BE(n, this.off)
     this.off += 4 + n
   }
+  /** int32 length + latin1 bytes — KNOWN-ASCII text values (number/bigint String() output); skips utf8 encoding. */
+  lpAsc(s: string): void { this.ensure(4 + s.length); const n = this.buf.write(s, this.off + 4, 'latin1'); this.buf.writeInt32BE(n, this.off); this.off += 4 + n }
   /** A SAFE integer as text-format ASCII digits — matches String(v) byte-for-byte, zero string alloc. */
   lpAsciiInt(v: number): void {
     this.ensure(25)
