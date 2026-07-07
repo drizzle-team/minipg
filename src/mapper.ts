@@ -14,24 +14,58 @@ export type RowMapperFactory = (cols: CodegenCol[], mode: 'array' | 'object', ma
 /** Can this runtime compile functions from strings? (false under strict CSP / Cloudflare Workers.) */
 export function isEvalAvailable(): boolean { try { new Function('return 1')(); return true } catch { return false } }
 
+const setKey = (obj: Record<string, unknown>, k: string, v: unknown) => { // __proto__ as an own property (no prototype pollution)
+  if (k === '__proto__') Object.defineProperty(obj, k, { value: v, writable: true, enumerable: true, configurable: true })
+  else obj[k] = v
+}
+// Collect/Transform assembly tree (built once per mapper; the interpreted mirror of decode2.buildObjectLiteral).
+type ONode = { leaves: Array<{ key: string; i: number; xform?: (v: unknown) => unknown; required: boolean }>; groups: Array<{ key: string; node: ONode }> }
+function buildObjTree(cols: CodegenCol[]): ONode {
+  const root: ONode = { leaves: [], groups: [] }
+  cols.forEach((c, i) => {
+    let node = root
+    for (const seg of c.path ?? []) { let g = node.groups.find((x) => x.key === seg); if (!g) { g = { key: seg, node: { leaves: [], groups: [] } }; node.groups.push(g) } node = g.node }
+    node.leaves.push({ key: c.name, i, xform: c.xform, required: !c.nullable })
+  })
+  return root
+}
+function assembleObj(node: ONode, vals: unknown[]): Record<string, unknown> {
+  const obj: Record<string, unknown> = {}
+  for (const l of node.leaves) setKey(obj, l.key, l.xform ? l.xform(vals[l.i]) : vals[l.i]) // xform runs on null too
+  for (const g of node.groups) setKey(obj, g.key, assembleGroup(g.node, vals))
+  return obj
+}
+function assembleGroup(node: ONode, vals: unknown[]): Record<string, unknown> | null {
+  for (const l of node.leaves) if (l.required && vals[l.i] === null) return null // auto-null: a required (non-Nullable) leaf is NULL
+  return assembleObj(node, vals)
+}
+
 // ---- interpreted: resolve a CellDecoder per column once, decode each row in a loop ----
 function interpretedMapper(cols: CodegenCol[], mode: 'array' | 'object', map: Map<number, Decoder>): RowMapper {
   const d = cols.map((c) => pickDecoder(c, map))
   const n = d.length
   if (mode === 'object') {
-    const names = cols.map((c) => c.name)
-    return (b) => {
-      let o = 2 // skip the Int16 column count
-      const row: Record<string, unknown> = {}
-      for (let i = 0; i < n; i++) {
-        const l = (b[o]! << 24) | (b[o + 1]! << 16) | (b[o + 2]! << 8) | b[o + 3]!; o += 4
-        let v: unknown = null
-        if (l !== -1) { v = d[i]!(b, o, l); o += l }
-        const name = names[i]!
-        if (name === '__proto__') Object.defineProperty(row, name, { value: v, writable: true, enumerable: true, configurable: true })
-        else row[name] = v
+    if (!cols.some((c) => c.path || c.xform)) { // fast flat path — no Collect / Transform
+      const names = cols.map((c) => c.name)
+      return (b) => {
+        let o = 2 // skip the Int16 column count
+        const row: Record<string, unknown> = {}
+        for (let i = 0; i < n; i++) {
+          const l = (b[o]! << 24) | (b[o + 1]! << 16) | (b[o + 2]! << 8) | b[o + 3]!; o += 4
+          let v: unknown = null
+          if (l !== -1) { v = d[i]!(b, o, l); o += l }
+          setKey(row, names[i]!, v)
+        }
+        return row
       }
-      return row
+    }
+    // Collect/Transform: decode into a flat vals[], then assemble the nested object (auto-null groups, xform per leaf)
+    const tree = buildObjTree(cols)
+    return (b) => {
+      let o = 2
+      const vals = new Array<unknown>(n)
+      for (let i = 0; i < n; i++) { const l = (b[o]! << 24) | (b[o + 1]! << 16) | (b[o + 2]! << 8) | b[o + 3]!; o += 4; if (l === -1) vals[i] = null; else { vals[i] = d[i]!(b, o, l); o += l } }
+      return assembleObj(tree, vals)
     }
   }
   return (b) => {

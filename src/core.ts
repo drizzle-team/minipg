@@ -25,8 +25,8 @@ export { defaultDecoders } from './codec.ts'
 export { Shape } from './shape.ts'
 export type { ShapeMapper } from './shape.ts'
 export type { ShapeSpec, TypeSpec, PgType } from './spec.ts'
-export { Json, JsonArray, Jsonb, JsonbArray } from './json.ts'
-export type { JsonSpec, JsonMarker, JsTarget } from './json.ts'
+export { Json, JsonArray, Jsonb, JsonbArray, Collect, Transform, Nullable } from './json.ts'
+export type { JsonSpec, JsonMarker, JsTarget, CollectMarker, TransformMarker, NullableMarker } from './json.ts'
 export type {
   ConnectConfig, PoolConfig, QueryOptions, StreamOptions, TxOptions,
   QueryResult, ResultMode, Decoder, Field,

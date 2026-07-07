@@ -608,7 +608,7 @@ export class Connection {
     cols = this.resolveCols(cols)
     // NB: encode the whole json marker (its declared shape), not just "has json" — two shapes that differ
     // only inside a Json()/JsonArray() must get different mappers, else the first one is wrongly reused.
-    const key = mode + '|' + cols.map((c) => `${c.name}:${c.oid}:${c.format ?? 't'}:${c.js ?? ''}:${c.json ? JSON.stringify(c.json) : ''}:${c.array ? 'a' + c.array.elem + (c.array.js ?? '') : ''}`).join(',')
+    const key = mode + '|' + cols.map((c) => `${c.name}:${c.oid}:${c.format ?? 't'}:${c.js ?? ''}:${c.json ? JSON.stringify(c.json) : ''}:${c.array ? 'a' + c.array.elem + (c.array.js ?? '') : ''}:${c.path ? c.path.join('.') : ''}:${c.nullable ? 'n' : ''}:${c.xformId ?? ''}`).join(',')
     let m = this.mapperCache.get(key)
     if (!m) { m = this.mapperFactory(cols, mode, this.cfg.decoders); this.mapperCache.set(key, m) }
     return m

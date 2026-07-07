@@ -15,7 +15,13 @@ import { genJsonParsers, type JsonMarker, type JsonPlan, type JsTarget } from '.
 export type Target = JsTarget | 'date' | 'ms'
 /** A column to decode: name + wire OID, optional JS-target override, shaped-JSON marker, and the WIRE
  *  format the value arrives in ('text' default, or 'binary' when the query requested binary for it). */
-export interface CodegenCol { name: string; oid: number; js?: Target; json?: JsonMarker; format?: 'text' | 'binary'; array?: { elem: number; js?: Target } }
+export interface CodegenCol {
+  name: string; oid: number; js?: Target; json?: JsonMarker; format?: 'text' | 'binary'; array?: { elem: number; js?: Target }
+  path?: readonly string[]        // Collect() nesting path (ancestor group keys); absent/[] = top level
+  xform?: (v: unknown) => unknown  // Transform() decode-time fn (captured closure; runs on null too)
+  xformId?: number                 // TransformMarker.id — for the mapper cache key only
+  nullable?: boolean               // Nullable() inside a Collect: excluded from the group's required-presence check
+}
 
 type AtDecoder = (b: Buffer, o: number, l: number) => unknown
 const byteaAt: AtDecoder = (b, o, l) => { const s = b.toString('utf8', o, o + l); return s.startsWith('\\x') ? Buffer.from(s.slice(2), 'hex') : Buffer.from(s, 'utf8') }
@@ -256,29 +262,67 @@ function columnLines(out: string[], col: CodegenCol, i: number, ind: string, hel
   else { const hi = helperCols.length; helperCols.push(col); out.push(`${ind}if (l !== -1) { ${v} = d[${hi}](b, o, l); o += l }`) }
 }
 
-const objKey = (name: string, i: number) => (name === '__proto__' ? `["__proto__"]: v${i}` : `${JSON.stringify(name)}: v${i}`)
+const litKey = (k: string) => (k === '__proto__' ? '["__proto__"]' : JSON.stringify(k)) // __proto__ as a computed key (no prototype pollution)
+
+/** Value expr for column i: `X[k](v_i)` when it has a Transform (runs on null too), else the raw temp `v_i`. */
+function colVal(col: CodegenCol, i: number, xforms: Array<(v: unknown) => unknown>): string {
+  if (!col.xform) return `v${i}`
+  const k = xforms.length; xforms.push(col.xform); return `X[${k}](v${i})`
+}
+
+/** Build a (possibly nested) object literal from ordered cols with `path` nesting (Collect groups). A group
+ *  auto-nulls when any REQUIRED (non-nullable) leaf's RAW temp is null (LEFT-JOIN miss). The root never nulls. */
+function buildObjectLiteral(cols: CodegenCol[], xforms: Array<(v: unknown) => unknown>): string {
+  type Node = { leaves: Array<{ key: string; i: number; col: CodegenCol }>; groups: Array<{ key: string; node: Node }> }
+  const root: Node = { leaves: [], groups: [] }
+  cols.forEach((c, i) => {
+    let node = root
+    for (const seg of c.path ?? []) { let g = node.groups.find((x) => x.key === seg); if (!g) { g = { key: seg, node: { leaves: [], groups: [] } }; node.groups.push(g) } node = g.node }
+    node.leaves.push({ key: c.name, i, col: c })
+  })
+  function body(node: Node): string {
+    const parts = node.leaves.map((l) => `${litKey(l.key)}: ${colVal(l.col, l.i, xforms)}`)
+    for (const g of node.groups) parts.push(`${litKey(g.key)}: ${group(g.node)}`)
+    return `{ ${parts.join(', ')} }`
+  }
+  function group(node: Node): string { // a nested Collect group: guard on its required leaves' raw null
+    const req = node.leaves.filter((l) => !l.col.nullable)
+    const b = body(node)
+    return req.length ? `(${req.map((l) => `v${l.i} === null`).join(' || ')}) ? null : ${b}` : b
+  }
+  return body(root)
+}
+const buildArrayLiteral = (cols: CodegenCol[], xforms: Array<(v: unknown) => unknown>): string =>
+  '[' + cols.map((c, i) => colVal(c, i, xforms)).join(', ') + ']'
+
+/** The row's return literal for the mode. Collect nesting requires object mode. */
+function rowLiteral(cols: CodegenCol[], mode: 'array' | 'object', xforms: Array<(v: unknown) => unknown>): string {
+  if (mode === 'array') {
+    if (cols.some((c) => c.path)) throw new Error('minipg: Collect() produces a nested object — use object mode (mode:"array" cannot nest)')
+    return buildArrayLiteral(cols, xforms)
+  }
+  return buildObjectLiteral(cols, xforms)
+}
 
 export type RowBuilder = ((body: Buffer) => unknown) & { source: string }
 
-export function rowBuilderSource(cols: CodegenCol[], mode: 'array' | 'object', custom: Set<number> = NO_CUSTOM): { source: string; helperCols: CodegenCol[] } {
+export function rowBuilderSource(cols: CodegenCol[], mode: 'array' | 'object', custom: Set<number> = NO_CUSTOM): { source: string; helperCols: CodegenCol[]; xforms: Array<(v: unknown) => unknown> } {
   const helperCols: CodegenCol[] = []
+  const xforms: Array<(v: unknown) => unknown> = []
   const { header, plan } = jsonPrep(cols)
   const lines = ['  let o = 2, l;']
   for (let i = 0; i < cols.length; i++) columnLines(lines, cols[i]!, i, '  ', helperCols, plan, custom)
-  const ret = mode === 'object'
-    ? '  return { ' + cols.map((c, i) => objKey(c.name, i)).join(', ') + ' };'
-    : '  return [' + cols.map((_, i) => `v${i}`).join(', ') + '];'
-  return { source: `function row(b) {\n  "use strict";${header}\n${lines.join('\n')}\n${ret}\n}`, helperCols }
+  const ret = '  return ' + rowLiteral(cols, mode, xforms) + ';'
+  return { source: `function row(b) {\n  "use strict";${header}\n${lines.join('\n')}\n${ret}\n}`, helperCols, xforms }
 }
 
-export function resultSetSource(cols: CodegenCol[], mode: 'array' | 'object', custom: Set<number> = NO_CUSTOM): { source: string; helperCols: CodegenCol[] } {
+export function resultSetSource(cols: CodegenCol[], mode: 'array' | 'object', custom: Set<number> = NO_CUSTOM): { source: string; helperCols: CodegenCol[]; xforms: Array<(v: unknown) => unknown> } {
   const helperCols: CodegenCol[] = []
+  const xforms: Array<(v: unknown) => unknown> = []
   const { header, plan } = jsonPrep(cols)
   const decode: string[] = []
   for (let i = 0; i < cols.length; i++) columnLines(decode, cols[i]!, i, '    ', helperCols, plan, custom)
-  const assign = mode === 'object'
-    ? '    res[i] = { ' + cols.map((c, i) => objKey(c.name, i)).join(', ') + ' };'
-    : '    res[i] = [' + cols.map((_, i) => `v${i}`).join(', ') + '];'
+  const assign = '    res[i] = ' + rowLiteral(cols, mode, xforms) + ';'
   const source = [
     'function rows(arr) {',
     '  "use strict";',
@@ -292,15 +336,15 @@ export function resultSetSource(cols: CodegenCol[], mode: 'array' | 'object', cu
     '  return res;',
     '}',
   ].filter((x) => x !== '').join('\n')
-  return { source, helperCols }
+  return { source, helperCols, xforms }
 }
 
 /** Compile a cached, monomorphic single-row builder (v2). */
 export function compileRow(cols: CodegenCol[], mode: 'array' | 'object', map: Map<number, Decoder>): RowBuilder {
-  const { source, helperCols } = rowBuilderSource(cols, mode, customOidsOf(map))
+  const { source, helperCols, xforms } = rowBuilderSource(cols, mode, customOidsOf(map))
   const helpers = helperCols.map((col) => helperForCol(col, map))
   if (DEBUG) console.error(`\n[minipg decode2] ${mode} builder for (${cols.map((c) => c.name).join(', ')}):\n${source}\n`)
-  const fn = new Function('d', 'P', `return (${source})`)(helpers, POW10) as RowBuilder
+  const fn = new Function('d', 'P', 'X', `return (${source})`)(helpers, POW10, xforms) as RowBuilder
   Object.defineProperty(fn, 'source', { value: source, enumerable: false })
   return fn
 }
@@ -309,10 +353,10 @@ export type ResultSetMapper = ((rows: Buffer[]) => unknown[]) & { source: string
 
 /** Compile a cached, monomorphic WHOLE-RESULT-SET mapper (v2). */
 export function compileResultSet(cols: CodegenCol[], mode: 'array' | 'object', map: Map<number, Decoder>): ResultSetMapper {
-  const { source, helperCols } = resultSetSource(cols, mode, customOidsOf(map))
+  const { source, helperCols, xforms } = resultSetSource(cols, mode, customOidsOf(map))
   const helpers = helperCols.map((col) => helperForCol(col, map))
   if (DEBUG) console.error(`\n[minipg decode2] ${mode} result-set mapper for (${cols.map((c) => c.name).join(', ')}):\n${source}\n`)
-  const fn = new Function('d', 'P', `return (${source})`)(helpers, POW10) as ResultSetMapper
+  const fn = new Function('d', 'P', 'X', `return (${source})`)(helpers, POW10, xforms) as ResultSetMapper
   Object.defineProperty(fn, 'source', { value: source, enumerable: false })
   return fn
 }

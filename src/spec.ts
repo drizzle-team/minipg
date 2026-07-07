@@ -2,7 +2,7 @@
 // JS-target override, or a Json()/Jsonb() marker) into the driver's column plan (CodegenCol[]). Kept
 // separate from shape.ts so the connection can resolve a `{ shape }` query option WITHOUT pulling in the
 // whole-result-set codegen used by the standalone Shape() helper. No node deps (imports only json/types).
-import { isJsonMarker, splitType, type JsonMarker } from './json.ts'
+import { isJsonMarker, isCollectMarker, isTransformMarker, isNullableMarker, splitType, type JsonMarker, type CollectMarker, type TransformMarker, type NullableMarker } from './json.ts'
 import { BINARY_FAST, type CodegenCol } from './decode2.ts'
 
 // PG type alias -> OID. `satisfies` (not a `: Record<…>` annotation) keeps the literal keys so PgType can
@@ -76,37 +76,57 @@ export type TypeSpec =
   | `${IntType}[]:${'number' | 'bigint'}`
   | `${NumericType}[]:number`
   | `${TextType}[]:latin1`
-/** A row shape: column name -> TypeSpec, or a Json()/Jsonb()/…Array() marker for a shaped json column. */
-export type ShapeSpec = Record<string, TypeSpec | JsonMarker>
+/** A row shape: column name -> TypeSpec, a Json()/Jsonb() marker (one json cell), a Collect() group (several
+ *  result columns -> nested object), a Transform() (per-column decode-time fn), or a Nullable() wrapper. */
+export type ShapeSpec = Record<string, TypeSpec | JsonMarker | CollectMarker | TransformMarker | NullableMarker>
 /** The same value type as ShapeSpec, but over KNOWN keys `K`. The public shape-taking functions use this
  *  generic form (`fn<K extends string>(spec: ShapeOf<K>)`) so editors offer value autocomplete — TypeScript
  *  does NOT surface value completions through a `Record<string, …>` index signature, but does through a
  *  mapped type over inferred keys. Same constraint either way; only the completion UX differs. */
-export type ShapeOf<K extends string> = { [P in K]: TypeSpec | JsonMarker }
+export type ShapeOf<K extends string> = { [P in K]: TypeSpec | JsonMarker | CollectMarker | TransformMarker | NullableMarker }
 
-/** Resolve a ShapeSpec into columns (name + wire OID + optional JS target / JSON marker / wire format). */
+/** Resolve a ShapeSpec into columns (name + wire OID + optional JS target / JSON marker / array / nesting path
+ *  / transform). Collect() flattens into several path-tagged columns; Transform() attaches an xform closure;
+ *  Nullable() marks a Collect field non-required. Emitted in DFS pre-order = the SELECT's wire column order. */
 export function shapeCols(spec: ShapeSpec): CodegenCol[] {
-  return Object.entries(spec).map(([name, t]) => {
-    if (isJsonMarker(t)) return { name, oid: t.type === 'jsonb' ? 3802 : 114, json: t }
-    const { pg, js } = splitType(t)
-    if (pg.endsWith('[]')) { // array column: decode '{…}' text -> JS array (always TEXT format; no binary array decoder)
-      const elemName = pg.slice(0, -2).toLowerCase()
-      const elem = (TYPE_OID as Record<string, number | undefined>)[elemName]
-      if (elem === undefined) throw new Error(`minipg: unknown array element type ${JSON.stringify(elemName)} for column "${name}" in shape (known: ${Object.keys(TYPE_OID).join(', ')})`)
-      const arrayOid = ARRAY_OID[elem]
-      if (arrayOid === undefined) throw new Error(`minipg: no array type known for ${JSON.stringify(pg)}`)
-      return { name, oid: arrayOid, array: { elem, js } } // element :target rides on array.js
+  const out: CodegenCol[] = []
+  const walk = (s: ShapeSpec, path: readonly string[]): void => {
+    for (const [name, t] of Object.entries(s)) {
+      if (isCollectMarker(t)) { walk(t.spec, [...path, name]); continue } // group -> recurse, extend the path (no col of its own)
+      let m: TypeSpec | JsonMarker | TransformMarker | NullableMarker = t
+      let nullable = false
+      if (isNullableMarker(m)) { nullable = true; m = m.inner } // unwrap Nullable(...)
+      let xform: ((v: unknown) => unknown) | undefined, xformId: number | undefined
+      if (isTransformMarker(m)) { xform = m.fn as (v: unknown) => unknown; xformId = m.id; m = m.type } // unwrap Transform(type, fn)
+      const col = resolveLeaf(name, m as TypeSpec | JsonMarker) // m is a plain type or a Json marker now
+      if (path.length) col.path = [...path]
+      if (nullable) col.nullable = true
+      if (xform) { col.xform = xform; col.xformId = xformId }
+      out.push(col)
     }
-    const oid = (TYPE_OID as Record<string, number | undefined>)[pg.toLowerCase()] // pg is user text -> string index
-    if (oid === undefined) throw new Error(`minipg: unknown type ${JSON.stringify(pg)} for column "${name}" in shape (known: ${Object.keys(TYPE_OID).join(', ')})`)
-    // Auto-request BINARY wire format for bench-proven-faster types (see BINARY_FAST). The ONLY unsafe case
-    // is `:string` on a non-int8 type: binary yields the decoded value (number/Date/Buffer), never the PG
-    // text — only int8:string reconstructs the exact decimal string from the int64. (int8:number DOES go
-    // binary — the >2^53 rounding difference is accepted. temporal:'string' via the global config is
-    // downgraded to text in Connection.resolveCols, after this.)
-    const binaryUnsafe = js === 'string' && oid !== 20
-    let binary = BINARY_FAST.has(oid) && !binaryUnsafe
-    if (oid === 700) binary = js === 'precise' // float4: only :precise (exact f32) goes binary; bare/:pretty/:string stay text (canonical)
-    return binary ? { name, oid, js, format: 'binary' } : { name, oid, js }
-  })
+  }
+  walk(spec, [])
+  return out
+}
+
+/** Resolve a single non-nesting leaf (a scalar/array TypeSpec or a Json marker) to a CodegenCol. */
+function resolveLeaf(name: string, t: TypeSpec | JsonMarker): CodegenCol {
+  if (isJsonMarker(t)) return { name, oid: t.type === 'jsonb' ? 3802 : 114, json: t }
+  const { pg, js } = splitType(t)
+  if (pg.endsWith('[]')) { // array column: decode '{…}' text -> JS array (always TEXT format; no binary array decoder)
+    const elemName = pg.slice(0, -2).toLowerCase()
+    const elem = (TYPE_OID as Record<string, number | undefined>)[elemName]
+    if (elem === undefined) throw new Error(`minipg: unknown array element type ${JSON.stringify(elemName)} for column "${name}" in shape (known: ${Object.keys(TYPE_OID).join(', ')})`)
+    const arrayOid = ARRAY_OID[elem]
+    if (arrayOid === undefined) throw new Error(`minipg: no array type known for ${JSON.stringify(pg)}`)
+    return { name, oid: arrayOid, array: { elem, js } } // element :target rides on array.js
+  }
+  const oid = (TYPE_OID as Record<string, number | undefined>)[pg.toLowerCase()] // pg is user text -> string index
+  if (oid === undefined) throw new Error(`minipg: unknown type ${JSON.stringify(pg)} for column "${name}" in shape (known: ${Object.keys(TYPE_OID).join(', ')})`)
+  // Auto-request BINARY wire format for bench-proven-faster types (see BINARY_FAST). :string on a non-int8 type
+  // is unsafe (binary yields the decoded value, never PG text); int8:number/float4:precise handled below.
+  const binaryUnsafe = js === 'string' && oid !== 20
+  let binary = BINARY_FAST.has(oid) && !binaryUnsafe
+  if (oid === 700) binary = js === 'precise' // float4: only :precise (exact f32) goes binary; bare/:pretty/:string stay text
+  return binary ? { name, oid, js, format: 'binary' } : { name, oid, js }
 }

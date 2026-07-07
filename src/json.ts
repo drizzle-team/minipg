@@ -24,7 +24,7 @@
 // we read in that computed order and reassemble into your declared order. The protocol does
 // NOT expose a JSON column's inner types — only the OID (json=114 / jsonb=3802) — which is
 // why `type` is declared here.
-import type { TypeSpec, ShapeOf } from './spec.ts' // type-only (erased): typed value union + generic mapped form
+import type { TypeSpec, ShapeOf, ShapeSpec } from './spec.ts' // type-only (erased): typed value union + generic mapped form
 
 export interface JsonMarker {
   readonly __json: 'object' | 'array'
@@ -46,6 +46,30 @@ export function JsonbArray<K extends string>(spec: ShapeOf<K>): JsonMarker { ret
 export function isJsonMarker(x: unknown): x is JsonMarker {
   return typeof x === 'object' && x !== null && typeof (x as { __json?: unknown }).__json === 'string'
 }
+
+// ---- Collect / Map / Nullable: TOP-LEVEL row shaping over real RESULT COLUMNS ----------------------------
+// These operate on wire columns (unlike Json() which parses ONE json cell), so they are valid at the top of a
+// Shape and inside a Collect — NOT inside a Json()/Jsonb() spec (JsonSpec stays TypeSpec|JsonMarker).
+
+/** Group several flat result columns (an ORM join) into ONE nested object per row. Multi-column nesting. Fields
+ *  are REQUIRED by default; wrap one in Nullable() to allow a legit NULL. The whole group decodes to `null` when
+ *  any required field is NULL (a required column is NOT-NULL in the DB, so it's only NULL on a LEFT-JOIN miss). */
+export interface CollectMarker { readonly __collect: true; readonly spec: ShapeSpec }
+export function Collect<K extends string>(spec: ShapeOf<K>): CollectMarker { return { __collect: true, spec: spec as ShapeSpec } }
+export const isCollectMarker = (x: unknown): x is CollectMarker => typeof x === 'object' && x !== null && (x as { __collect?: unknown }).__collect === true
+
+/** A per-column DECODE-TIME transform: the cell decodes per `type`, then `fn(decoded)` runs during assembly.
+ *  `fn` DOES receive `null` for a NULL cell (so it can do null-dependent logic — e.g. supply a default).
+ *  e.g. id: Transform('bigint:number', BigInt), or bio: Transform('text', s => s ?? ''). */
+export interface TransformMarker { readonly __transform: true; readonly id: number; readonly type: TypeSpec; readonly fn: (v: never) => unknown }
+let __xformId = 0
+export function Transform<T extends TypeSpec, R>(type: T, fn: (v: never) => R): TransformMarker { return { __transform: true, id: __xformId++, type, fn: fn as (v: never) => unknown } }
+export const isTransformMarker = (x: unknown): x is TransformMarker => typeof x === 'object' && x !== null && (x as { __transform?: unknown }).__transform === true
+
+/** Inside a Collect: mark a field as legitimately nullable — excluded from the group's required-presence check. */
+export interface NullableMarker { readonly __nullable: true; readonly inner: TypeSpec | TransformMarker | JsonMarker }
+export function Nullable(inner: TypeSpec | TransformMarker | JsonMarker): NullableMarker { return { __nullable: true, inner } }
+export const isNullableMarker = (x: unknown): x is NullableMarker => typeof x === 'object' && x !== null && (x as { __nullable?: unknown }).__nullable === true
 
 // JS-target overrides:
 //   number  -> JS number         string -> string (default)
