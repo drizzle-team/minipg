@@ -68,6 +68,14 @@ export type TypeSpec =
   | `${NumericType}:number`
   | `${Float4Type}:${'precise' | 'pretty'}`
   | `${TextType}:latin1`
+  // array forms — decode a '{…}' result column to a JS array; the element :target binds AFTER the []
+  // (e.g. 'text[]', 'numeric[]' keeps exact strings, 'int8[]:number', 'timestamptz[]:string').
+  | `${PgType}[]`
+  | `${PgType}[]:string`
+  | `${TemporalType}[]:${'date' | 'ms'}`
+  | `${IntType}[]:${'number' | 'bigint'}`
+  | `${NumericType}[]:number`
+  | `${TextType}[]:latin1`
 /** A row shape: column name -> TypeSpec, or a Json()/Jsonb()/…Array() marker for a shaped json column. */
 export type ShapeSpec = Record<string, TypeSpec | JsonMarker>
 /** The same value type as ShapeSpec, but over KNOWN keys `K`. The public shape-taking functions use this
@@ -81,6 +89,14 @@ export function shapeCols(spec: ShapeSpec): CodegenCol[] {
   return Object.entries(spec).map(([name, t]) => {
     if (isJsonMarker(t)) return { name, oid: t.type === 'jsonb' ? 3802 : 114, json: t }
     const { pg, js } = splitType(t)
+    if (pg.endsWith('[]')) { // array column: decode '{…}' text -> JS array (always TEXT format; no binary array decoder)
+      const elemName = pg.slice(0, -2).toLowerCase()
+      const elem = (TYPE_OID as Record<string, number | undefined>)[elemName]
+      if (elem === undefined) throw new Error(`minipg: unknown array element type ${JSON.stringify(elemName)} for column "${name}" in shape (known: ${Object.keys(TYPE_OID).join(', ')})`)
+      const arrayOid = ARRAY_OID[elem]
+      if (arrayOid === undefined) throw new Error(`minipg: no array type known for ${JSON.stringify(pg)}`)
+      return { name, oid: arrayOid, array: { elem, js } } // element :target rides on array.js
+    }
     const oid = (TYPE_OID as Record<string, number | undefined>)[pg.toLowerCase()] // pg is user text -> string index
     if (oid === undefined) throw new Error(`minipg: unknown type ${JSON.stringify(pg)} for column "${name}" in shape (known: ${Object.keys(TYPE_OID).join(', ')})`)
     // Auto-request BINARY wire format for bench-proven-faster types (see BINARY_FAST). The ONLY unsafe case

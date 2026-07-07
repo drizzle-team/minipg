@@ -573,7 +573,11 @@ export class Connection {
   // binary can't yield the PG text (lossless for µs/BC/infinity that a JS Date can't represent).
   private resolveCols(cols: CodegenCol[]): CodegenCol[] {
     if (this.cfg.temporal !== 'string') return cols
-    return cols.map((c) => (!c.js && !c.json && INSTANT_OIDS.has(c.oid) ? { ...c, js: 'string', format: 'text' } : c))
+    return cols.map((c) => {
+      if (!c.js && !c.json && INSTANT_OIDS.has(c.oid)) return { ...c, js: 'string', format: 'text' }
+      if (c.array && !c.array.js && INSTANT_OIDS.has(c.array.elem)) return { ...c, array: { ...c.array, js: 'string' } } // temporal[] elements follow the global too
+      return c
+    })
   }
 
   // Build + assign the row mapper for a task, capturing the resolved column plan when { debug: true }.
@@ -604,7 +608,7 @@ export class Connection {
     cols = this.resolveCols(cols)
     // NB: encode the whole json marker (its declared shape), not just "has json" — two shapes that differ
     // only inside a Json()/JsonArray() must get different mappers, else the first one is wrongly reused.
-    const key = mode + '|' + cols.map((c) => `${c.name}:${c.oid}:${c.format ?? 't'}:${c.js ?? ''}:${c.json ? JSON.stringify(c.json) : ''}`).join(',')
+    const key = mode + '|' + cols.map((c) => `${c.name}:${c.oid}:${c.format ?? 't'}:${c.js ?? ''}:${c.json ? JSON.stringify(c.json) : ''}:${c.array ? 'a' + c.array.elem + (c.array.js ?? '') : ''}`).join(',')
     let m = this.mapperCache.get(key)
     if (!m) { m = this.mapperFactory(cols, mode, this.cfg.decoders); this.mapperCache.set(key, m) }
     return m

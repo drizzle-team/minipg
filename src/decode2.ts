@@ -8,14 +8,14 @@
 // Types that can carry non-ASCII (text/varchar/bpchar/name/money/xml/json/jsonb, and anything routed
 // to the helper closure) stay UTF-8 so unicode is preserved.
 import type { Decoder } from './types.ts'
-import { decoderFor, defaultDecoders } from './codec.ts'
+import { decoderFor, defaultDecoders, arrayDecoderFor } from './codec.ts'
 import { genJsonParsers, type JsonMarker, type JsonPlan, type JsTarget } from './json.ts'
 
 // decode2 extends the JS-target set with temporal INSTANT targets: 'date' -> JS Date, 'ms' -> ms number.
 export type Target = JsTarget | 'date' | 'ms'
 /** A column to decode: name + wire OID, optional JS-target override, shaped-JSON marker, and the WIRE
  *  format the value arrives in ('text' default, or 'binary' when the query requested binary for it). */
-export interface CodegenCol { name: string; oid: number; js?: Target; json?: JsonMarker; format?: 'text' | 'binary' }
+export interface CodegenCol { name: string; oid: number; js?: Target; json?: JsonMarker; format?: 'text' | 'binary'; array?: { elem: number; js?: Target } }
 
 type AtDecoder = (b: Buffer, o: number, l: number) => unknown
 const byteaAt: AtDecoder = (b, o, l) => { const s = b.toString('utf8', o, o + l); return s.startsWith('\\x') ? Buffer.from(s.slice(2), 'hex') : Buffer.from(s, 'utf8') }
@@ -204,6 +204,13 @@ function helperFor(oid: number, map: Map<number, Decoder>): AtDecoder {
   const dec = decoderFor(oid, map)
   return (b, o, l) => dec(b.subarray(o, o + l))
 }
+/** Helper decoder for a column: an array column ('{…}' text) decodes via arrayDecoderFor with its element
+ *  target — UNLESS the user overrode that array OID via config.types (map.has), which wins in both mappers
+ *  (interpreted checks the override first). Every scalar column keeps the OID-keyed helperFor path. */
+function helperForCol(col: CodegenCol, map: Map<number, Decoder>): AtDecoder {
+  if (col.array && !map.has(col.oid)) { const dec = arrayDecoderFor(col.oid, col.array.js); return (b, o, l) => dec(b.subarray(o, o + l)) }
+  return helperFor(col.oid, map)
+}
 
 const NO_CUSTOM = new Set<number>()
 function customOidsOf(map: Map<number, Decoder>): Set<number> {
@@ -222,7 +229,7 @@ function jsonPrep(cols: CodegenCol[]): { header: string; plan: Map<JsonMarker, J
   return { header: '', plan }
 }
 
-function columnLines(out: string[], col: CodegenCol, i: number, ind: string, helperOids: number[], plan: Map<JsonMarker, JsonPlan>, custom: Set<number>): void {
+function columnLines(out: string[], col: CodegenCol, i: number, ind: string, helperCols: CodegenCol[], plan: Map<JsonMarker, JsonPlan>, custom: Set<number>): void {
   const v = `v${i}`
   if (col.format === 'binary') { // BINARY wire: direct fixed-width read (still length-prefixed; -1 = NULL)
     const bin = binarySnippet(col.oid, v, col.js)
@@ -241,34 +248,34 @@ function columnLines(out: string[], col: CodegenCol, i: number, ind: string, hel
       : `${ind}if (l !== -1) { let jb = b, jp = o, je = o + l; ${pl.inline(v)} o += l }`)
     return
   }
-  const inl = custom.has(col.oid) ? null : inlineSnippet(col.oid, v, col.js)
-  const kind = inl ? inl[1] : 'helper'
+  const inl = (col.array || custom.has(col.oid)) ? null : inlineSnippet(col.oid, v, col.js) // array cols always route to the helper
+  const kind = inl ? inl[1] : col.array ? `${col.oid} array[]` : 'helper'
   if (DEBUG) out.push(`${ind}// ${JSON.stringify(col.name)} oid=${col.oid}${col.js ? ' :' + col.js : ''} (${kind})`)
   out.push(`${ind}${readLen} let ${v} = null;`)
   if (inl) out.push(`${ind}if (l !== -1) { ${inl[0]}; o += l }`)
-  else { const hi = helperOids.length; helperOids.push(col.oid); out.push(`${ind}if (l !== -1) { ${v} = d[${hi}](b, o, l); o += l }`) }
+  else { const hi = helperCols.length; helperCols.push(col); out.push(`${ind}if (l !== -1) { ${v} = d[${hi}](b, o, l); o += l }`) }
 }
 
 const objKey = (name: string, i: number) => (name === '__proto__' ? `["__proto__"]: v${i}` : `${JSON.stringify(name)}: v${i}`)
 
 export type RowBuilder = ((body: Buffer) => unknown) & { source: string }
 
-export function rowBuilderSource(cols: CodegenCol[], mode: 'array' | 'object', custom: Set<number> = NO_CUSTOM): { source: string; helperOids: number[] } {
-  const helperOids: number[] = []
+export function rowBuilderSource(cols: CodegenCol[], mode: 'array' | 'object', custom: Set<number> = NO_CUSTOM): { source: string; helperCols: CodegenCol[] } {
+  const helperCols: CodegenCol[] = []
   const { header, plan } = jsonPrep(cols)
   const lines = ['  let o = 2, l;']
-  for (let i = 0; i < cols.length; i++) columnLines(lines, cols[i]!, i, '  ', helperOids, plan, custom)
+  for (let i = 0; i < cols.length; i++) columnLines(lines, cols[i]!, i, '  ', helperCols, plan, custom)
   const ret = mode === 'object'
     ? '  return { ' + cols.map((c, i) => objKey(c.name, i)).join(', ') + ' };'
     : '  return [' + cols.map((_, i) => `v${i}`).join(', ') + '];'
-  return { source: `function row(b) {\n  "use strict";${header}\n${lines.join('\n')}\n${ret}\n}`, helperOids }
+  return { source: `function row(b) {\n  "use strict";${header}\n${lines.join('\n')}\n${ret}\n}`, helperCols }
 }
 
-export function resultSetSource(cols: CodegenCol[], mode: 'array' | 'object', custom: Set<number> = NO_CUSTOM): { source: string; helperOids: number[] } {
-  const helperOids: number[] = []
+export function resultSetSource(cols: CodegenCol[], mode: 'array' | 'object', custom: Set<number> = NO_CUSTOM): { source: string; helperCols: CodegenCol[] } {
+  const helperCols: CodegenCol[] = []
   const { header, plan } = jsonPrep(cols)
   const decode: string[] = []
-  for (let i = 0; i < cols.length; i++) columnLines(decode, cols[i]!, i, '    ', helperOids, plan, custom)
+  for (let i = 0; i < cols.length; i++) columnLines(decode, cols[i]!, i, '    ', helperCols, plan, custom)
   const assign = mode === 'object'
     ? '    res[i] = { ' + cols.map((c, i) => objKey(c.name, i)).join(', ') + ' };'
     : '    res[i] = [' + cols.map((_, i) => `v${i}`).join(', ') + '];'
@@ -285,13 +292,13 @@ export function resultSetSource(cols: CodegenCol[], mode: 'array' | 'object', cu
     '  return res;',
     '}',
   ].filter((x) => x !== '').join('\n')
-  return { source, helperOids }
+  return { source, helperCols }
 }
 
 /** Compile a cached, monomorphic single-row builder (v2). */
 export function compileRow(cols: CodegenCol[], mode: 'array' | 'object', map: Map<number, Decoder>): RowBuilder {
-  const { source, helperOids } = rowBuilderSource(cols, mode, customOidsOf(map))
-  const helpers = helperOids.map((oid) => helperFor(oid, map))
+  const { source, helperCols } = rowBuilderSource(cols, mode, customOidsOf(map))
+  const helpers = helperCols.map((col) => helperForCol(col, map))
   if (DEBUG) console.error(`\n[minipg decode2] ${mode} builder for (${cols.map((c) => c.name).join(', ')}):\n${source}\n`)
   const fn = new Function('d', 'P', `return (${source})`)(helpers, POW10) as RowBuilder
   Object.defineProperty(fn, 'source', { value: source, enumerable: false })
@@ -302,8 +309,8 @@ export type ResultSetMapper = ((rows: Buffer[]) => unknown[]) & { source: string
 
 /** Compile a cached, monomorphic WHOLE-RESULT-SET mapper (v2). */
 export function compileResultSet(cols: CodegenCol[], mode: 'array' | 'object', map: Map<number, Decoder>): ResultSetMapper {
-  const { source, helperOids } = resultSetSource(cols, mode, customOidsOf(map))
-  const helpers = helperOids.map((oid) => helperFor(oid, map))
+  const { source, helperCols } = resultSetSource(cols, mode, customOidsOf(map))
+  const helpers = helperCols.map((col) => helperForCol(col, map))
   if (DEBUG) console.error(`\n[minipg decode2] ${mode} result-set mapper for (${cols.map((c) => c.name).join(', ')}):\n${source}\n`)
   const fn = new Function('d', 'P', `return (${source})`)(helpers, POW10) as ResultSetMapper
   Object.defineProperty(fn, 'source', { value: source, enumerable: false })

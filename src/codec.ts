@@ -373,6 +373,94 @@ export function arrayLiteralInto(w: Writer, arr: readonly unknown[]): void {
   w.patch32(lp, w.mark() - s)
 }
 
+// ---- OUTPUT array decode: parse a PG '{…}' text literal into a JS array (shape-gated) ----------------
+// The inverse of arrayLiteral. Element leaves reproduce the SCALAR text-decode DEFAULTS (int8->BigInt,
+// numeric->exact string, temporal->Date, bytea->Buffer) — NOT decoderFor(elemOid), which is asString for
+// those. Lives here (not decoders.ts) so BOTH mappers reach it without a codec<-decoders import cycle.
+type Leaf = (s: string) => unknown
+const strLeaf: Leaf = (s) => s
+const numLeaf: Leaf = (s) => Number(s)
+const bigIntLeaf: Leaf = (s) => BigInt(s)
+const boolLeaf: Leaf = (s) => s === 't'
+const jsonLeaf: Leaf = (s) => JSON.parse(s)
+const byteaLeaf: Leaf = (s) => (s.charCodeAt(0) === 92 && s.charCodeAt(1) === 120 ? Buffer.from(s.slice(2), 'hex') : Buffer.from(s, 'utf8')) // '\x' hex
+
+/** ms-since-epoch from a PG temporal text element — a STRING port of decoders.tsParse (same field parse,
+ *  bare +00 offset, year<=99 fixup) so array Date values are bit-identical to the scalar timestamp path. */
+function parseInstantMs(s: string): number {
+  if (s === 'infinity' || s === '-infinity') return NaN // PG ±infinity has no JS Date -> Invalid Date (matches the binary scalar)
+  let e = s.length, bc = false
+  if (e >= 3 && s.charCodeAt(e - 1) === 67 && s.charCodeAt(e - 2) === 66 && s.charCodeAt(e - 3) === 32) { bc = true; e -= 3 } // strip a trailing ' BC'
+  let p = 0
+  let Y = 0; for (; p < e; p++) { const c = s.charCodeAt(p); if (c < 48 || c > 57) break; Y = Y * 10 + (c - 48) } p++
+  const Mo = (s.charCodeAt(p) - 48) * 10 + (s.charCodeAt(p + 1) - 48); p += 3
+  const D = (s.charCodeAt(p) - 48) * 10 + (s.charCodeAt(p + 1) - 48); p += 2
+  let H = 0, Mi = 0, S = 0, ms = 0, off = 0
+  if (p < e && s.charCodeAt(p) === 32) {
+    p++
+    H = (s.charCodeAt(p) - 48) * 10 + (s.charCodeAt(p + 1) - 48); p += 3
+    Mi = (s.charCodeAt(p) - 48) * 10 + (s.charCodeAt(p + 1) - 48); p += 3
+    S = (s.charCodeAt(p) - 48) * 10 + (s.charCodeAt(p + 1) - 48); p += 2
+    if (p < e && s.charCodeAt(p) === 46) { p++; let f = 0, k = 0; for (; p < e && k < 3; p++) { const c = s.charCodeAt(p); if (c < 48 || c > 57) break; f = f * 10 + (c - 48); k++ } while (k < 3) { f *= 10; k++ } ms = f; while (p < e) { const c = s.charCodeAt(p); if (c < 48 || c > 57) break; p++ } }
+    if (p < e && (s.charCodeAt(p) === 43 || s.charCodeAt(p) === 45)) { const sg = s.charCodeAt(p) === 45 ? -1 : 1; p++; const th = (s.charCodeAt(p) - 48) * 10 + (s.charCodeAt(p + 1) - 48); p += 2; let tm = 0; if (p < e && s.charCodeAt(p) === 58) { p++; tm = (s.charCodeAt(p) - 48) * 10 + (s.charCodeAt(p + 1) - 48); p += 2 } off = sg * (th * 60 + tm) * 60000 }
+  }
+  const year = bc ? 1 - Y : Y // PG 'N BC' -> proleptic/astronomical year 1-N (44 BC -> -43, 1 BC -> 0)
+  let ems = Date.UTC(year, Mo - 1, D, H, Mi, S, ms)
+  if (year >= 0 && year <= 99) { const d = new Date(ems); d.setUTCFullYear(year); ems = d.getTime() } // Date.UTC remaps 0-99 to 1900+
+  return ems - off
+}
+
+/** Element OID (+ optional element :target) -> leaf decoder, mirroring the scalar pickText/defaultJs defaults. */
+function elemLeafFor(elemOid: number, js?: string): Leaf {
+  switch (elemOid) {
+    case 16: return boolLeaf                                          // bool -> boolean
+    case 17: return byteaLeaf                                         // bytea -> Buffer
+    case 20: return js === 'number' ? numLeaf : js === 'string' ? strLeaf : bigIntLeaf // int8 -> BigInt (default)
+    case 21: case 23: case 26: case 700: case 701: return numLeaf     // int2/int4/oid/float4/float8 -> Number
+    case 1700: case 790: return js === 'number' ? numLeaf : strLeaf   // numeric/money -> exact STRING (default)
+    case 114: case 3802: return jsonLeaf                             // json/jsonb -> JSON.parse
+    case 1082: case 1114: case 1184: return js === 'ms' ? parseInstantMs : js === 'string' ? strLeaf : (s: string) => new Date(parseInstantMs(s)) // date/timestamp(tz) -> Date (default)
+    default: return strLeaf                                           // text/varchar/bpchar/char/name/uuid/time/interval
+  }
+}
+
+/** Parse a PG array text literal ('{…}') into a nested JS array (inverse of arrayLiteral). Honors nesting,
+ *  empty {}, unquoted bare NULL -> null, quoted backslash-escaped elements, and a leading [lb:ub]= prefix. */
+export function parseArrayLiteral(decodeLeaf: Leaf): (text: string) => unknown[] {
+  return (text) => {
+    let i = 0
+    if (text[0] === '[') { const eq = text.indexOf('='); if (eq >= 0) i = eq + 1 } // skip [lb:ub]= dimension prefix
+    function arr(): unknown[] {
+      const out: unknown[] = []
+      i++ // consume '{'
+      while (i < text.length) {
+        const c = text[i]
+        if (c === '}') { i++; break }
+        if (c === ',') { i++; continue }
+        if (c === '{') { out.push(arr()); continue } // nesting
+        if (c === '"') { // quoted, backslash-escaped element
+          i++; let s = ''
+          while (i < text.length) { const ch = text[i]!; if (ch === '\\') { s += text[i + 1]; i += 2; continue } if (ch === '"') { i++; break } s += ch; i++ }
+          out.push(decodeLeaf(s)); continue // a quoted "NULL" is the literal string
+        }
+        let j = i // unquoted -> read to ',' or '}'; a bare NULL is SQL null
+        while (j < text.length && text[j] !== ',' && text[j] !== '}') j++
+        const raw = text.slice(i, j); i = j
+        out.push(raw === 'NULL' ? null : decodeLeaf(raw))
+      }
+      return out
+    }
+    return arr()
+  }
+}
+
+/** Whole-value Decoder for an array column: '{…}' text -> JS array, elements decoded per the element OID. */
+export function arrayDecoderFor(arrayOid: number, js?: string): Decoder {
+  const elem = ELEM_OID[arrayOid]
+  const parse = parseArrayLiteral(elem === undefined ? strLeaf : elemLeafFor(elem, js))
+  return (b) => parse(b.toString('utf8'))
+}
+
 /** Compile the per-statement param plan from cached ParameterDescription OIDs. Returns null when
  *  no param has a binary encoder (pure-text statement — callers keep the plain path). */
 export function compileParamPlan(oids: readonly number[]): ParamsEncoder | null {
