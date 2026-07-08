@@ -36,7 +36,7 @@ line('Scenario 1 · object rows — undefined→DEFAULT, explicit null→NULL')
   const r = await mc.query('truncate bd_param').then(() =>
     mc.bulkInsert('bd_param', cols, rows, { returning: 'id', defaults: true }))
   ok(r.rowCount === 100, `inserted 100 rows (rowCount=${r.rowCount}) — no NOT NULL violation on qty`)
-  ok(r.rows.length === 100, `returning yielded 100 ids in input order (first=${(r.rows[0] as unknown[])[0]})`)
+  ok(r.rows.length === 100, `returning yielded 100 ids in input order (first=${(r.rows[0] as unknown as unknown[])[0]})`)
 
   const q = (sql: string) => mc.query(sql, [], { mode: 'object' }).then((x) => x.rows[0] as Record<string, string>)
   const defaulted = await q(`select count(*)::text n from bd_param where status='pending' and qty=0 and created_at >= date '2021-01-01' and (id-1)%3=0`)
@@ -67,7 +67,7 @@ line('Scenario 3 · row that is DEFAULT for every non-key column')
 {
   await mc.query('truncate bd_param')
   const r = await mc.bulkInsert('bd_param', cols, [{ id: 1, name: 'solo' }], { returning: 'status, qty, tok', defaults: true })
-  const row = r.rows[0] as [string, number, string]
+  const row = r.rows[0] as unknown as [string, number, string]
   ok(row[0] === 'pending' && Number(row[1]) === 0, `single all-default row → status='pending', qty=0 [${row[0]},${row[1]}]`)
 }
 

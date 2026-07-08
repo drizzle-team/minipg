@@ -20,8 +20,8 @@ describe('bulkInsert', () => {
       expect(r.rowCount).toBe(500)
       for (const row of rows.slice(0, 50)) await c.query(`insert into ${K}_a values ($1,$2,$3,$4,$5,$6)`, row as unknown[])
       const chk = await c.query(`select count(*)::int4, count(distinct (id,name,qty,price,ok,at))::int4 from ${K}_a`)
-      expect((chk.rows[0] as unknown[])[0]).toBe(550)
-      expect((chk.rows[0] as unknown[])[1]).toBe(500) // the 50 re-inserted rows matched exactly
+      expect((chk.rows[0] as unknown as unknown[])[0]).toBe(550)
+      expect((chk.rows[0] as unknown as unknown[])[1]).toBe(500) // the 50 re-inserted rows matched exactly
     })
   }, TEST_TIMEOUT)
 
@@ -39,7 +39,7 @@ describe('bulkInsert', () => {
       const empty = await c.bulkInsert(`${K}_b`, COLS, [])
       expect(empty.rowCount).toBe(0)
       const nulls = await c.query(`select name, qty, price, ok, at from ${K}_b where id = 2`)
-      expect((nulls.rows[0] as unknown[]).slice(1)).toEqual([null, null, null, null])
+      expect((nulls.rows[0] as unknown as unknown[]).slice(1)).toEqual([null, null, null, null])
     })
   }, TEST_TIMEOUT)
 
@@ -50,9 +50,9 @@ describe('bulkInsert', () => {
       await c.bulkInsert(`${K}_c`, COLS, [mkRow(1), mkRow(2)])
       await c.bulkInsert(`${K}_c`, COLS, Array.from({ length: 100 }, (_, i) => mkRow(i + 3)))
       const pp = await c.query("select count(*)::int4 from pg_prepared_statements where name like '\\_im%'")
-      expect((pp.rows[0] as unknown[])[0]).toBe(1)
+      expect((pp.rows[0] as unknown as unknown[])[0]).toBe(1)
       const n = await c.query(`select count(*)::int4 from ${K}_c`)
-      expect((n.rows[0] as unknown[])[0]).toBe(103)
+      expect((n.rows[0] as unknown as unknown[])[0]).toBe(103)
     })
   }, TEST_TIMEOUT)
 
@@ -74,7 +74,7 @@ describe('bulkInsert', () => {
       expect((r.rows[0] as unknown as unknown[])[0]).toBe(1n)
       expect((r.rows[24_999] as unknown as unknown[])[0]).toBe(25_000n) // chunk results merged in input order
       const pp = await c.query("select count(*)::int4 from pg_prepared_statements where name like '\\_im%'")
-      expect((pp.rows[0] as unknown[])[0]).toBe(1) // partial last chunk reused the same statement
+      expect((pp.rows[0] as unknown as unknown[])[0]).toBe(1) // partial last chunk reused the same statement
     })
   }, TEST_TIMEOUT)
 
@@ -86,7 +86,7 @@ describe('bulkInsert', () => {
       const e = (await caught(() => c.bulkInsert(`${K}_at`, COLS, rows, { chunk: 100 }))) as PgError
       expect(e.code).toBe('23505')
       const n = await c.query(`select count(*)::int4 from ${K}_at`)
-      expect((n.rows[0] as unknown[])[0]).toBe(0) // chunks 1+2 rolled back too
+      expect((n.rows[0] as unknown as unknown[])[0]).toBe(0) // chunks 1+2 rolled back too
     })
   }, TEST_TIMEOUT)
 
@@ -101,7 +101,7 @@ describe('bulkInsert', () => {
       }))
       expect(String((e as Error).message)).toContain('force rollback')
       const n = await c.query(`select count(*)::int4 from ${K}_ot`)
-      expect((n.rows[0] as unknown[])[0]).toBe(0)
+      expect((n.rows[0] as unknown as unknown[])[0]).toBe(0)
     })
   }, TEST_TIMEOUT)
 
@@ -114,7 +114,7 @@ describe('bulkInsert', () => {
       expect(e.code).toBe('23505')
       expect(e.insertedRows).toBe(200) // chunks 1+2 committed and stay
       const n = await c.query(`select count(*)::int4 from ${K}_wf`)
-      expect((n.rows[0] as unknown[])[0]).toBe(200)
+      expect((n.rows[0] as unknown as unknown[])[0]).toBe(200)
     })
   }, TEST_TIMEOUT)
 
@@ -179,7 +179,7 @@ describe('bulkInsert defaults:true', () => {
       const rows = Array.from({ length: 20 }, (_, i) => ({ id: i + 1 })) // tok undefined -> DEFAULT on every row
       await c.bulkInsert(`${K}_d2`, { id: 'int8', tok: 'int8' }, rows, { defaults: true })
       const d = await c.query(`select count(distinct tok)::int4 from ${K}_d2`)
-      expect((d.rows[0] as unknown[])[0]).toBe(20) // 20 distinct sequence values, not one shared value
+      expect((d.rows[0] as unknown as unknown[])[0]).toBe(20) // 20 distinct sequence values, not one shared value
     })
   }, TEST_TIMEOUT)
 
@@ -189,10 +189,10 @@ describe('bulkInsert defaults:true', () => {
       const rows = Array.from({ length: 300 }, (_, i) => ({ id: i + 1, name: `r${i}` })) // same DEFAULT pattern, exact multiple of chunk
       const r = await c.bulkInsert(`${K}_d3`, DCOLS, rows, { defaults: true, chunk: 100, returning: 'id' })
       expect(r.rowCount).toBe(300)
-      expect((r.rows[0] as unknown[])[0]).toBe(1n)
-      expect((r.rows[299] as unknown[])[0]).toBe(300n) // chunk results merged in input order
+      expect((r.rows[0] as unknown as unknown[])[0]).toBe(1n)
+      expect((r.rows[299] as unknown as unknown[])[0]).toBe(300n) // chunk results merged in input order
       const pp = await c.query("select count(*)::int4 from pg_prepared_statements where name like '\\_iv%'")
-      expect((pp.rows[0] as unknown[])[0]).toBe(1) // 3 identical 100-row chunks share one statement
+      expect((pp.rows[0] as unknown as unknown[])[0]).toBe(1) // 3 identical 100-row chunks share one statement
     })
   }, TEST_TIMEOUT)
 
@@ -204,7 +204,7 @@ describe('bulkInsert defaults:true', () => {
       const r = await pool.bulkInsert(`${K}_d4`, { id: 'int8', name: 'text', status: 'text', n: 'int4' }, rows, { defaults: true })
       expect(r.rowCount).toBe(10)
       const chk = await pool.query(`select count(*)::int4 from ${K}_d4 where status = 'pending' and n = 7`, [], { mode: 'array' })
-      expect((chk.rows[0] as unknown[])[0]).toBe(10)
+      expect((chk.rows[0] as unknown as unknown[])[0]).toBe(10)
     } finally {
       await pool.execute(`drop table if exists ${K}_d4`)
       await pool.end()
@@ -216,7 +216,7 @@ describe('array params on plain queries', () => {
   test('declared array param, first unnamed execution', async () => {
     await withConn(async (c) => {
       const r = await c.query('select ($1)::text as v, array_length($1, 1) as n', [[10, null, 30]], { params: ['int8[]'] })
-      expect((r.rows[0] as unknown[])[0]).toBe('{10,NULL,30}')
+      expect((r.rows[0] as unknown as unknown[])[0]).toBe('{10,NULL,30}')
     })
   }, TEST_TIMEOUT)
 
@@ -231,14 +231,14 @@ describe('array params on plain queries', () => {
   test('mismatched element falls back to literal and the server validates', async () => {
     await withConn(async (c) => {
       const r = await c.query('select ($1)::text as v', [[1, 2.5, 3]], { params: ['float8[]'] })
-      expect((r.rows[0] as unknown[])[0]).toBe('{1,2.5,3}')
+      expect((r.rows[0] as unknown as unknown[])[0]).toBe('{1,2.5,3}')
     })
   }, TEST_TIMEOUT)
 
   test('a JS array into jsonb: DECLARE jsonb (untyped array is now a PG literal, Option A)', async () => {
     await withConn(async (c) => {
       const r = await c.query('select ($1)::text as v', [[1, { a: 2 }]], { params: ['jsonb'] })
-      expect((r.rows[0] as unknown[])[0]).toBe('[1, {"a": 2}]') // declared jsonb -> JSON.stringify, not a '{…}' literal
+      expect((r.rows[0] as unknown as unknown[])[0]).toBe('[1, {"a": 2}]') // declared jsonb -> JSON.stringify, not a '{…}' literal
     })
   }, TEST_TIMEOUT)
 })

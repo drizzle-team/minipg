@@ -72,26 +72,22 @@ export type CopySource = Iterable<string | Uint8Array> | AsyncIterable<string | 
 
 const qIdent = (s: string): string => '"' + s.replace(/"/g, '""') + '"'
 
-// Adaptive default chunk for bulkInsert (shape-sweep-derived). Two constraints bind, whichever
-// is smaller: ~1024 CELLS/statement (chunk x columns — per-element array_recv overhead) and
-// ~32KB/statement (array materialization memcpy), with row bytes estimated from a few sampled
-// rows of THIS batch. Measured vs fixed 256: ties on narrow tables, +5% on 6-col, +32% on
-// 24-col, +115% on fat-text rows (playground/inserts/adaptive-chunk.bench.ts).
-function adaptiveChunk(names: readonly string[], rows: readonly (readonly unknown[] | Readonly<Record<string, unknown>>)[]): number {
-  if (rows.length === 0) return 256
-  const idx = rows.length <= 4 ? [...rows.keys()] : [0, rows.length >> 2, rows.length >> 1, rows.length - 1]
-  let est = 0
-  for (const i of idx) {
-    const row = rows[i]!
-    let b = 24 // per-row fixed overhead (tuple + element headers)
-    for (let c = 0; c < names.length; c++) {
-      const v = Array.isArray(row) ? row[c] : (row as Record<string, unknown>)[names[c]!]
-      b += typeof v === 'string' ? v.length + 4 : v instanceof Uint8Array ? v.byteLength + 4 : 12
-    }
-    est += b
+// Default bulkInsert chunk: 64 rows, pulled DOWN for FAT rows (bytes guard) so ONE unnest statement's array
+// materialization stays ~<=32KB server-side. Re-derived on a REALISTIC WAL-on server across shapes
+// (playground/inserts/shape-sweep.bench.ts): 64 is at/above the best chunk for EVERY shape — narrow/standard/
+// wide are ~flat and fat-text peaks small (64 beats a larger default by +16% by clearing the 128-256 dip).
+// The old 1024-cells cap + multi-row sampling earned nothing on a realistic server (wide was flat, large
+// chunks never won) and were dropped; the earlier +32%/+115% were fsync-off/UNLOGGED artifacts. The bytes
+// guard now only bites for >512B/row (safety against giant statements). Explicit opts.chunk still wins.
+function defaultChunk(names: readonly string[], rows: readonly (readonly unknown[] | Readonly<Record<string, unknown>>)[]): number {
+  if (rows.length === 0) return 64
+  const row = rows[0]! // one sampled row is enough for a size cap; typical batches are size-uniform
+  let b = 24 // per-row byte estimate (tuple + element headers)
+  for (let c = 0; c < names.length; c++) {
+    const v = Array.isArray(row) ? row[c] : (row as Record<string, unknown>)[names[c]!]
+    b += typeof v === 'string' ? v.length + 4 : v instanceof Uint8Array ? v.byteLength + 4 : 12
   }
-  est /= idx.length
-  return Math.max(16, Math.min(Math.ceil(1024 / names.length), Math.max(16, Math.floor(32768 / est)), 2048))
+  return Math.max(16, Math.min(64, Math.floor(32768 / b)))
 }
 
 // build the $n::type[] cast list + array OIDs for a bulk statement (aliases are validated by
@@ -290,6 +286,7 @@ export class Connection {
                                // head (inflight[0]) is the task currently receiving results. length ≤ pipelineDepth
   private outbuf = new Writer() // outbound batch: pipelined tasks serialize here, flushed once per dispatch pass
   private flushScheduled = false // a microtask flush is pending (guards against scheduling more than one)
+  private writeBackedUp = false // socket write buffer is full — pause dispatching new pipelined tasks until 'drain'
   private _maxInflight = 0      // high-water mark of concurrent in-flight queries (diagnostics / tests)
   private _flushes = 0          // count of outbound socket writes for query batches (coalescing diagnostic)
   private spCounter = 0         // monotonic counter for auto-generated SAVEPOINT names (nested begin)
@@ -461,6 +458,7 @@ export class Connection {
       Promise.resolve(factory()).then((sock) => {
         if (!this.connecting) { try { sock.destroy() } catch { /* superseded/aborted while connecting */ } return }
         this.socket = sock
+        this.writeBackedUp = false // fresh socket: clear any stale write-backpressure gate from a prior connection
         this.attachSocket(sock)
         this.afterTransport()
       }, (e) => this.failAttempt(e as Error))
@@ -633,8 +631,14 @@ export class Connection {
   // behaviour. A serialize failure rejects that task and the loop moves on (no re-entrancy needed).
   private processQueue(): void {
     if (this.state !== 'ready') return
-    while (this.queue.length && this.inflight.length < this.cfg.pipelineDepth && this.canStartNext()) {
+    while (this.queue.length && this.inflight.length < this.cfg.pipelineDepth && !this.writeBackedUp && this.canStartNext()) {
       this.startTask(this.queue.shift()!)
+      // Flush mid-burst once the batch is large, so write() backpressure is OBSERVED before we bury the socket's
+      // send buffer under a deep pipeline of big writes. Adaptive: on a fast/large-buffer link write() stays
+      // writable and the loop keeps filling the pipe (deep pipelining hides RTT); on a slow/small-buffer one it
+      // backs up here and the `!writeBackedUp` guard pauses dispatch until 'drain'. No fixed byte/RTT constant —
+      // the socket's own flow-control encodes the transport + bandwidth-delay product.
+      if (this.outbuf.mark() >= FLUSH_THRESHOLD) this.flushWrites()
     }
     // Coalesce writes: in 'microtask' mode, defer the flush so queries issued across SEPARATE query() calls
     // in the same tick (e.g. Promise.all) leave in ONE socket write. Flush synchronously when pipelining is
@@ -720,7 +724,17 @@ export class Connection {
     const bytes = Buffer.from(this.outbuf.slice())
     this.outbuf.reset()
     this._flushes++
-    this.socket?.write(bytes)
+    const s = this.socket
+    if (s && !s.write(bytes) && !this.writeBackedUp) {
+      // Write buffer full: its size reflects the transport + bandwidth-delay product, so this is where we learn
+      // the pipe is as deep as the link can absorb. Pause dispatching new tasks until 'drain'; the count cap
+      // (pipelineDepth) still bounds pending-response memory as a ceiling. Mirrors writeRaw's drain handling.
+      this.writeBackedUp = true
+      const resume = (): void => { off(); if (this.writeBackedUp) { this.writeBackedUp = false; this.processQueue() } }
+      const stop = (): void => { off(); this.writeBackedUp = false } // socket died: socketDown() tears down; just clear the gate
+      const off = (): void => { s.off('drain', resume); s.off('close', stop); s.off('error', stop) }
+      s.once('drain', resume); s.once('close', stop); s.once('error', stop)
+    }
   }
 
   private startTask(t: Task): void {
@@ -1182,7 +1196,7 @@ export class Connection {
       return this.query(c.sql, c.params, { name: c.name, params: c.oids, timeout: opts.timeout, signal: opts.signal, metrics }) as Promise<QueryResult<never>>
     }
     const chunkMetrics = onProgress ? ('us' as const) : undefined
-    const chunk = Math.max(1, opts.chunk ?? adaptiveChunk(names, rows)) // per-batch adaptive default; explicit opts.chunk always wins
+    const chunk = Math.max(1, opts.chunk ?? defaultChunk(names, rows)) // 64, bytes-capped for fat rows; explicit opts.chunk always wins
     if (rows.length <= chunk) {
       const p = run(0, rows.length, opts.metrics ?? chunkMetrics)
       return onProgress ? p.then((r) => { report(rows.length, r, 1); return r }) : p

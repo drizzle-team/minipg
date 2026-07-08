@@ -54,7 +54,7 @@ const COLS = 'id,name,qty,price,flag,created_at'
 const SET = ['name', 'qty', 'price', 'flag', 'created_at'].map((c) => `${c} = excluded.${c}`).join(', ')
 const UPSERT = `insert into upb(${COLS}) select * from unnest($1::int8[],$2::text[],$3::int4[],$4::float8[],$5::bool[],$6::timestamptz[]) on conflict (id) do update set ${SET}`
 const NOTHING = `insert into upb(${COLS}) select * from unnest($1::int8[],$2::text[],$3::int4[],$4::float8[],$5::bool[],$6::timestamptz[]) on conflict (id) do nothing`
-const PT = ['int8[]', 'text[]', 'int4[]', 'float8[]', 'bool[]', 'timestamptz[]']
+const PT = ['int8[]', 'text[]', 'int4[]', 'float8[]', 'bool[]', 'timestamptz[]'] as const
 const pivot = (rows: Record<string, unknown>[]): unknown[] => ['id', 'name', 'qty', 'price', 'flag', 'created_at'].map((k) => rows.map((r) => r[k]))
 const chunked = (sql: string, name: string) => (rows: Record<string, unknown>[]) => mc.begin(async (tx) => {
   const ps: Promise<unknown>[] = []

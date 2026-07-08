@@ -98,7 +98,9 @@
     "bench:pertype": "bun bench/per-type-decode.bench.ts",
     "bench:chunks": "bun bench/chunks.bench.ts",
     "bench:mapper-dispatch": "bun bench/mapper-dispatch.bench.ts",
-    "bench:query-decode": "bun bench/query-decode.bench.ts"
+    "bench:query-decode": "bun bench/query-decode.bench.ts",
+    "db:pull": "drizzle-kit pull",
+    "db:studio": "drizzle-kit studio"
   },
   "devDependencies": {
     "@cloudflare/vitest-pool-workers": "^0.5.2",
@@ -106,6 +108,8 @@
     "@types/bun": "latest",
     "@types/pg": "^8.20.0",
     "cli-highlight": "^2.1.11",
+    "drizzle-kit": "^0.31.10",
+    "drizzle-orm": "^0.45.2",
     "fast-check": "^4.8.0",
     "mitata": "^1.0.34",
     "pg": "^8.22.0",
