@@ -52,6 +52,10 @@ interface PreparedEntry { sql: string; fields: Field[]; paramOids?: number[]; pl
 
 // Identity of a Parse on the wire: same name may NOT be reused for different sql OR different declared
 // param types (the parseInflight burst-dedup compares this key).
+// Fill 'unknown' (oid 0) shape columns with the REAL type OIDs from the result, positionally.
+const mergeUnknownCols = (cols: CodegenCol[], fields: Field[]): CodegenCol[] =>
+  cols.map((c, i) => (c.oid === 0 ? { ...c, oid: fields[i]?.dataTypeOid ?? 0 } : c))
+
 const parseKey = (t: Task): string => (t.paramTypes && t.paramTypes.length ? t.sql + '\u0000' + t.paramTypes.join(',') : t.sql)
 
 /** Per-chunk progress for bulkInsert/bulkUpdate/copyMany. Fired as each chunk is CONFIRMED
@@ -177,6 +181,7 @@ interface Task {
   _retryErrors?: string[] // SQLSTATE codes of the swallowed attempts
   _repreparedSqlChanged?: boolean // the name was cached with DIFFERENT SQL -> old statement deallocated + re-Parsed
   _paramOids?: number[] // ParameterDescription ('t') OIDs from THIS response cycle (cached with the statement on 'T'/'n')
+  _shapeCols?: CodegenCol[] // shape with 'unknown' columns: mapper build DEFERRED until real OIDs arrive ('T' or cached fields)
   paramTypes?: readonly number[] // caller-declared param OIDs: sent in Parse + binary plan from the FIRST execution
   copySource?: CopySource // COPY FROM STDIN payload source — marks the task as a copy (simple 'Q', runs solo)
   _instrDone?: boolean // guard so onQueryEnd/Error fires exactly once across the settle paths
@@ -513,7 +518,7 @@ export class Connection {
       }
       case 'W': { try { this.socket?.write(Buffer.concat([W.copyFail('CopyBoth is not supported by minipg'), W.sync()])) } catch { /* */ } return }
       case 't': if (this.current) this.current._paramOids = parseParameterDescription(body); return
-      case 'T': if (this.current) { this.current.fields = parseRowDescription(body); if (!this.current._typed) { const bin = this.current.binary; try { const cols = this.current.fields.map((f) => (bin ? { name: f.name, oid: f.dataTypeOid, format: 'binary' as const } : { name: f.name, oid: f.dataTypeOid })); this.assignMapper(this.current, cols) } catch (e) { this.current.error = e as Error } /* e.g. { binary: true } on a type with no binary decoder */ } if (this.current._cacheName) this.cacheStatement(this.current) } return
+      case 'T': if (this.current) { this.current.fields = parseRowDescription(body); if (this.current._typed && this.current._shapeCols && !this.current.mapper) { try { this.assignMapper(this.current, mergeUnknownCols(this.current._shapeCols, this.current.fields)) } catch (e) { this.current.error = e as Error } } else if (!this.current._typed) { const bin = this.current.binary; try { const cols = this.current.fields.map((f) => (bin ? { name: f.name, oid: f.dataTypeOid, format: 'binary' as const } : { name: f.name, oid: f.dataTypeOid })); this.assignMapper(this.current, cols) } catch (e) { this.current.error = e as Error } /* e.g. { binary: true } on a type with no binary decoder */ } if (this.current._cacheName) this.cacheStatement(this.current) } return
       case 'n': if (this.current) { this.current.fields = []; if (this.current._cacheName) this.cacheStatement(this.current) } return
       case 'D': return this.dataRow(body)
       case 'C': if (this.current) { const tag = firstCstr(body); this.current.command = tag.split(' ')[0]; const m = tag.match(/(\d+)\s*$/); this.current.rowCount = m ? parseInt(m[1]!, 10) : null } return
@@ -758,6 +763,8 @@ export class Connection {
           reuse = true; entry = cached; t.fields = cached.fields
           if (t._typed) {
             // shape / queryTyped: the caller already chose per-column formats + mapper in query(); keep them.
+            // Exception: a shape with 'unknown' columns deferred its mapper — build it from the cached fields.
+            if (t._shapeCols && !t.mapper) this.assignMapper(t, mergeUnknownCols(t._shapeCols, cached.fields))
           } else if (t.binary) {
             this.assignMapper(t, cached.fields.map((f) => ({ name: f.name, oid: f.dataTypeOid, format: 'binary' as const }))) // { binary: true }: all binary
           } else if (t.mode === 'array' || t.mode === 'object') {
@@ -1015,8 +1022,9 @@ export class Connection {
         // declared column shape: decode with the SAME cached jit/interpreted mapper as any query, and
         // request binary wire format for any column marked format:'binary'. (mode is array|object here.)
         const cols = this.resolveCols(typeof opts.shape === 'function' ? (opts.shape.$cols as CodegenCol[]) : shapeCols(opts.shape))
-        this.assignMapper(task, cols)
-        task.resultFormat = cols.map((c) => (c.format === 'binary' ? 1 : 0)) // shapeCols upgraded boost types
+        if (cols.some((c) => c.oid === 0)) task._shapeCols = cols // 'unknown' cols: defer the mapper until real OIDs arrive
+        else this.assignMapper(task, cols)
+        task.resultFormat = cols.map((c) => (c.format === 'binary' ? 1 : 0)) // shapeCols upgraded boost types ('unknown' is always text)
         task._typed = true
       } else if (opts.binary) {
         // force BINARY for every column; the mapper is built binary from RowDescription OIDs in the 'T'

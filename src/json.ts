@@ -78,14 +78,15 @@ export const isNullableMarker = (x: unknown): x is NullableMarker => typeof x ==
 //   date    -> Date object        epoch  -> epoch milliseconds (number)
 // date/epoch apply to timestamp/date/timestamptz: top-level columns parse the wire value; inside a shaped
 // json column they re-parse the ISO string PG serialized into the JSON (Date.parse / new Date).
-export type JsTarget = 'number' | 'string' | 'latin1' | 'date' | 'ms' | 'bigint' | 'precise' | 'pretty'
+export type JsTarget = 'number' | 'string' | 'latin1' | 'date' | 'ms' | 'bigint' | 'precise' | 'pretty' | 'tuple' | 'xy' | 'array' | 'f32' | 'sparse' | 'hex' | 'wkb' | 'geojson'
 /** Split a "<pgtype>" or "<pgtype>:number|string|latin1|date|ms|bigint|precise|pretty" spec into PG type + JS-target override. */
 export function splitType(s: string): { pg: string; js?: JsTarget } {
   const i = s.indexOf(':')
   if (i === -1) return { pg: s.trim() }
   const js = s.slice(i + 1).trim().toLowerCase()
-  if (js !== 'number' && js !== 'string' && js !== 'latin1' && js !== 'date' && js !== 'ms' && js !== 'bigint' && js !== 'precise' && js !== 'pretty') {
-    throw new Error(`unknown JS target ${JSON.stringify(js)} in ${JSON.stringify(s)} (use ':number', ':string', ':latin1', ':date', ':ms', ':bigint', ':precise' or ':pretty')`)
+  if (js !== 'number' && js !== 'string' && js !== 'latin1' && js !== 'date' && js !== 'ms' && js !== 'bigint' && js !== 'precise' && js !== 'pretty'
+    && js !== 'tuple' && js !== 'xy' && js !== 'array' && js !== 'f32' && js !== 'sparse' && js !== 'hex' && js !== 'wkb' && js !== 'geojson') {
+    throw new Error(`unknown JS target ${JSON.stringify(js)} in ${JSON.stringify(s)} (use ':number', ':string', ':latin1', ':date', ':ms', ':bigint', ':precise', ':pretty', ':tuple', ':xy', ':array', ':f32', ':sparse', ':hex', ':wkb' or ':geojson')`)
   }
   return { pg: s.slice(0, i).trim(), js: js as JsTarget }
 }

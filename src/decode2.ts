@@ -10,6 +10,7 @@
 import type { Decoder } from './types.ts'
 import { decoderFor, defaultDecoders, arrayDecoderFor } from './codec.ts'
 import { genJsonParsers, type JsonMarker, type JsonPlan, type JsTarget } from './json.ts'
+import { extAt } from './geo.ts'
 
 // decode2 extends the JS-target set with temporal INSTANT targets: 'date' -> JS Date, 'ms' -> ms number.
 export type Target = JsTarget | 'date' | 'ms'
@@ -215,6 +216,7 @@ function helperFor(oid: number, map: Map<number, Decoder>): AtDecoder {
  *  (interpreted checks the override first). Every scalar column keeps the OID-keyed helperFor path. */
 function helperForCol(col: CodegenCol, map: Map<number, Decoder>): AtDecoder {
   if (col.array && !map.has(col.oid)) { const dec = arrayDecoderFor(col.oid, col.array.js); return (b, o, l) => dec(b.subarray(o, o + l)) }
+  if (!map.has(col.oid)) { const ext = extAt(col); if (ext) return ext } // point / pgvector / PostGIS shape columns (config.types override wins)
   return helperFor(col.oid, map)
 }
 

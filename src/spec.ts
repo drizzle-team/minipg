@@ -4,6 +4,7 @@
 // whole-result-set codegen used by the standalone Shape() helper. No node deps (imports only json/types).
 import { isJsonMarker, isCollectMarker, isTransformMarker, isNullableMarker, splitType, type JsonMarker, type CollectMarker, type TransformMarker, type NullableMarker } from './json.ts'
 import { BINARY_FAST, type CodegenCol } from './decode2.ts'
+import { EXT_VECTOR, EXT_GEOMETRY, EXT_HALFVEC, EXT_SPARSEVEC, EXT_BOX2D, EXT_BOX3D } from './geo.ts'
 
 // PG type alias -> OID. `satisfies` (not a `: Record<…>` annotation) keeps the literal keys so PgType can
 // derive the alias union straight from this map — the type list and the runtime map can never drift apart.
@@ -13,7 +14,7 @@ const TYPE_OID = {
   numeric: 1700, decimal: 1700, money: 790, bool: 16, boolean: 16,
   text: 25, varchar: 1043, bpchar: 1042, char: 18, name: 19,
   json: 114, jsonb: 3802, bytea: 17, uuid: 2950,
-  date: 1082, time: 1083, timestamp: 1114, timestamptz: 1184, interval: 1186,
+  date: 1082, time: 1083, timestamp: 1114, timestamptz: 1184, interval: 1186, point: 600,
 } satisfies Record<string, number>
 
 /** A known PG type alias (e.g. 'int4', 'bigint', 'timestamptz'). */
@@ -61,6 +62,13 @@ type TextType = 'text' | 'varchar' | 'bpchar' | 'char' | 'name'
  *  known list). e.g. `'bigint'` -> BigInt, `'bigint:number'` -> JS number, `'timestamptz:ms'` -> epoch ms,
  *  `'float4:precise'` -> exact stored f32, `'float4:pretty'` -> PG's canonical shortest decimal. */
 export type TypeSpec =
+  | 'unknown' // resolve from the actual result (RowDescription) at runtime — for columns not known upfront
+  | `point${'' | ':xy' | ':tuple' | ':string'}`                              // built-in point: raw '(x,y)' text (default/:string); {x,y} (:xy), [x,y] (:tuple)
+  | `vector${'' | ':array' | ':f32' | ':string'}`                            // pgvector: raw '[…]' text (default/:string); number[] (:array), Float32Array (:f32)
+  | `${'geometry' | 'geography'}${'' | ':geojson' | ':hex' | ':wkb'}`        // PostGIS: raw EWKB hex text (default/:hex); GeoJSON-shaped object (:geojson), Buffer (:wkb)
+  | `halfvec${'' | ':array' | ':f32' | ':string'}`                           // pgvector halfvec: raw text (default); number[] (:array), Float32Array (:f32)
+  | `sparsevec${'' | ':sparse' | ':array' | ':string'}`                      // pgvector sparsevec: raw '{i:v,…}/dim' text (default); {dim,indices,values} (:sparse), dense number[] (:array)
+  | `${'box2d' | 'box3d'}${'' | ':xy' | ':tuple' | ':string'}`               // PostGIS boxes: raw 'BOX(…)' text (default); {xmin,…} (:xy), flat numbers (:tuple)
   | PgType
   | `${PgType}:string`
   | `${TemporalType}:${'date' | 'ms'}`
@@ -112,6 +120,22 @@ export function shapeCols(spec: ShapeSpec): CodegenCol[] {
 /** Resolve a single non-nesting leaf (a scalar/array TypeSpec or a Json marker) to a CodegenCol. */
 function resolveLeaf(name: string, t: TypeSpec | JsonMarker): CodegenCol {
   if (isJsonMarker(t)) return { name, oid: t.type === 'jsonb' ? 3802 : 114, json: t }
+  // 'unknown': type not known upfront — oid 0 is the DEFER sentinel; the real OID comes from
+  // RowDescription (or the cached fields on prepared reuse) and the column decodes like a
+  // plain query column (default decoder catalog, TEXT wire format).
+  if (t === 'unknown') return { name, oid: 0 }
+  // pgvector / PostGIS: extension types have DYNAMIC OIDs — sentinel OIDs select the decoder
+  // by DECLARED name (see geo.ts); the runtime OID is irrelevant (text format, name-driven).
+  {
+    const { pg, js } = splitType(t as string)
+    const base = pg.toLowerCase()
+    if (base === 'vector') return { name, oid: EXT_VECTOR, js }
+    if (base === 'halfvec') return { name, oid: EXT_HALFVEC, js }
+    if (base === 'sparsevec') return { name, oid: EXT_SPARSEVEC, js }
+    if (base === 'geometry' || base === 'geography') return { name, oid: EXT_GEOMETRY, js }
+    if (base === 'box2d') return { name, oid: EXT_BOX2D, js }
+    if (base === 'box3d') return { name, oid: EXT_BOX3D, js }
+  }
   const { pg, js } = splitType(t)
   if (pg.endsWith('[]')) { // array column: decode '{…}' text -> JS array (always TEXT format; no binary array decoder)
     const elemName = pg.slice(0, -2).toLowerCase()

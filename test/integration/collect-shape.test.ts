@@ -94,6 +94,75 @@ describe('Collect / Transform / Nullable', () => {
     expect(r[0]).toEqual({ id: 1, g: { a: 'x', inner: null } }) // parent has data; empty child group nulls
   })
 
+  test("'unknown' column decodes by its RUNTIME type (like a plain query)", async () => {
+    const sql = `SELECT * FROM (VALUES (1::int8, 42::int4, '2026-07-09T10:00:00Z'::timestamptz, '{"a":1}'::jsonb, 'txt'::text)) t(id, n, ts, j, s)`
+    const r = await rows(sql, { id: 'bigint:number', n: 'unknown', ts: 'unknown', j: 'unknown', s: 'unknown' })
+    const row = r[0] as Record<string, unknown>
+    expect(row.n).toBe(42)                                  // int4 -> number
+    expect((row.ts as Date).getTime()).toBe(Date.parse('2026-07-09T10:00:00Z')) // timestamptz -> Date
+    expect(row.j).toEqual({ a: 1 })                          // jsonb -> object
+    expect(row.s).toBe('txt')                                // text -> string
+  })
+
+  test("'unknown' works on prepared REUSE (mapper built from cached fields)", async () => {
+    const sql = `SELECT * FROM (VALUES (7::int4, 2.5::float8)) t(a, b)`
+    const shape = { a: 'unknown', b: 'unknown' } as const
+    const name = `unk_${process.pid}`
+    const first = await jit.query(sql, [], { shape: shape as never, name })
+    const reused = await jit.query(sql, [], { shape: shape as never, name }) // no 'T' arrives on reuse
+    expect(first.rows[0]).toEqual({ a: 7, b: 2.5 })
+    expect(reused.rows[0]).toEqual({ a: 7, b: 2.5 })
+  })
+
+  test("'unknown' composes with Collect/Nullable/Transform", async () => {
+    const sql = `SELECT * FROM (VALUES (1::int8, 5::int4, NULL::text), (2::int8, NULL::int4, NULL::text)) t(id, x, y)`
+    const r = await rows(sql, {
+      id: 'bigint:number',
+      g: Collect({ x: Nullable(Transform('unknown', (v: number) => v * 2)), y: Nullable('unknown') }),
+    })
+    expect(r[0]).toEqual({ id: 1, g: { x: 10, y: null } }) // runtime int4 -> number, then transform
+    expect(r[1]).toEqual({ id: 2, g: null })                // all-null group -> null
+  })
+
+  test("geometric + extension types: point / vector / geometry targets", async () => {
+    // vector + geometry come through as ::text fixtures — the decoder is chosen by the DECLARED
+    // type (extension OIDs are dynamic), so the bench cluster needs neither pgvector nor PostGIS
+    const sql = `SELECT '(1.5,2.5)'::point p, '(1.5,2.5)'::point pt, '(1.5,2.5)'::point ps,
+                        '[1,2.5,3]'::text v, '[1,2.5,3]'::text vf,
+                        '0101000020E6100000000000000000F03F0000000000000040'::text g,
+                        '0101000020E6100000000000000000F03F0000000000000040'::text gh`
+    const r = await rows(sql, {
+      p: 'point:xy', pt: 'point:tuple', ps: 'point', // bare = raw text (explicit-only parsing)
+      v: 'vector:array', vf: 'vector:f32',
+      g: 'geometry:geojson', gh: 'geometry',
+    })
+    const row = r[0] as Record<string, unknown>
+    expect(row.p).toEqual({ x: 1.5, y: 2.5 })
+    expect(row.pt).toEqual([1.5, 2.5])
+    expect(row.ps).toBe('(1.5,2.5)') // bare 'point' -> raw text
+    expect(row.v).toEqual([1, 2.5, 3])
+    expect(row.vf).toBeInstanceOf(Float32Array)
+    expect(Array.from(row.vf as Float32Array)).toEqual([1, 2.5, 3])
+    expect(row.g).toEqual({ type: 'Point', coordinates: [1, 2], srid: 4326 })
+    expect(row.gh).toBe('0101000020E6100000000000000000F03F0000000000000040') // bare 'geometry' -> raw hex
+  })
+
+  test('pgvector halfvec/sparsevec + PostGIS boxes', async () => {
+    const sql = `SELECT '[1,2.5]'::text hv, '{1:1.5,3:2}/5'::text sv, '{1:1.5,3:2}/5'::text sd,
+                        'BOX(1 2,3 4)'::text b2, 'BOX3D(1 2 3,4 5 6)'::text b3, 'BOX(1 2,3 4)'::text braw`
+    const r = await rows(sql, {
+      hv: 'halfvec:array', sv: 'sparsevec:sparse', sd: 'sparsevec:array',
+      b2: 'box2d:xy', b3: 'box3d:xy', braw: 'box2d',
+    })
+    const row = r[0] as Record<string, unknown>
+    expect(row.hv).toEqual([1, 2.5])
+    expect(row.sv).toEqual({ dim: 5, indices: [1, 3], values: [1.5, 2] })
+    expect(row.sd).toEqual([1.5, 0, 2, 0, 0])
+    expect(row.b2).toEqual({ xmin: 1, ymin: 2, xmax: 3, ymax: 4 })
+    expect(row.b3).toEqual({ xmin: 1, ymin: 2, zmin: 3, xmax: 4, ymax: 5, zmax: 6 })
+    expect(row.braw).toBe('BOX(1 2,3 4)') // bare -> raw text
+  })
+
   test('Collect in array mode is rejected', async () => {
     const err = await caught(() => jit.query(`SELECT 1::int4 v`, [], { shape: { g: Collect({ v: 'int4' }) } as never, mode: 'array' }))
     expect((err as Error).message).toMatch(/Collect|object mode|nest/i)

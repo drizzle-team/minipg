@@ -7,6 +7,7 @@ import type { Decoder } from './types.ts'
 import { decoderFor, defaultDecoders, arrayDecoderFor } from './codec.ts'
 import { ASCII_SAFE, INSTANT_OIDS, INT_OIDS, defaultJs, type CodegenCol, type Target } from './decode2.ts'
 import { specNeedsWalk, buildJsonWalk } from './json.ts'
+import { extAt } from './geo.ts'
 
 /** Decode a cell in place from (buffer, offset, length) — no per-cell subarray. */
 export type CellDecoder = (b: Buffer, o: number, l: number) => unknown
@@ -139,6 +140,7 @@ export function pickDecoder(col: CodegenCol, map: Map<number, Decoder>): CellDec
   }
   // a custom (config.types) override always wins — decode2 routes these to its helper too
   if (map !== defaultDecoders) { const d = map.get(col.oid); if (d && d !== defaultDecoders.get(col.oid)) return wrap(d) }
+  const ext = extAt(col); if (ext) return ext // point / pgvector / PostGIS shape columns (custom override handled above)
   if (col.array) { const dec = arrayDecoderFor(col.oid, col.array.js); return (b, o, l) => dec(b.subarray(o, o + l)) } // '{…}' text -> JS array (same as the JIT helper)
   return pickText(col.oid, col.js) ?? wrap(decoderFor(col.oid, map))
 }
