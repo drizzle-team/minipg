@@ -36,11 +36,11 @@ describe('Collect / Transform / Nullable', () => {
     expect(r[1]).toEqual({ user: { id: 2, name: 'bob' }, sub: null }) // sub.id required + NULL -> whole group null
   })
 
-  test('Transform runs, including on NULL (null-dependent logic)', async () => {
+  test('Transform is SKIPPED for NULL cells — null passes through (changed 2026-07-09)', async () => {
     const sql = `SELECT * FROM (VALUES (5::int8,'hi'::text),(9::int8,NULL::text)) t(id,note)`
-    const r = await rows(sql, { id: Transform('bigint:number', (n: number) => n * 100), note: Transform('text', (s: string | null) => s ?? 'NONE') })
-    expect(r[0]).toEqual({ id: 500, note: 'hi' })
-    expect(r[1]).toEqual({ id: 900, note: 'NONE' }) // transform saw null
+    const r = await rows(sql, { id: Transform('bigint:number', (n: number) => n * 100), note: Transform('text', (s: string) => s.toUpperCase()) })
+    expect(r[0]).toEqual({ id: 500, note: 'HI' })
+    expect(r[1]).toEqual({ id: 900, note: null }) // fn never called; no null-check needed inside fn
   })
 
   test('Nullable field does not trigger the group auto-null', async () => {
@@ -49,16 +49,17 @@ describe('Collect / Transform / Nullable', () => {
     expect(r[0]).toEqual({ u: { id: 1n, bio: null } }) // bio Nullable -> group present, bio null
   })
 
-  test('all-Nullable group is always an object (no presence sentinel)', async () => {
+  test('all-Nullable group with EVERY field null -> group is null (changed 2026-07-09)', async () => {
     const sql = `SELECT * FROM (VALUES (NULL::int8,NULL::text)) t(a,b)`
     const r = await rows(sql, { g: Collect({ a: Nullable('bigint'), b: Nullable('text') }) })
-    expect(r[0]).toEqual({ g: { a: null, b: null } })
+    expect(r[0]).toEqual({ g: null }) // was { a: null, b: null }; all-null now means LEFT-JOIN miss
   })
 
-  test('Nullable(Transform(...)) composes', async () => {
-    const sql = `SELECT * FROM (VALUES (1::int8,NULL::text)) t(id,tag)`
-    const r = await rows(sql, { u: Collect({ id: 'bigint:number', tag: Nullable(Transform('text', (s: string | null) => (s ? s.toUpperCase() : 'x'))) }) })
-    expect(r[0]).toEqual({ u: { id: 1, tag: 'x' } })
+  test('Nullable(Transform(...)) composes; null skips the fn', async () => {
+    const sql = `SELECT * FROM (VALUES (1::int8,NULL::text),(2::int8,'go'::text)) t(id,tag)`
+    const r = await rows(sql, { u: Collect({ id: 'bigint:number', tag: Nullable(Transform('text', (s: string) => s.toUpperCase())) }) })
+    expect(r[0]).toEqual({ u: { id: 1, tag: null } }) // fn not called on null
+    expect(r[1]).toEqual({ u: { id: 2, tag: 'GO' } })
   })
 
   test('deep nesting (Collect in Collect) with inner auto-null', async () => {
@@ -78,6 +79,19 @@ describe('Collect / Transform / Nullable', () => {
     const sql = `SELECT * FROM (VALUES (1::int8,'{"theme":"dark","n":3}'::json)) t(id,prefs)`
     const r = await rows(sql, { u: Collect({ id: 'bigint:number', prefs: Json({ theme: 'text', n: 'int4' }) }) })
     expect(r[0]).toEqual({ u: { id: 1, prefs: { theme: 'dark', n: 3 } } })
+  })
+
+  test('all-Nullable Collect group: ALL fields null -> group is null (LEFT-JOIN miss)', async () => {
+    const sql = `SELECT * FROM (VALUES (1::int8, NULL::text, NULL::int4), (2::int8, 'bob', NULL::int4)) t(id, name, age)`
+    const r = await rows(sql, { id: 'bigint:number', u: Collect({ name: Nullable('text'), age: Nullable('int4') }) })
+    expect(r[0]).toEqual({ id: 1, u: null })                      // every field null -> whole group null
+    expect(r[1]).toEqual({ id: 2, u: { name: 'bob', age: null } }) // partial null -> object survives
+  })
+
+  test('all-Nullable NESTED group nulls independently of its parent', async () => {
+    const sql = `SELECT * FROM (VALUES (1::int8, 'x', NULL::text, NULL::text)) t(id, a, b, c)`
+    const r = await rows(sql, { id: 'bigint:number', g: Collect({ a: Nullable('text'), inner: Collect({ b: Nullable('text'), c: Nullable('text') }) }) })
+    expect(r[0]).toEqual({ id: 1, g: { a: 'x', inner: null } }) // parent has data; empty child group nulls
   })
 
   test('Collect in array mode is rejected', async () => {

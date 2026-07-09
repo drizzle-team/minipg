@@ -31,12 +31,19 @@ function buildObjTree(cols: CodegenCol[]): ONode {
 }
 function assembleObj(node: ONode, vals: unknown[]): Record<string, unknown> {
   const obj: Record<string, unknown> = {}
-  for (const l of node.leaves) setKey(obj, l.key, l.xform ? l.xform(vals[l.i]) : vals[l.i]) // xform runs on null too
+  for (const l of node.leaves) setKey(obj, l.key, l.xform && vals[l.i] !== null ? l.xform(vals[l.i]) : vals[l.i]) // xform SKIPPED for null (null stays null)
   for (const g of node.groups) setKey(obj, g.key, assembleGroup(g.node, vals))
   return obj
 }
+function groupAllNull(node: ONode, vals: unknown[]): boolean {
+  for (const l of node.leaves) if (vals[l.i] !== null) return false
+  for (const g of node.groups) if (!groupAllNull(g.node, vals)) return false
+  return true
+}
 function assembleGroup(node: ONode, vals: unknown[]): Record<string, unknown> | null {
-  for (const l of node.leaves) if (l.required && vals[l.i] === null) return null // auto-null: a required (non-Nullable) leaf is NULL
+  let anyRequired = false
+  for (const l of node.leaves) { if (l.required) { anyRequired = true; if (vals[l.i] === null) return null } } // auto-null: a required (non-Nullable) leaf is NULL
+  if (!anyRequired && groupAllNull(node, vals)) return null // all-Nullable group, every field null (LEFT-JOIN miss)
   return assembleObj(node, vals)
 }
 

@@ -28,6 +28,7 @@ const db = await connect({ ...cfg, ...pipeOpt })
 const gc = () => (globalThis as { Bun?: { gc(force: boolean): void } }).Bun?.gc(true)
 
 const LOGGED = process.env.LOGGED === '1' // LOGGED=1 -> WAL-logged table (realistic durability); default UNLOGGED (fast)
+const MODE = process.env.MODE ?? 'insert' // 'insert' = bulkInsert(unnest) | 'copy' = copyMany(COPY protocol)
 const COLS = { id: 'int8', name: 'text', qty: 'int4', price: 'float8', flag: 'bool', created_at: 'timestamptz' } as const
 await db.query('drop table if exists bulk_bench')
 await db.query(`create ${LOGGED ? '' : 'unlogged '}table bulk_bench(id int8, name text, qty int4, price float8, flag bool, created_at timestamptz)`)
@@ -52,7 +53,8 @@ async function measure(): Promise<M> {
     const r = process.memoryUsage().rss; if (r > peakRss) peakRss = r
   }, 2)
   const cpu0 = process.cpuUsage(); const t0 = performance.now()
-  await db.bulkInsert('bulk_bench', COLS, rows, CHUNK > 0 ? { chunk: CHUNK } : {}) // CHUNK=0 -> adaptive; the only measured work
+  if (MODE === 'copy') await db.copyMany('bulk_bench', COLS, rows) // COPY protocol (drain-aware pumpCopy)
+  else await db.bulkInsert('bulk_bench', COLS, rows, CHUNK > 0 ? { chunk: CHUNK } : {}) // unnest; CHUNK=0 -> adaptive
   const wallMs = performance.now() - t0; const cpu = process.cpuUsage(cpu0)
   clearInterval(timer)
   const end = process.memoryUsage(); if (end.rss > peakRss) peakRss = end.rss

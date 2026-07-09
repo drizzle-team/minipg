@@ -264,14 +264,14 @@ function columnLines(out: string[], col: CodegenCol, i: number, ind: string, hel
 
 const litKey = (k: string) => (k === '__proto__' ? '["__proto__"]' : JSON.stringify(k)) // __proto__ as a computed key (no prototype pollution)
 
-/** Value expr for column i: `X[k](v_i)` when it has a Transform (runs on null too), else the raw temp `v_i`. */
+/** Value expr for column i: `X[k](v_i)` when it has a Transform (SKIPPED for NULL cells — null stays null), else the raw temp `v_i`. */
 function colVal(col: CodegenCol, i: number, xforms: Array<(v: unknown) => unknown>): string {
   if (!col.xform) return `v${i}`
-  const k = xforms.length; xforms.push(col.xform); return `X[${k}](v${i})`
+  const k = xforms.length; xforms.push(col.xform); return `(v${i} === null ? null : X[${k}](v${i}))`
 }
 
 /** Build a (possibly nested) object literal from ordered cols with `path` nesting (Collect groups). A group
- *  auto-nulls when any REQUIRED (non-nullable) leaf's RAW temp is null (LEFT-JOIN miss). The root never nulls. */
+ *  auto-nulls when any REQUIRED (non-nullable) leaf's RAW temp is null, or (all-Nullable groups) when EVERY field is null. The root never nulls. */
 function buildObjectLiteral(cols: CodegenCol[], xforms: Array<(v: unknown) => unknown>): string {
   type Node = { leaves: Array<{ key: string; i: number; col: CodegenCol }>; groups: Array<{ key: string; node: Node }> }
   const root: Node = { leaves: [], groups: [] }
@@ -285,10 +285,18 @@ function buildObjectLiteral(cols: CodegenCol[], xforms: Array<(v: unknown) => un
     for (const g of node.groups) parts.push(`${litKey(g.key)}: ${group(g.node)}`)
     return `{ ${parts.join(', ')} }`
   }
+  function allIdx(node: Node): number[] { // every descendant column index of a group
+    const out = node.leaves.map((l) => l.i)
+    for (const g of node.groups) out.push(...allIdx(g.node))
+    return out
+  }
   function group(node: Node): string { // a nested Collect group: guard on its required leaves' raw null
     const req = node.leaves.filter((l) => !l.col.nullable)
     const b = body(node)
-    return req.length ? `(${req.map((l) => `v${l.i} === null`).join(' || ')}) ? null : ${b}` : b
+    if (req.length) return `(${req.map((l) => `v${l.i} === null`).join(' || ')}) ? null : ${b}`
+    // all-Nullable group: still null when EVERY descendant column is null (LEFT-JOIN miss)
+    const all = allIdx(node)
+    return all.length ? `(${all.map((i) => `v${i} === null`).join(' && ')}) ? null : ${b}` : b
   }
   return body(root)
 }

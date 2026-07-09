@@ -53,14 +53,15 @@ export function isJsonMarker(x: unknown): x is JsonMarker {
 
 /** Group several flat result columns (an ORM join) into ONE nested object per row. Multi-column nesting. Fields
  *  are REQUIRED by default; wrap one in Nullable() to allow a legit NULL. The whole group decodes to `null` when
- *  any required field is NULL (a required column is NOT-NULL in the DB, so it's only NULL on a LEFT-JOIN miss). */
+ *  any required field is NULL, or — when every field is Nullable() — when ALL fields are NULL (a required column
+ *  is NOT-NULL in the DB, so either condition only fires on a LEFT-JOIN miss). */
 export interface CollectMarker { readonly __collect: true; readonly spec: ShapeSpec }
 export function Collect<K extends string>(spec: ShapeOf<K>): CollectMarker { return { __collect: true, spec: spec as ShapeSpec } }
 export const isCollectMarker = (x: unknown): x is CollectMarker => typeof x === 'object' && x !== null && (x as { __collect?: unknown }).__collect === true
 
 /** A per-column DECODE-TIME transform: the cell decodes per `type`, then `fn(decoded)` runs during assembly.
- *  `fn` DOES receive `null` for a NULL cell (so it can do null-dependent logic — e.g. supply a default).
- *  e.g. id: Transform('bigint:number', BigInt), or bio: Transform('text', s => s ?? ''). */
+ *  `fn` is NOT called for a NULL cell — null passes through unchanged (so fn never has to null-check).
+ *  e.g. id: Transform('bigint:number', BigInt), or name: Transform('text', s => s.toUpperCase()). */
 export interface TransformMarker { readonly __transform: true; readonly id: number; readonly type: TypeSpec; readonly fn: (v: never) => unknown }
 let __xformId = 0
 export function Transform<T extends TypeSpec, R>(type: T, fn: (v: never) => R): TransformMarker { return { __transform: true, id: __xformId++, type, fn: fn as (v: never) => unknown } }
