@@ -8,6 +8,7 @@ import { Connection } from './connection.ts'
 import type { TxFn } from './connection.ts'
 import { resolveUrl } from './url.ts'
 import type { PoolConfig, QueryOptions, QueryResult, TxOptions } from './types.ts'
+import { Cursor, type CursorOptions } from './cursor.ts'
 
 interface Waiter { resolve: (c: Connection) => void; reject: (e: Error) => void }
 
@@ -267,6 +268,16 @@ export class Pool {
   async copyMany(...args: Parameters<Connection['copyMany']>): Promise<QueryResult<never>> {
     const { client, release } = await this.connect()
     try { return await client.copyMany(...args) } finally { release() }
+  }
+
+  /** Server-side cursor on a DEDICATED pooled connection — created synchronously; the
+   *  connection is checked out on the first next() and released when the cursor is drained,
+   *  closed, or aborted by its guards. */
+  cursor<Row = Record<string, unknown>>(opts: CursorOptions): Cursor<Row> {
+    return new Cursor<Row>(async () => {
+      const { client, release } = await this.connect()
+      return { conn: client, release }
+    }, opts)
   }
 
   /** Check out a dedicated connection (e.g. for a transaction). `release()` is idempotent. */

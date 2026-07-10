@@ -2,7 +2,7 @@
 // Requires the local cluster with wal_level=logical (test/setup-pg.sh cluster, reconfigured).
 import { test, expect, describe } from 'bun:test'
 import { replication, connect, type ReplicationEvent } from '../../src/index.ts'
-import { TEST_CONFIG, withConn, TEST_TIMEOUT } from '../helpers/db.ts'
+import { TEST_CONFIG, withConn, testPool, TEST_TIMEOUT } from '../helpers/db.ts'
 
 const K = `repl_${process.pid}`
 
@@ -90,35 +90,34 @@ describe('replication()', () => {
     })
   }, TEST_TIMEOUT)
 
-  test('backfill(): per-table iterators, pinned snapshot, CONCURRENT with streaming', async () => {
+  test('cursor + snapshot: eager open() pins per-table backfills, CONCURRENT with streaming', async () => {
     await withConn(async (c) => {
       await c.query(`create table ${K}_b1(id int4 primary key, v text)`)
       await c.query(`create table ${K}_b2(id int4 primary key)`)
       await c.query(`create publication ${K}_bpub for table ${K}_b1, ${K}_b2`)
       await c.query(`insert into ${K}_b1 select g, 'v' || g from generate_series(1, 2500) g`)
       await c.query(`insert into ${K}_b2 select generate_series(1, 7)`)
+      const pool = testPool({ max: 2 })
       const repl = await replication(TEST_CONFIG)
       try {
         const slot = await repl.createSlot(`${K}_bslot`, { temporary: true, snapshot: 'export' })
-        // pin BOTH tables' backfills eagerly (while the slot tx is open)…
-        const [bf1, bf2] = await Promise.all([
-          repl.backfill({ table: `${K}_b1`, snapshot: slot.snapshot, batchSize: 1000 }),
-          repl.backfill({ table: `${K}_b2`, snapshot: slot.snapshot }),
-        ])
-        // …then a post-slot write, and START STREAMING while backfills are still unconsumed
+        // pin BOTH tables' cursors eagerly (while the slot tx is open)…
+        const bf1 = pool.cursor({ sql: `select * from ${K}_b1`, snapshot: slot.snapshot!, fullScan: true, fetchSize: 1000 })
+        const bf2 = pool.cursor({ sql: `select * from ${K}_b2`, snapshot: slot.snapshot!, fullScan: true })
+        await Promise.all([bf1.open(), bf2.open()])
+        // …then a post-slot write, and START STREAMING while the cursors are still undrained
         await c.query(`insert into ${K}_b1 values (9001, 'streamed')`)
         const streamP = collectUntil(
           repl.start({ slot: slot.slot, publications: [`${K}_bpub`] }),
           (es) => es.some((e) => e.kind === 'commit'),
         )
-        // consume both backfills concurrently with the live stream
-        const drain = async (g: AsyncGenerator<Record<string, unknown>[]>): Promise<Record<string, unknown>[]> => {
+        const drain = async (cur: AsyncIterable<Record<string, unknown>[]>): Promise<Record<string, unknown>[]> => {
           const all: Record<string, unknown>[] = []
-          for await (const batch of g) all.push(...batch)
+          for await (const batch of cur) all.push(...batch)
           return all
         }
         const [rows1, rows2, events] = await Promise.all([drain(bf1), drain(bf2), streamP])
-        expect(rows1.length).toBe(2500)                       // batched via cursor (3 fetches)
+        expect(rows1.length).toBe(2500)                       // batched (3 fetches of 1000)
         expect(rows1.some((r) => r.id === 9001)).toBe(false)  // post-slot row NOT in the snapshot
         expect(rows1[0]).toEqual({ id: 1, v: 'v1' })          // decoded like normal queries
         expect(rows2.length).toBe(7)
@@ -126,25 +125,9 @@ describe('replication()', () => {
         expect(ins.new.id).toBe(9001)                          // …and arrives via the stream instead
       } finally {
         repl.end()
+        await pool.end()
         await c.query(`drop publication ${K}_bpub`)
         await c.query(`drop table ${K}_b1, ${K}_b2`)
-      }
-    })
-  }, TEST_TIMEOUT)
-
-  test('backfill() without snapshot: ad-hoc read of current data (explicit re-sync)', async () => {
-    await withConn(async (c) => {
-      await c.query(`create table ${K}_ad(id int4 primary key)`)
-      await c.query(`insert into ${K}_ad values (1), (2)`)
-      const repl = await replication(TEST_CONFIG)
-      try {
-        const bf = await repl.backfill({ table: `${K}_ad`, where: 'id > 1' })
-        const rows: unknown[] = []
-        for await (const b of bf) rows.push(...b)
-        expect(rows).toEqual([{ id: 2 }])
-      } finally {
-        repl.end()
-        await c.query(`drop table ${K}_ad`)
       }
     })
   }, TEST_TIMEOUT)

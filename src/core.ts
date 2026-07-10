@@ -19,6 +19,8 @@ export function createPool(config: string | PoolConfig = {}): Pool {
 
 export { Connection, Pool }
 export { replication, ReplicationConnection, lsnToString, lsnFromString } from './replication.ts'
+export { Cursor } from './cursor.ts'
+export type { CursorOptions } from './cursor.ts'
 export type { ReplicationConfig, ReplicationEvent, ReplicationRelation, StartOptions, Row } from './replication.ts'
 export { PoolQuery } from './pool.ts'
 export { parseConnectionString } from './url.ts'

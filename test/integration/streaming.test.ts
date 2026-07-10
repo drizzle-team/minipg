@@ -529,14 +529,14 @@ describe('streaming :: out-of-scope / roadmap guards', () => {
       expect(it.on).toBeUndefined()
       expect(it.destroy).toBeUndefined()
       expect(it.read).toBeUndefined()
-      expect((c as unknown as Record<string, unknown>).cursor).toBeUndefined()
+      expect(typeof c.cursor).toBe('function') // cursor() shipped 2026-07-10
       for await (const _ of c.stream('select 1')) { /* drain the probe */ }
     })
   })
 
   test('GUARD: refcursor is reachable only via raw SQL (no first-class helper)', async () => {
     await withConn(async (c) => {
-      expect((c as unknown as Record<string, unknown>).cursor).toBeUndefined()
+      expect(typeof c.cursor).toBe('function') // cursor() shipped 2026-07-10
       await c.query('begin')
       await c.query('declare strm_rc cursor for select g from generate_series(1,3) g')
       const got: number[] = []

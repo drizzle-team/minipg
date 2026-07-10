@@ -12,6 +12,7 @@ import { resolveUrl } from './url.ts'
 import { shapeCols, resolveParamTypes, paramTypeOid, type ShapeSpec, type ShapeOf, type ParamType, type PgType } from './spec.ts'
 import type { ShapeMapper } from './shape.ts'
 import type { Plugin, QueryInfo, QueryMetrics } from './plugin.ts'
+import { Cursor, type CursorOptions } from './cursor.ts'
 
 type ConnState = 'idle' | 'connecting' | 'ready' | 'reconnecting' | 'closed'
 
@@ -1324,6 +1325,14 @@ export class Connection {
       return runSeq()
     }
     return this.inTransaction ? runSeq() : this.begin(runSeq)
+  }
+
+  /** Server-side cursor over a SELECT on THIS connection — created synchronously, opened
+   *  lazily on the first next(). Owns the connection's transaction while open (like begin()):
+   *  don't interleave other transactional work until it's closed/drained. For a dedicated
+   *  connection per cursor, use pool.cursor(). */
+  cursor<Row = Record<string, unknown>>(opts: CursorOptions): Cursor<Row> {
+    return new Cursor<Row>(async () => ({ conn: this, release: () => {} }), opts)
   }
 
   /** Run `fn` inside a transaction on THIS connection. Sends BEGIN (with optional isolation/mode options),

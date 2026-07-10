@@ -6,12 +6,14 @@
 //
 //   const repl = await replication({ host, port, user, password, database })
 //   const slot = await repl.createSlot('pulse', { temporary: true, snapshot: 'export' })
+//   // gapless backfill: pin the snapshot with a cursor BEFORE the next command here —
+//   //   const cur = pool.cursor({ sql: 'select * from t', snapshot: slot.snapshot, fullScan: true }); await cur.open()
 //   for await (const e of repl.start({ slot: slot.slot, publications: ['pub'] })) { … repl.ack(e.endLsn) }
 import type { Duplex } from 'node:stream'
 import { W, Parser, parseRowDescription, parseDataRow, type RawMessage } from './protocol.ts'
 import { md5Password, scram, type Scram } from './auth.ts'
 import { PgError, parseErrorFields } from './errors.ts'
-import { getDefaultTransport, Connection, type NormalizedConfig } from './connection.ts'
+import { getDefaultTransport, type NormalizedConfig } from './connection.ts'
 import { resolveUrl } from './url.ts'
 import { buildDecoders, decoderFor } from './codec.ts'
 import type { ConnectConfig, Decoder } from './types.ts'
@@ -78,11 +80,8 @@ export class ReplicationConnection {
   private flushed = 0n
   private lastDeliveredEnd = 0n // highest commit endLsn handed to the consumer (guards idleAck)
 
-  private rawConfig: ReplicationConfig
-
   constructor(config: ReplicationConfig = {}) {
     const rc = resolveUrl(config)
-    this.rawConfig = rc
     const user = rc.user || process.env.PGUSER || process.env.USER || process.env.USERNAME || 'postgres'
     this.decoders = buildDecoders(rc.types, rc.jsonBigints)
     this.cfg = {
@@ -200,50 +199,6 @@ export class ReplicationConnection {
 
   async dropSlot(name: string, opts: { wait?: boolean } = {}): Promise<void> {
     await this.command(`DROP_REPLICATION_SLOT ${name}${opts.wait ? ' WAIT' : ''}`)
-  }
-
-  /** Backfill ONE table on its OWN normal connection, as an async stream of row batches.
-   *  Pins the snapshot EAGERLY (before returning), so the caller may pin several tables, then
-   *  begin start() streaming and consume backfills + live events CONCURRENTLY — once pinned,
-   *  each connection keeps its snapshot independently. Constraint: create every backfill while
-   *  the exporting slot transaction is still open (i.e. before the next command on THIS
-   *  connection). Without `snapshot` it reads current data (ad-hoc re-sync — dedupe against
-   *  the stream by key, last LSN wins). Reads via a server-side cursor: constant memory. */
-  async backfill(opts: {
-    table: string
-    snapshot?: string | null
-    columns?: readonly string[]   // default: all
-    where?: string                // raw filter fragment
-    batchSize?: number            // rows per FETCH (default 5_000)
-  }): Promise<AsyncGenerator<Row[]>> {
-    const qi = (s: string): string => '"' + s.replace(/"/g, '""') + '"'
-    const conn = new Connection({ ...this.rawConfig })
-    await conn.connect()
-    try {
-      await conn.query('begin isolation level repeatable read read only')
-      await conn.query('set local cursor_tuple_fraction = 1.0') // backfill drains fully: plan for throughput, not fast startup
-      if (opts.snapshot) await conn.query(`set transaction snapshot '${opts.snapshot.replace(/'/g, "''")}'`)
-      const cols = opts.columns?.length ? opts.columns.map(qi).join(', ') : '*'
-      const cur = '_minipg_bf'
-      await conn.query(`declare ${cur} no scroll cursor for select ${cols} from ${opts.table.split('.').map(qi).join('.')}${opts.where ? ` where ${opts.where}` : ''}`)
-      const batch = Math.max(1, opts.batchSize ?? 5_000)
-      // snapshot is pinned + cursor open: safe to return; iteration streams batches
-      return (async function* () {
-        try {
-          for (;;) {
-            const r = await conn.query(`fetch ${batch} from ${cur}`, [], { mode: 'object' })
-            if (r.rows.length) yield r.rows as Row[]
-            if (r.rows.length < batch) return
-          }
-        } finally {
-          try { await conn.query('commit') } catch { /* connection may be gone */ }
-          await conn.end()
-        }
-      })()
-    } catch (e) {
-      await conn.end().catch(() => {})
-      throw e
-    }
   }
 
   /** Consumer acknowledgement: everything <= lsn is durably processed. Advances the slot's

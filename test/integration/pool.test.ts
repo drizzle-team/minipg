@@ -734,7 +734,7 @@ describe('out-of-scope surface guards', () => {
     expect(typeof p.copyFrom).toBe('function')
     expect(typeof p.copyMany).toBe('function')
     expect(p.copyTo).toBeUndefined()
-    expect(p.cursor).toBeUndefined()
+    expect(typeof p.cursor).toBe('function') // cursor() shipped 2026-07-10
     void pool.end()
   })
 
