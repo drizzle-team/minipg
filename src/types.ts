@@ -143,6 +143,11 @@ export type TxOptions =
 export interface QueryOptions {
   /** Reuse a server-side prepared statement under this name (parse once, bind many). */
   name?: string
+  /** Run this ONE query pinned to an exported snapshot (from replication createSlot or
+   *  pg_export_snapshot()): wraps it in `begin repeatable read read only; set transaction
+   *  snapshot …; <query>; commit` — all pipelined into a single round trip. Rejects if the
+   *  connection is already inside a transaction. The exporting transaction must still be open. */
+  snapshot?: string
   mode?: ResultMode
   /** Declare the param types upfront — the input-side mirror of `shape`. Aliases ('int8',
    *  'timestamptz'), array forms ('int8[]', 'text[]'), or raw OIDs. Sent in Parse — pinning the

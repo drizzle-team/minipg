@@ -1003,11 +1003,28 @@ export class Connection {
   // a shape (without an explicit non-object mode) decodes to objects — matches the runtime default.
   // generic over the shape's column names so editors autocomplete each value to the known type list.
   query<K extends string>(sql: string | readonly string[], params: unknown[], opts: { shape: ShapeOf<K> | ShapeMapper; mode?: 'object'; name?: string; metrics?: boolean | 'ms' | 'us'; debug?: boolean; timeout?: number; signal?: AbortSignal }): Promise<QueryResult<Record<string, unknown>>>
-  query(sql: string | readonly string[], params?: unknown[], opts?: { name?: string; params?: readonly ParamType[]; mode?: 'array'; metrics?: boolean | 'ms' | 'us'; debug?: boolean; timeout?: number; signal?: AbortSignal; trace?: boolean; shape?: ShapeSpec | ShapeMapper; binary?: boolean }): Promise<QueryResult<unknown[]>>
-  query(sql: string | readonly string[], params: unknown[], opts: { name?: string; params?: readonly ParamType[]; mode: 'object'; metrics?: boolean | 'ms' | 'us'; debug?: boolean; timeout?: number; signal?: AbortSignal; trace?: boolean; shape?: ShapeSpec | ShapeMapper; binary?: boolean }): Promise<QueryResult<Record<string, unknown>>>
-  query(sql: string | readonly string[], params: unknown[], opts: { name?: string; params?: readonly ParamType[]; mode: 'buffer'; metrics?: boolean | 'ms' | 'us'; debug?: boolean; timeout?: number; signal?: AbortSignal; trace?: boolean; binary?: boolean }): Promise<QueryResult<(Buffer | null)[]>>
-  query(sql: string | readonly string[], params: unknown[], opts: { name?: string; params?: readonly ParamType[]; mode: 'raw'; metrics?: boolean | 'ms' | 'us'; debug?: boolean; timeout?: number; signal?: AbortSignal; trace?: boolean; binary?: boolean }): Promise<QueryResult<Buffer>>
+  query(sql: string | readonly string[], params?: unknown[], opts?: { name?: string; snapshot?: string; params?: readonly ParamType[]; mode?: 'array'; metrics?: boolean | 'ms' | 'us'; debug?: boolean; timeout?: number; signal?: AbortSignal; trace?: boolean; shape?: ShapeSpec | ShapeMapper; binary?: boolean }): Promise<QueryResult<unknown[]>>
+  query(sql: string | readonly string[], params: unknown[], opts: { name?: string; snapshot?: string; params?: readonly ParamType[]; mode: 'object'; metrics?: boolean | 'ms' | 'us'; debug?: boolean; timeout?: number; signal?: AbortSignal; trace?: boolean; shape?: ShapeSpec | ShapeMapper; binary?: boolean }): Promise<QueryResult<Record<string, unknown>>>
+  query(sql: string | readonly string[], params: unknown[], opts: { name?: string; snapshot?: string; params?: readonly ParamType[]; mode: 'buffer'; metrics?: boolean | 'ms' | 'us'; debug?: boolean; timeout?: number; signal?: AbortSignal; trace?: boolean; binary?: boolean }): Promise<QueryResult<(Buffer | null)[]>>
+  query(sql: string | readonly string[], params: unknown[], opts: { name?: string; snapshot?: string; params?: readonly ParamType[]; mode: 'raw'; metrics?: boolean | 'ms' | 'us'; debug?: boolean; timeout?: number; signal?: AbortSignal; trace?: boolean; binary?: boolean }): Promise<QueryResult<Buffer>>
   query(sql: string | readonly string[], params: unknown[] = [], opts: QueryOptions = {}): Promise<QueryResult<never>> {
+    if (opts.snapshot) {
+      // snapshot-pinned one-shot: BEGIN + SET SNAPSHOT + query + COMMIT fired back-to-back so
+      // they PIPELINE (one round trip, contiguous in the dispatch queue). A failed query
+      // aborts the tx, which turns the trailing COMMIT into a rollback — always cleaned up.
+      if (this.inTransaction) return Promise.reject(new Error('snapshot queries need a fresh transaction — use them outside begin()'))
+      const { snapshot, ...rest } = opts
+      const parts = [
+        this.query('begin isolation level repeatable read read only'),
+        this.query(`set transaction snapshot '${snapshot.replace(/'/g, "''")}'`),
+        this.query(sql as string, params, rest as never) as Promise<QueryResult<never>>,
+        this.query('commit'),
+      ] as const
+      return Promise.allSettled(parts).then((r) => {
+        for (const s of r) if (s.status === 'rejected') throw s.reason // first failure wins (SET before its 25P02 fallout)
+        return (r[2] as PromiseFulfilledResult<QueryResult<never>>).value
+      })
+    }
     const p = new Promise<QueryResult<never>>((resolve, reject) => {
       if (this.state === 'closed') return reject(new Error('connection is closed'))
       let text: string, name = opts.name

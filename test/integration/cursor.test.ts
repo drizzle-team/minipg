@@ -23,17 +23,21 @@ describe('cursor()', () => {
     } finally { await pool.end() }
   }, TEST_TIMEOUT)
 
-  test('for-await iterates batches; break closes and releases', async () => {
+  test('for-await iterates ROWS; break closes and releases; batches() iterates batches', async () => {
     const pool = testPool({ max: 1 })
     try {
-      const cur = pool.cursor({ sql: 'select g from generate_series(1, 100) g', fetchSize: 10, mode: 'array' })
-      let batches = 0
-      for await (const batch of cur) {
-        expect((batch as unknown as unknown[][])[0]!.length).toBe(1)
-        if (++batches === 3) break // generator return() -> close()
+      const cur = pool.cursor({ sql: 'select g from generate_series(1, 100) g', fetchSize: 10 })
+      let rows = 0
+      for await (const row of cur) {
+        expect(row).toEqual({ g: rows + 1 })
+        if (++rows === 25) break // mid-batch break -> generator finally -> close()
       }
-      expect(batches).toBe(3)
+      expect(rows).toBe(25)
       expect(pool.idleCount).toBe(1) // released despite early break
+      const bcur = pool.cursor({ sql: 'select g from generate_series(1, 30) g', fetchSize: 10 })
+      let batches = 0
+      for await (const batch of bcur.batches()) { expect(batch.length).toBe(10); batches++ }
+      expect(batches).toBe(3)
       const r = await pool.execute('select 1') // pool still healthy
       expect(r.rowCount).toBe(1)
     } finally { await pool.end() }
@@ -77,6 +81,26 @@ describe('cursor()', () => {
         } catch (e) { return e as Error }
       })()
       expect(String(err?.message)).toMatch(/maxDurationMs/)
+    } finally { await pool.end() }
+  }, TEST_TIMEOUT)
+
+  test('all(): drains into one exact-size array; remainder mid-iteration; [] when exhausted', async () => {
+    const pool = testPool({ max: 1 })
+    try {
+      const rows = await pool.cursor({ sql: 'select g as id from generate_series(1, 12345) g', fetchSize: 1000 }).all()
+      expect(rows.length).toBe(12345)
+      expect(rows[0]).toEqual({ id: 1 })
+      expect(rows[12344]).toEqual({ id: 12345 })
+      expect(pool.idleCount).toBe(1) // auto-closed, lease released
+      const cur = pool.cursor({ sql: 'select g from generate_series(1, 100) g', fetchSize: 30 })
+      const first = await cur.next()
+      expect(first!.length).toBe(30)
+      const rest = await cur.all() // remaining rows only
+      expect(rest.length).toBe(70)
+      expect(rest[0]).toEqual({ g: 31 })
+      expect(await cur.all()).toEqual([]) // exhausted
+      const drained = await pool.cursor({ sql: 'select g from generate_series(1, 5) g' }).drain() // alias
+      expect(drained.length).toBe(5)
     } finally { await pool.end() }
   }, TEST_TIMEOUT)
 

@@ -5,7 +5,8 @@
 // idle_in_transaction_session_timeout (fires even if this process is frozen).
 //
 //   const cur = pool.cursor({ sql: 'select * from orders where created_at > $1', params: [d] })
-//   for await (const batch of cur) { … }        // or: while (b = await cur.next()) { … }
+//   for await (const row of cur) { … }          // rows; cur.batches() for batches; cur.next() for batch|null
+//   const rows = await cur.all()                 // drain everything into one array
 //   await cur.close()                            // early termination (idempotent)
 import type { Connection } from './connection.ts'
 import type { ShapeSpec } from './spec.ts'
@@ -39,7 +40,7 @@ export interface CursorLease { conn: Connection; release: () => void }
 
 let cursorSeq = 0
 
-export class Cursor<Row = Record<string, unknown>> implements AsyncIterable<Row[]> {
+export class Cursor<Row = Record<string, unknown>> implements AsyncIterable<Row> {
   private state: 'idle' | 'open' | 'done' = 'idle'
   private err: Error | null = null
   private lease: CursorLease | null = null
@@ -144,16 +145,47 @@ export class Cursor<Row = Record<string, unknown>> implements AsyncIterable<Row[
     if (this.deadline) { clearTimeout(this.deadline); this.deadline = null }
   }
 
-  [Symbol.asyncIterator](): AsyncGenerator<Row[]> {
-    const self = this
-    return {
-      async next(): Promise<IteratorResult<Row[]>> {
-        const b = await self.next()
-        return b === null ? { done: true, value: undefined } : { done: false, value: b }
-      },
-      async return(): Promise<IteratorResult<Row[]>> { await self.close(); return { done: true, value: undefined } }, // for-await break -> close
-      async throw(e: unknown): Promise<IteratorResult<Row[]>> { await self.close(); throw e },
-      [Symbol.asyncIterator]() { return this },
-    } as unknown as AsyncGenerator<Row[]>
+  /** Drain the rest of the cursor into ONE array (exact-size, single final copy — batches are
+   *  collected by reference, never spread). Called mid-iteration it returns the REMAINING rows;
+   *  after exhaustion it returns []. */
+  async all(): Promise<Row[]> {
+    const batches: Row[][] = []
+    let total = 0
+    for (;;) {
+      const b = await this.next()
+      if (b === null) break
+      batches.push(b)
+      total += b.length
+    }
+    const rows = new Array<Row>(total)
+    let i = 0
+    for (const b of batches) for (const r of b) rows[i++] = r
+    return rows
+  }
+
+  /** Alias for all(). */
+  drain(): Promise<Row[]> { return this.all() }
+
+  /** Iterate BATCHES (`for await (const batch of cur.batches())`). Break/throw closes the cursor. */
+  async *batches(): AsyncGenerator<Row[]> {
+    try {
+      for (;;) {
+        const b = await this.next()
+        if (b === null) return
+        yield b
+      }
+    } finally { await this.close() } // break/throw inside for-await lands here
+  }
+
+  /** Iterate ROWS (`for await (const row of cursor)`) — batching stays internal.
+   *  Break/throw closes the cursor. Use batches() or next() for batch-wise consumption. */
+  async *[Symbol.asyncIterator](): AsyncGenerator<Row> {
+    try {
+      for (;;) {
+        const b = await this.next()
+        if (b === null) return
+        yield* b
+      }
+    } finally { await this.close() }
   }
 }

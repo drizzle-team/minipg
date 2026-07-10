@@ -111,9 +111,9 @@ describe('replication()', () => {
           repl.start({ slot: slot.slot, publications: [`${K}_bpub`] }),
           (es) => es.some((e) => e.kind === 'commit'),
         )
-        const drain = async (cur: AsyncIterable<Record<string, unknown>[]>): Promise<Record<string, unknown>[]> => {
+        const drain = async (cur: { batches(): AsyncGenerator<Record<string, unknown>[]> }): Promise<Record<string, unknown>[]> => {
           const all: Record<string, unknown>[] = []
-          for await (const batch of cur) all.push(...batch)
+          for await (const batch of cur.batches()) all.push(...batch)
           return all
         }
         const [rows1, rows2, events] = await Promise.all([drain(bf1), drain(bf2), streamP])
