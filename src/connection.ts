@@ -24,6 +24,8 @@ let defaultCancel: CancelFn | null = null
 export function registerDefaultTransport(transport: TransportFactory, cancel: CancelFn): void {
   defaultTransport = transport; defaultCancel = cancel
 }
+/** The registered transport (node net/tls, or null on runtimes that pass config.socket) — used by replication(). */
+export function getDefaultTransport(): TransportFactory | null { return defaultTransport }
 
 export interface NormalizedConfig {
   host: string; port: number; user: string; password: string; database: string
@@ -611,7 +613,7 @@ export class Connection {
     cols = this.resolveCols(cols)
     // NB: encode the whole json marker (its declared shape), not just "has json" — two shapes that differ
     // only inside a Json()/JsonArray() must get different mappers, else the first one is wrongly reused.
-    const key = mode + '|' + cols.map((c) => `${c.name}:${c.oid}:${c.format ?? 't'}:${c.js ?? ''}:${c.json ? JSON.stringify(c.json) : ''}:${c.array ? 'a' + c.array.elem + (c.array.js ?? '') : ''}:${c.path ? c.path.join('.') : ''}:${c.nullable ? 'n' : ''}:${c.xformId ?? ''}`).join(',')
+    const key = mode + '|' + cols.map((c) => `${c.name}:${c.oid}:${c.format ?? 't'}:${c.js ?? ''}:${c.json ? JSON.stringify(c.json) : ''}:${c.array ? 'a' + c.array.elem + (c.array.js ?? '') : ''}:${c.path ? c.path.join('.') : ''}:${c.groupNullable ? c.groupNullable.map((x) => (x ? '1' : '0')).join('') : ''}:${c.nullable ? 'n' : ''}:${c.xformId ?? ''}`).join(',')
     let m = this.mapperCache.get(key)
     if (!m) { m = this.mapperFactory(cols, mode, this.cfg.decoders); this.mapperCache.set(key, m) }
     return m

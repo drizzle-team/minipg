@@ -19,12 +19,13 @@ const setKey = (obj: Record<string, unknown>, k: string, v: unknown) => { // __p
   else obj[k] = v
 }
 // Collect/Transform assembly tree (built once per mapper; the interpreted mirror of decode2.buildObjectLiteral).
-type ONode = { leaves: Array<{ key: string; i: number; xform?: (v: unknown) => unknown; required: boolean }>; groups: Array<{ key: string; node: ONode }> }
+type ONode = { leaves: Array<{ key: string; i: number; xform?: (v: unknown) => unknown; required: boolean }>; groups: Array<{ key: string; node: ONode }>; nullable: boolean }
 function buildObjTree(cols: CodegenCol[]): ONode {
-  const root: ONode = { leaves: [], groups: [] }
+  const root: ONode = { leaves: [], groups: [], nullable: false }
   cols.forEach((c, i) => {
     let node = root
-    for (const seg of c.path ?? []) { let g = node.groups.find((x) => x.key === seg); if (!g) { g = { key: seg, node: { leaves: [], groups: [] } }; node.groups.push(g) } node = g.node }
+    const gn = c.groupNullable ?? []
+    ;(c.path ?? []).forEach((seg, depth) => { let g = node.groups.find((x) => x.key === seg); if (!g) { g = { key: seg, node: { leaves: [], groups: [], nullable: gn[depth] ?? false } }; node.groups.push(g) } node = g.node })
     node.leaves.push({ key: c.name, i, xform: c.xform, required: !c.nullable })
   })
   return root
@@ -41,9 +42,11 @@ function groupAllNull(node: ONode, vals: unknown[]): boolean {
   return true
 }
 function assembleGroup(node: ONode, vals: unknown[]): Record<string, unknown> | null {
-  let anyRequired = false
-  for (const l of node.leaves) { if (l.required) { anyRequired = true; if (vals[l.i] === null) return null } } // auto-null: a required (non-Nullable) leaf is NULL
-  if (!anyRequired && groupAllNull(node, vals)) return null // all-Nullable group, every field null (LEFT-JOIN miss)
+  if (node.nullable) { // CollectNullable: null the whole group on a LEFT-JOIN miss (plain Collect always returns an object)
+    let anyRequired = false
+    for (const l of node.leaves) { if (l.required) { anyRequired = true; if (vals[l.i] === null) return null } } // a required (non-Nullable) leaf is NULL
+    if (!anyRequired && groupAllNull(node, vals)) return null // all-Nullable group, every field null
+  }
   return assembleObj(node, vals)
 }
 

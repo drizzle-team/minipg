@@ -3,7 +3,7 @@
 // Uses VALUES-with-casts (no tables) to produce columns in a fixed wire order incl. NULLs (LEFT-JOIN miss).
 import { test, expect, describe, beforeAll, afterAll } from 'bun:test'
 import { testConnect, caught } from '../helpers/db.ts'
-import { Collect, Transform, Nullable, Json } from '../../src/index.ts'
+import { Collect, CollectNullable, Transform, Nullable, Json } from '../../src/index.ts'
 import type { Connection } from '../../src/index.ts'
 import type { ShapeSpec } from '../../src/spec.ts'
 
@@ -29,11 +29,18 @@ async function rows(sql: string, shape: ShapeSpec): Promise<unknown[]> {
 }
 
 describe('Collect / Transform / Nullable', () => {
-  test('nested grouping + auto-null when a required field is NULL', async () => {
+  test('CollectNullable: auto-null when a required field is NULL (Collect stays an object)', async () => {
     const sql = `SELECT * FROM (VALUES (1::int8,'alice'::text,10::int8,'pro'::text),(2::int8,'bob'::text,NULL::int8,NULL::text)) t(uid,uname,sid,splan)`
-    const r = await rows(sql, { user: Collect({ id: 'bigint:number', name: 'text' }), sub: Collect({ id: 'bigint', plan: 'text' }) })
+    const r = await rows(sql, { user: Collect({ id: 'bigint:number', name: 'text' }), sub: CollectNullable({ id: 'bigint', plan: 'text' }) })
     expect(r[0]).toEqual({ user: { id: 1, name: 'alice' }, sub: { id: 10n, plan: 'pro' } })
-    expect(r[1]).toEqual({ user: { id: 2, name: 'bob' }, sub: null }) // sub.id required + NULL -> whole group null
+    expect(r[1]).toEqual({ user: { id: 2, name: 'bob' }, sub: null }) // sub.id required + NULL -> whole group null (CollectNullable)
+  })
+
+  test('Collect ALWAYS returns an object — a LEFT-JOIN miss gives null fields, not null', async () => {
+    const sql = `SELECT * FROM (VALUES (1::int8,'alice'::text,10::int8,'pro'::text),(2::int8,'bob'::text,NULL::int8,NULL::text)) t(uid,uname,sid,splan)`
+    const r = await rows(sql, { user: Collect({ id: 'bigint:number', name: 'text' }), sub: Collect({ id: 'bigint:number', plan: 'text' }) })
+    expect(r[0]).toEqual({ user: { id: 1, name: 'alice' }, sub: { id: 10, plan: 'pro' } })
+    expect(r[1]).toEqual({ user: { id: 2, name: 'bob' }, sub: { id: null, plan: null } }) // Collect never nulls the group
   })
 
   test('Transform is SKIPPED for NULL cells — null passes through (changed 2026-07-09)', async () => {
@@ -51,8 +58,8 @@ describe('Collect / Transform / Nullable', () => {
 
   test('all-Nullable group with EVERY field null -> group is null (changed 2026-07-09)', async () => {
     const sql = `SELECT * FROM (VALUES (NULL::int8,NULL::text)) t(a,b)`
-    const r = await rows(sql, { g: Collect({ a: Nullable('bigint'), b: Nullable('text') }) })
-    expect(r[0]).toEqual({ g: null }) // was { a: null, b: null }; all-null now means LEFT-JOIN miss
+    const r = await rows(sql, { g: CollectNullable({ a: Nullable('bigint'), b: Nullable('text') }) })
+    expect(r[0]).toEqual({ g: null }) // all-Nullable CollectNullable, every field null -> LEFT-JOIN miss
   })
 
   test('Nullable(Transform(...)) composes; null skips the fn', async () => {
@@ -64,14 +71,14 @@ describe('Collect / Transform / Nullable', () => {
 
   test('deep nesting (Collect in Collect) with inner auto-null', async () => {
     const sql = `SELECT * FROM (VALUES (1::int8,'nyc'::text,2::int8),(3::int8,NULL::text,NULL::int8)) t(id,city,zip)`
-    const r = await rows(sql, { user: Collect({ id: 'bigint:number', address: Collect({ city: 'text', zip: 'bigint:number' }) }) })
+    const r = await rows(sql, { user: Collect({ id: 'bigint:number', address: CollectNullable({ city: 'text', zip: 'bigint:number' }) }) })
     expect(r[0]).toEqual({ user: { id: 1, address: { city: 'nyc', zip: 2 } } })
-    expect(r[1]).toEqual({ user: { id: 3, address: null } }) // address.city required + NULL -> address null (user present)
+    expect(r[1]).toEqual({ user: { id: 3, address: null } }) // address.city required + NULL -> address null (CollectNullable); user present
   })
 
   test('multiple required fields: any NULL nulls the group', async () => {
     const sql = `SELECT * FROM (VALUES (1::int8,NULL::int8,'x'::text)) t(a,b,c)`
-    const r = await rows(sql, { g: Collect({ a: 'bigint', b: 'bigint', c: 'text' }) })
+    const r = await rows(sql, { g: CollectNullable({ a: 'bigint', b: 'bigint', c: 'text' }) })
     expect(r[0]).toEqual({ g: null }) // b required + NULL
   })
 
@@ -83,15 +90,15 @@ describe('Collect / Transform / Nullable', () => {
 
   test('all-Nullable Collect group: ALL fields null -> group is null (LEFT-JOIN miss)', async () => {
     const sql = `SELECT * FROM (VALUES (1::int8, NULL::text, NULL::int4), (2::int8, 'bob', NULL::int4)) t(id, name, age)`
-    const r = await rows(sql, { id: 'bigint:number', u: Collect({ name: Nullable('text'), age: Nullable('int4') }) })
+    const r = await rows(sql, { id: 'bigint:number', u: CollectNullable({ name: Nullable('text'), age: Nullable('int4') }) })
     expect(r[0]).toEqual({ id: 1, u: null })                      // every field null -> whole group null
     expect(r[1]).toEqual({ id: 2, u: { name: 'bob', age: null } }) // partial null -> object survives
   })
 
   test('all-Nullable NESTED group nulls independently of its parent', async () => {
     const sql = `SELECT * FROM (VALUES (1::int8, 'x', NULL::text, NULL::text)) t(id, a, b, c)`
-    const r = await rows(sql, { id: 'bigint:number', g: Collect({ a: Nullable('text'), inner: Collect({ b: Nullable('text'), c: Nullable('text') }) }) })
-    expect(r[0]).toEqual({ id: 1, g: { a: 'x', inner: null } }) // parent has data; empty child group nulls
+    const r = await rows(sql, { id: 'bigint:number', g: Collect({ a: Nullable('text'), inner: CollectNullable({ b: Nullable('text'), c: Nullable('text') }) }) })
+    expect(r[0]).toEqual({ id: 1, g: { a: 'x', inner: null } }) // parent Collect present; empty CollectNullable child nulls
   })
 
   test("'unknown' column decodes by its RUNTIME type (like a plain query)", async () => {
@@ -118,10 +125,10 @@ describe('Collect / Transform / Nullable', () => {
     const sql = `SELECT * FROM (VALUES (1::int8, 5::int4, NULL::text), (2::int8, NULL::int4, NULL::text)) t(id, x, y)`
     const r = await rows(sql, {
       id: 'bigint:number',
-      g: Collect({ x: Nullable(Transform('unknown', (v: number) => v * 2)), y: Nullable('unknown') }),
+      g: CollectNullable({ x: Nullable(Transform('unknown', (v: number) => v * 2)), y: Nullable('unknown') }),
     })
     expect(r[0]).toEqual({ id: 1, g: { x: 10, y: null } }) // runtime int4 -> number, then transform
-    expect(r[1]).toEqual({ id: 2, g: null })                // all-null group -> null
+    expect(r[1]).toEqual({ id: 2, g: null })                // all-null CollectNullable group -> null
   })
 
   test("geometric + extension types: point / vector / geometry targets", async () => {

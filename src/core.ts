@@ -18,6 +18,8 @@ export function createPool(config: string | PoolConfig = {}): Pool {
 }
 
 export { Connection, Pool }
+export { replication, ReplicationConnection, lsnToString, lsnFromString } from './replication.ts'
+export type { ReplicationConfig, ReplicationEvent, ReplicationRelation, StartOptions, Row } from './replication.ts'
 export { PoolQuery } from './pool.ts'
 export { parseConnectionString } from './url.ts'
 export { PgError } from './errors.ts'
@@ -25,7 +27,7 @@ export { defaultDecoders } from './codec.ts'
 export { Shape } from './shape.ts'
 export type { ShapeMapper } from './shape.ts'
 export type { ShapeSpec, TypeSpec, PgType } from './spec.ts'
-export { Json, JsonArray, Jsonb, JsonbArray, Collect, Transform, Nullable } from './json.ts'
+export { Json, JsonArray, Jsonb, JsonbArray, Collect, CollectNullable, Transform, Nullable } from './json.ts'
 export type { JsonSpec, JsonMarker, JsTarget, CollectMarker, TransformMarker, NullableMarker } from './json.ts'
 export type {
   ConnectConfig, PoolConfig, QueryOptions, StreamOptions, TxOptions,

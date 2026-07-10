@@ -31,8 +31,11 @@ export interface JsonMarker {
   readonly type: 'json' | 'jsonb'
   readonly spec: JsonSpec
 }
-/** A nested JSON shape: field name -> TypeSpec (PG alias, optionally `:number`/`:string`), or a nested Json()/Jsonb()/array. */
-export type JsonSpec = Record<string, TypeSpec | JsonMarker>
+/** A nested JSON shape: field name -> TypeSpec (PG alias, optionally `:number`/`:string`), a nested
+ *  Json()/Jsonb()/array, or a Transform(type, fn) applied to the decoded field value. */
+export type JsonSpec = Record<string, TypeSpec | JsonMarker | TransformMarker>
+/** A json field's base type, unwrapping Transform(type, fn) to `type` (the fn is applied after decode). */
+const jsonBase = (f: TypeSpec | JsonMarker | TransformMarker): TypeSpec | JsonMarker => (isTransformMarker(f) ? f.type : f)
 
 // Generic over the field names (ShapeOf<K>) so nested json field values autocomplete, same as Shape().
 /** Declare a `json` column that is a single object of a known shape (keys in declared order). */
@@ -48,15 +51,18 @@ export function isJsonMarker(x: unknown): x is JsonMarker {
 }
 
 // ---- Collect / Map / Nullable: TOP-LEVEL row shaping over real RESULT COLUMNS ----------------------------
-// These operate on wire columns (unlike Json() which parses ONE json cell), so they are valid at the top of a
-// Shape and inside a Collect — NOT inside a Json()/Jsonb() spec (JsonSpec stays TypeSpec|JsonMarker).
+// Collect/Nullable operate on wire columns (unlike Json() which parses ONE json cell), so they are valid at the
+// top of a Shape and inside a Collect — NOT inside a Json()/Jsonb() spec. Transform(), however, just visits a
+// decoded value, so it IS allowed inside a Json()/Jsonb() spec (applied per-field after the scanner/JSON.parse).
 
-/** Group several flat result columns (an ORM join) into ONE nested object per row. Multi-column nesting. Fields
- *  are REQUIRED by default; wrap one in Nullable() to allow a legit NULL. The whole group decodes to `null` when
- *  any required field is NULL, or — when every field is Nullable() — when ALL fields are NULL (a required column
- *  is NOT-NULL in the DB, so either condition only fires on a LEFT-JOIN miss). */
-export interface CollectMarker { readonly __collect: true; readonly spec: ShapeSpec }
-export function Collect<K extends string>(spec: ShapeOf<K>): CollectMarker { return { __collect: true, spec: spec as ShapeSpec } }
+/** Group several flat result columns (an ORM join) into ONE nested object per row. Multi-column nesting.
+ *  `Collect` ALWAYS returns an object — a LEFT-JOIN miss (all fields NULL) yields an object with null fields,
+ *  not null. Use `CollectNullable` when you want the whole group to become `null` on a miss. */
+export interface CollectMarker { readonly __collect: true; readonly nullable: boolean; readonly spec: ShapeSpec }
+export function Collect<K extends string>(spec: ShapeOf<K>): CollectMarker { return { __collect: true, nullable: false, spec: spec as ShapeSpec } }
+/** Like Collect(), but the whole group decodes to `null` on a LEFT-JOIN miss: when any REQUIRED field is NULL,
+ *  or — when every field is Nullable() — when ALL fields are NULL. */
+export function CollectNullable<K extends string>(spec: ShapeOf<K>): CollectMarker { return { __collect: true, nullable: true, spec: spec as ShapeSpec } }
 export const isCollectMarker = (x: unknown): x is CollectMarker => typeof x === 'object' && x !== null && (x as { __collect?: unknown }).__collect === true
 
 /** A per-column DECODE-TIME transform: the cell decodes per `type`, then `fn(decoded)` runs during assembly.
@@ -95,7 +101,7 @@ export function splitType(s: string): { pg: string; js?: JsTarget } {
 const NUMBER = new Set(['int2', 'smallint', 'int4', 'int', 'integer', 'serial', 'oid', 'float4', 'real', 'float8', 'double precision'])
 const PRECISION = new Set(['int8', 'bigint', 'numeric', 'decimal', 'money']) // exact-string by default; JSON.parse would lose precision
 const BOOL = new Set(['bool', 'boolean'])
-const RAWJSON = new Set(['json', 'jsonb']) // a sub-field that is itself arbitrary JSON (no declared shape)
+const RAWJSON = new Set(['json', 'jsonb', 'unknown']) // arbitrary-JSON sub-field (no declared shape); 'unknown' = passthrough (JSON.parse value as-is)
 function category(alias: string): 'number' | 'precision' | 'bool' | 'json' | 'string' {
   const t = alias.toLowerCase().trim()
   if (NUMBER.has(t)) return 'number'
@@ -142,7 +148,8 @@ export function float4Target(pg: string, js?: JsTarget): 'precise' | 'pretty' | 
 /** True if anywhere in the shape there's a field whose exact value JSON.parse can't produce
  *  (a precision type left as string). A `:number` override opts out — Number is JSON.parse-safe. */
 export function specHasPrecision(spec: JsonSpec): boolean {
-  for (const v of Object.values(spec)) {
+  for (const raw of Object.values(spec)) {
+    const v = jsonBase(raw) // Transform doesn't force the scanner; its base type decides
     if (isJsonMarker(v)) { if (specHasPrecision(v.spec)) return true; continue }
     const { pg, js } = splitType(v)
     if (temporalTarget(pg, js)) return true // temporal (default Date, or :date/:ms) needs the positional scanner
@@ -151,13 +158,23 @@ export function specHasPrecision(spec: JsonSpec): boolean {
   return false
 }
 
+/** True if the shape has any Transform field (anywhere) — the decoded value must be visited by its fn. */
+export function specHasTransform(spec: JsonSpec): boolean {
+  for (const v of Object.values(spec)) {
+    if (isTransformMarker(v)) return true
+    if (isJsonMarker(v) && specHasTransform(v.spec)) return true
+  }
+  return false
+}
+
 /** True if the shape has any field the interpreted (no-eval) path must fix up after JSON.parse — a
  *  :ms/:date temporal (ISO string -> Date/number) or an int8/bigint (number/string -> BigInt). Only
  *  shapes that answer true need the post-parse walk below. */
 export function specNeedsWalk(spec: JsonSpec): boolean {
-  for (const v of Object.values(spec)) {
-    if (isJsonMarker(v)) { if (specNeedsWalk(v.spec)) return true; continue }
-    const { pg, js } = splitType(v)
+  for (const raw of Object.values(spec)) {
+    if (isTransformMarker(raw)) return true // the interpreted walk applies the transform fn after JSON.parse
+    if (isJsonMarker(raw)) { if (specNeedsWalk(raw.spec)) return true; continue }
+    const { pg, js } = splitType(raw)
     if (temporalTarget(pg, js) || bigintField(pg, js) || float4Target(pg, js) === 'precise') return true
   }
   return false
@@ -180,14 +197,39 @@ function isoEpoch(s: string): number {
  *  as a string. Access is by key, so jsonb's sorted wire order is irrelevant. */
 export function buildJsonWalk(marker: JsonMarker): (v: unknown) => unknown {
   const fns: Array<[string, (x: unknown) => unknown]> = []
-  for (const [key, field] of Object.entries(marker.spec)) {
-    if (isJsonMarker(field)) { if (specNeedsWalk(field.spec)) fns.push([key, buildJsonWalk(field)]); continue }
-    const { pg, js } = splitType(field)
-    const tt = temporalTarget(pg, js)
-    if (tt === 'ms') fns.push([key, (x) => (typeof x === 'string' ? isoEpoch(x) : x)])
-    else if (tt === 'date') fns.push([key, (x) => (typeof x === 'string' ? new Date(isoEpoch(x)) : x)])
-    else if (bigintField(pg, js)) fns.push([key, (x) => (typeof x === 'bigint' ? x : BigInt(x as string | number))])
-    else if (float4Target(pg, js) === 'precise') fns.push([key, (x) => (typeof x === 'number' ? Math.fround(x) : x)])
+  for (const [key, raw] of Object.entries(marker.spec)) {
+    const field = isTransformMarker(raw) ? raw.type : raw // Transform: fixup the base type, then apply the fn
+    const xf = isTransformMarker(raw) ? (raw.fn as (x: unknown) => unknown) : null
+    let base: ((x: unknown) => unknown) | null = null
+    if (isJsonMarker(field)) { if (specNeedsWalk(field.spec)) base = buildJsonWalk(field) }
+    else {
+      const { pg, js } = splitType(field)
+      const tt = temporalTarget(pg, js)
+      if (tt === 'ms') base = (x) => (typeof x === 'string' ? isoEpoch(x) : x)
+      else if (tt === 'date') base = (x) => (typeof x === 'string' ? new Date(isoEpoch(x)) : x)
+      else if (bigintField(pg, js)) base = (x) => (typeof x === 'bigint' ? x : BigInt(x as string | number))
+      else if (float4Target(pg, js) === 'precise') base = (x) => (typeof x === 'number' ? Math.fround(x) : x)
+    }
+    if (base && xf) fns.push([key, (x) => xf(base!(x))]) // fixup then transform; null is skipped by walkObj below
+    else if (xf) fns.push([key, xf])
+    else if (base) fns.push([key, base])
+  }
+  const walkObj = (o: Record<string, unknown>): Record<string, unknown> => {
+    for (const [k, f] of fns) { const val = o[k]; if (val != null) o[k] = f(val) }
+    return o
+  }
+  return marker.__json === 'array'
+    ? (arr) => { if (Array.isArray(arr)) for (const el of arr) if (el != null) walkObj(el as Record<string, unknown>); return arr }
+    : (o) => (o != null ? walkObj(o as Record<string, unknown>) : o)
+}
+
+/** Post-decode walk applying ONLY the Transform fns (base values already decoded by the JIT scanner or
+ *  JSON.parse). Recurses into nested json that has transforms; null passes through (fn never sees null). */
+export function buildJsonTransformWalk(marker: JsonMarker): (v: unknown) => unknown {
+  const fns: Array<[string, (x: unknown) => unknown]> = []
+  for (const [key, raw] of Object.entries(marker.spec)) {
+    if (isTransformMarker(raw)) fns.push([key, raw.fn as (x: unknown) => unknown])
+    else if (isJsonMarker(raw) && specHasTransform(raw.spec)) fns.push([key, buildJsonTransformWalk(raw)])
   }
   const walkObj = (o: Record<string, unknown>): Record<string, unknown> => {
     for (const [k, f] of fns) { const val = o[k]; if (val != null) o[k] = f(val) }
@@ -200,7 +242,7 @@ export function buildJsonWalk(marker: JsonMarker): (v: unknown) => unknown {
 
 // The order fields appear ON THE WIRE: declared order for json; (length, then bytewise on
 // UTF-8) for jsonb. Returns declared-indices in wire order. Stable for equal keys.
-function wireOrder(entries: [string, string | JsonMarker][], type: 'json' | 'jsonb'): number[] {
+function wireOrder(entries: [string, unknown][], type: 'json' | 'jsonb'): number[] { // only the keys matter
   const idx = entries.map((_, i) => i)
   if (type === 'json') return idx
   return idx.sort((a, b) => {
@@ -247,7 +289,8 @@ const SKIPOBJEND = `{ let _od = 1; while (jp < je) { const _oc = jb[jp]; if (_oc
 // multiple/nested markers can share one function scope. ----
 
 // Assign the value at the cursor into `target`, advancing jp. Nested markers recurse inline.
-function inlineValue(field: string | JsonMarker, target: string, type: 'json' | 'jsonb', ctx: { n: number }): string {
+function inlineValue(field: string | JsonMarker | TransformMarker, target: string, type: 'json' | 'jsonb', ctx: { n: number }): string {
+  if (isTransformMarker(field)) field = field.type // decode the base type; the fn runs post-decode via the transform walk
   if (isJsonMarker(field)) {
     if (!specHasPrecision(field.spec)) { // nested shape with no exact value -> JSON.parse its sub-slice
       const id = ctx.n++
@@ -318,7 +361,7 @@ function inlineArray(elemSpec: JsonSpec, type: 'json' | 'jsonb', target: string,
     + `${SKIPWS} const ${C} = jb[jp]; if (${C} === 44) { jp++; ${SKIPWS} continue } if (${C} === 93) { jp++; break } break; } } ${target} = ${A}; }`
 }
 
-export type JsonPlan = { fast: true } | { fast: false; inline: (target: string) => string }
+export type JsonPlan = ({ fast: true } | { fast: false; inline: (target: string) => string }) & { transformWalk?: (v: unknown) => unknown }
 
 /** Plan the top-level markers. Fast (no exact value needed) -> { fast: true } (JSON.parse at the call
  *  site). Otherwise -> { fast: false, inline } where `inline(v)` emits the positional scan code that
@@ -327,8 +370,9 @@ export type JsonPlan = { fast: true } | { fast: false; inline: (target: string) 
 export function genJsonParsers(markers: JsonMarker[]): { plan: Map<JsonMarker, JsonPlan> } {
   const plan = new Map<JsonMarker, JsonPlan>()
   for (const m of markers) {
-    if (!specHasPrecision(m.spec)) plan.set(m, { fast: true })
-    else plan.set(m, { fast: false, inline: (target: string) => inlineMarker(m, target, { n: 0 }) })
+    const transformWalk = specHasTransform(m.spec) ? buildJsonTransformWalk(m) : undefined
+    if (!specHasPrecision(m.spec)) plan.set(m, { fast: true, transformWalk })
+    else plan.set(m, { fast: false, inline: (target: string) => inlineMarker(m, target, { n: 0 }), transformWalk })
   }
   return { plan }
 }

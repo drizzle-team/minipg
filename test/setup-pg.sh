@@ -26,6 +26,7 @@ cat >> "$PGDATA/postgresql.conf" <<EOF
 ssl = on
 ssl_cert_file = 'server.crt'
 ssl_key_file = 'server.key'
+wal_level = logical
 EOF
 
 pg_ctl -D "$PGDATA" -o "-p $PGPORT -k $SOCK -c listen_addresses=127.0.0.1" -l "$PGDATA/server.log" -w start

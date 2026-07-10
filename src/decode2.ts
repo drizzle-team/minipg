@@ -19,9 +19,10 @@ export type Target = JsTarget | 'date' | 'ms'
 export interface CodegenCol {
   name: string; oid: number; js?: Target; json?: JsonMarker; format?: 'text' | 'binary'; array?: { elem: number; js?: Target }
   path?: readonly string[]        // Collect() nesting path (ancestor group keys); absent/[] = top level
+  groupNullable?: readonly boolean[] // per path segment: is that group a CollectNullable (auto-null) vs Collect (always object)?
   xform?: (v: unknown) => unknown  // Transform() decode-time fn (captured closure; runs on null too)
   xformId?: number                 // TransformMarker.id — for the mapper cache key only
-  nullable?: boolean               // Nullable() inside a Collect: excluded from the group's required-presence check
+  nullable?: boolean               // Nullable() inside a CollectNullable: excluded from the group's required-presence check
 }
 
 type AtDecoder = (b: Buffer, o: number, l: number) => unknown
@@ -237,7 +238,7 @@ function jsonPrep(cols: CodegenCol[]): { header: string; plan: Map<JsonMarker, J
   return { header: '', plan }
 }
 
-function columnLines(out: string[], col: CodegenCol, i: number, ind: string, helperCols: CodegenCol[], plan: Map<JsonMarker, JsonPlan>, custom: Set<number>): void {
+function columnLines(out: string[], col: CodegenCol, i: number, ind: string, helperCols: CodegenCol[], plan: Map<JsonMarker, JsonPlan>, custom: Set<number>, xforms: Array<(v: unknown) => unknown>): void {
   const v = `v${i}`
   if (col.format === 'binary') { // BINARY wire: direct fixed-width read (still length-prefixed; -1 = NULL)
     const bin = binarySnippet(col.oid, v, col.js)
@@ -254,6 +255,7 @@ function columnLines(out: string[], col: CodegenCol, i: number, ind: string, hel
     out.push(pl.fast
       ? `${ind}if (l !== -1) { ${v} = JSON.parse(${str('o', 'o + l')}); o += l }`
       : `${ind}if (l !== -1) { let jb = b, jp = o, je = o + l; ${pl.inline(v)} o += l }`)
+    if (pl.transformWalk) { const k = xforms.length; xforms.push(pl.transformWalk); out.push(`${ind}${v} = X[${k}](${v});`) } // json-field Transform: visit the decoded value
     return
   }
   const inl = (col.array || custom.has(col.oid)) ? null : inlineSnippet(col.oid, v, col.js) // array cols always route to the helper
@@ -275,11 +277,12 @@ function colVal(col: CodegenCol, i: number, xforms: Array<(v: unknown) => unknow
 /** Build a (possibly nested) object literal from ordered cols with `path` nesting (Collect groups). A group
  *  auto-nulls when any REQUIRED (non-nullable) leaf's RAW temp is null, or (all-Nullable groups) when EVERY field is null. The root never nulls. */
 function buildObjectLiteral(cols: CodegenCol[], xforms: Array<(v: unknown) => unknown>): string {
-  type Node = { leaves: Array<{ key: string; i: number; col: CodegenCol }>; groups: Array<{ key: string; node: Node }> }
-  const root: Node = { leaves: [], groups: [] }
+  type Node = { leaves: Array<{ key: string; i: number; col: CodegenCol }>; groups: Array<{ key: string; node: Node }>; nullable: boolean }
+  const root: Node = { leaves: [], groups: [], nullable: false }
   cols.forEach((c, i) => {
     let node = root
-    for (const seg of c.path ?? []) { let g = node.groups.find((x) => x.key === seg); if (!g) { g = { key: seg, node: { leaves: [], groups: [] } }; node.groups.push(g) } node = g.node }
+    const gn = c.groupNullable ?? []
+    ;(c.path ?? []).forEach((seg, depth) => { let g = node.groups.find((x) => x.key === seg); if (!g) { g = { key: seg, node: { leaves: [], groups: [], nullable: gn[depth] ?? false } }; node.groups.push(g) } node = g.node })
     node.leaves.push({ key: c.name, i, col: c })
   })
   function body(node: Node): string {
@@ -292,11 +295,12 @@ function buildObjectLiteral(cols: CodegenCol[], xforms: Array<(v: unknown) => un
     for (const g of node.groups) out.push(...allIdx(g.node))
     return out
   }
-  function group(node: Node): string { // a nested Collect group: guard on its required leaves' raw null
-    const req = node.leaves.filter((l) => !l.col.nullable)
+  function group(node: Node): string {
     const b = body(node)
+    if (!node.nullable) return b // Collect: ALWAYS an object (a LEFT-JOIN miss yields null fields, not a null group)
+    // CollectNullable: null the whole group on a miss — any required leaf null, or (all-Nullable) every field null
+    const req = node.leaves.filter((l) => !l.col.nullable)
     if (req.length) return `(${req.map((l) => `v${l.i} === null`).join(' || ')}) ? null : ${b}`
-    // all-Nullable group: still null when EVERY descendant column is null (LEFT-JOIN miss)
     const all = allIdx(node)
     return all.length ? `(${all.map((i) => `v${i} === null`).join(' && ')}) ? null : ${b}` : b
   }
@@ -321,7 +325,7 @@ export function rowBuilderSource(cols: CodegenCol[], mode: 'array' | 'object', c
   const xforms: Array<(v: unknown) => unknown> = []
   const { header, plan } = jsonPrep(cols)
   const lines = ['  let o = 2, l;']
-  for (let i = 0; i < cols.length; i++) columnLines(lines, cols[i]!, i, '  ', helperCols, plan, custom)
+  for (let i = 0; i < cols.length; i++) columnLines(lines, cols[i]!, i, '  ', helperCols, plan, custom, xforms)
   const ret = '  return ' + rowLiteral(cols, mode, xforms) + ';'
   return { source: `function row(b) {\n  "use strict";${header}\n${lines.join('\n')}\n${ret}\n}`, helperCols, xforms }
 }
@@ -331,7 +335,7 @@ export function resultSetSource(cols: CodegenCol[], mode: 'array' | 'object', cu
   const xforms: Array<(v: unknown) => unknown> = []
   const { header, plan } = jsonPrep(cols)
   const decode: string[] = []
-  for (let i = 0; i < cols.length; i++) columnLines(decode, cols[i]!, i, '    ', helperCols, plan, custom)
+  for (let i = 0; i < cols.length; i++) columnLines(decode, cols[i]!, i, '    ', helperCols, plan, custom, xforms)
   const assign = '    res[i] = ' + rowLiteral(cols, mode, xforms) + ';'
   const source = [
     'function rows(arr) {',

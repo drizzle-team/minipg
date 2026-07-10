@@ -98,22 +98,23 @@ export type ShapeOf<K extends string> = { [P in K]: TypeSpec | JsonMarker | Coll
  *  Nullable() marks a Collect field non-required. Emitted in DFS pre-order = the SELECT's wire column order. */
 export function shapeCols(spec: ShapeSpec): CodegenCol[] {
   const out: CodegenCol[] = []
-  const walk = (s: ShapeSpec, path: readonly string[]): void => {
+  // gn[k] = is the k-th path group a CollectNullable (auto-null on a LEFT-JOIN miss) vs a plain Collect (always an object)?
+  const walk = (s: ShapeSpec, path: readonly string[], gn: readonly boolean[]): void => {
     for (const [name, t] of Object.entries(s)) {
-      if (isCollectMarker(t)) { walk(t.spec, [...path, name]); continue } // group -> recurse, extend the path (no col of its own)
+      if (isCollectMarker(t)) { walk(t.spec, [...path, name], [...gn, t.nullable]); continue } // group -> recurse, extend path + group-null flags
       let m: TypeSpec | JsonMarker | TransformMarker | NullableMarker = t
       let nullable = false
       if (isNullableMarker(m)) { nullable = true; m = m.inner } // unwrap Nullable(...)
       let xform: ((v: unknown) => unknown) | undefined, xformId: number | undefined
       if (isTransformMarker(m)) { xform = m.fn as (v: unknown) => unknown; xformId = m.id; m = m.type } // unwrap Transform(type, fn)
       const col = resolveLeaf(name, m as TypeSpec | JsonMarker) // m is a plain type or a Json marker now
-      if (path.length) col.path = [...path]
+      if (path.length) { col.path = [...path]; col.groupNullable = [...gn] }
       if (nullable) col.nullable = true
       if (xform) { col.xform = xform; col.xformId = xformId }
       out.push(col)
     }
   }
-  walk(spec, [])
+  walk(spec, [], [])
   return out
 }
 
