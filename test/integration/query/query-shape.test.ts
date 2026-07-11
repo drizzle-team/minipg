@@ -2,8 +2,8 @@
 // Shape() mapper), using the SAME cached jit/interpreted mapper as any query. Runs under both decode
 // variants (MINIPG_VARIANT) so the interpreted and jit shape mappers are validated against real PG.
 import { test, expect, describe, afterEach } from 'bun:test'
-import { Shape, Json, JsonArray, type ShapeSpec } from '../../src/index.ts'
-import { testConnect } from '../helpers/db.ts'
+import { Shape, Json, JsonArray, type ShapeSpec } from '../../../src/index.ts'
+import { testConnect } from '../../helpers/db.ts'
 
 let open: Array<Awaited<ReturnType<typeof testConnect>>> = []
 afterEach(async () => { for (const c of open) await c.end().catch(() => {}); open = [] })

@@ -3,9 +3,9 @@
 // Isolation: public.t is READ-ONLY; all writes/DDL go to CONNECTION-SCOPED TEMP tables
 // or objects prefixed "qp_". Every connection/pool is ended.
 import { test, expect, describe } from 'bun:test'
-import { testConnect, withConn, caught, PgError, REMOTE } from '../helpers/db.ts'
-import { W, Parser } from '../../src/protocol.ts'
-import { encodeParam } from '../../src/codec.ts'
+import { testConnect, withConn, caught, PgError, REMOTE } from '../../helpers/db.ts'
+import { W, Parser } from '../../../src/protocol.ts'
+import { encodeParam } from '../../../src/codec.ts'
 
 // Extract the sequence of frontend message-type bytes from a buffer the driver
 // wrote to the socket (each msg = 1 type byte + Int32 length covering len+payload).
@@ -529,7 +529,7 @@ describe('out-of-scope guards', () => {
   })
 
   test('there is no simple-query API surface exported', async () => {
-    const api = await import('../../src/index.ts')
+    const api = await import('../../../src/index.ts')
     const bag = api as unknown as Record<string, unknown>
     expect(bag.simple).toBeUndefined()
     expect(bag.simpleQuery).toBeUndefined()

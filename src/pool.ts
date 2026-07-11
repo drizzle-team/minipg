@@ -323,6 +323,13 @@ export class PoolQuery implements PromiseLike<QueryResult<never>> {
   private promise?: Promise<QueryResult<never>>
   constructor(private pool: Pool, private sql: string, private params: unknown[], private opts: QueryOptions) {}
 
+  /** Inspect WITHOUT executing: the statement exactly as it will be sent (side-effect-free — the
+   *  query stays lazy). Preview a set with `queries.map(q => q.toSQL())`; note pool.batch()
+   *  additionally wraps the set in BEGIN … COMMIT on one connection. */
+  toSQL(): { sql: string; params: unknown[]; options: QueryOptions } {
+    return { sql: this.sql, params: this.params, options: this.opts }
+  }
+
   /** Run now (acquire → run → release), returning the Promise. Idempotent — the same Promise every call. */
   execute(): Promise<QueryResult<never>> {
     return (this.promise ??= (async () => {

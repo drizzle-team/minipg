@@ -483,6 +483,7 @@ export function compileParamPlan(oids: readonly number[]): ParamsEncoder | null 
 export type BindEncoder = (w: Writer, params: readonly unknown[]) => void
 const JIT_FAST = new Set([16, 21, 23, 20, 701, 1114, 1184]) // OIDs inlined straight-line (exact binEncoderFor replicas)
 const JIT_MAX_PERIOD = 64 // cap on the ROW WIDTH (repeating period), not total params — an N-row VALUES chunk still qualifies
+let bindSeq = 0 // numbers the //# sourceURL virtual filenames of compiled bind encoders
 
 // Smallest p | n with oids[i] === oids[i-p] for all i>=p — the row width of a repeating plan. So ONE compiled
 // row body serves a 1-row insert AND an N-row VALUES chunk of the same columns (looped n/p times), instead of
@@ -538,6 +539,8 @@ export function compileBindEncoder(name: string, oids: readonly number[], result
     ? `for (let r = 0; r < ${rowCount}; r++) { const vb = r * ${p}, fb = base + ${FMT0} + r * ${p * 2}; ${body} }`
     : `{ const vb = 0, fb = base + ${FMT0}; ${body} }` // single row (or zero): no loop overhead
   const src = `w.start("B"); const base = w.mark(); w.bytes(PREFIX); ${loop} w.bytes(RESULTFMT); w.end(); w.bytes(EXECSYNC);`
+  // sourceURL names this encoder in stack traces (see mapperSrcName in decode2.ts for the pattern)
+  const srcName = `minipg-bind-${++bindSeq}.${name.replace(/[^\w-]+/g, '').slice(0, 40) || 'unnamed'}.p${p}.js`
   return new Function('PREFIX', 'RESULTFMT', 'EXECSYNC', 'enc', 'C', 'PG_EPOCH_MS', 'MS_SAFE', 'I64_MIN', 'I64_MAX', 'NUL_MSG',
-    `return (w, v) => { ${src} }`)(PREFIX, RESULTFMT, EXECSYNC, encodeValueInto, C, PG_EPOCH_MS, MS_SAFE, I64_MIN, I64_MAX, NUL_MSG) as BindEncoder
+    `return (w, v) => { ${src} }\n//# sourceURL=${srcName}`)(PREFIX, RESULTFMT, EXECSYNC, encodeValueInto, C, PG_EPOCH_MS, MS_SAFE, I64_MIN, I64_MAX, NUL_MSG) as BindEncoder
 }

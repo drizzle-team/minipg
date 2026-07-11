@@ -2,7 +2,7 @@
 // JS-target override, or a Json()/Jsonb() marker) into the driver's column plan (CodegenCol[]). Kept
 // separate from shape.ts so the connection can resolve a `{ shape }` query option WITHOUT pulling in the
 // whole-result-set codegen used by the standalone Shape() helper. No node deps (imports only json/types).
-import { isJsonMarker, isCollectMarker, isTransformMarker, isNullableMarker, splitType, type JsonMarker, type CollectMarker, type TransformMarker, type NullableMarker } from './json.ts'
+import { isJsonMarker, isCollectMarker, isTransformMarker, isNullableMarker, splitType, validateJsonSpec, type JsonMarker, type CollectMarker, type TransformMarker, type NullableMarker } from './json.ts'
 import { BINARY_FAST, type CodegenCol } from './decode2.ts'
 import { EXT_VECTOR, EXT_GEOMETRY, EXT_HALFVEC, EXT_SPARSEVEC, EXT_BOX2D, EXT_BOX3D } from './geo.ts'
 
@@ -120,7 +120,7 @@ export function shapeCols(spec: ShapeSpec): CodegenCol[] {
 
 /** Resolve a single non-nesting leaf (a scalar/array TypeSpec or a Json marker) to a CodegenCol. */
 function resolveLeaf(name: string, t: TypeSpec | JsonMarker): CodegenCol {
-  if (isJsonMarker(t)) return { name, oid: t.type === 'jsonb' ? 3802 : 114, json: t }
+  if (isJsonMarker(t)) { validateJsonSpec(t.spec); return { name, oid: t.type === 'jsonb' ? 3802 : 114, json: t } }
   // 'unknown': type not known upfront — oid 0 is the DEFER sentinel; the real OID comes from
   // RowDescription (or the cached fields on prepared reuse) and the column decodes like a
   // plain query column (default decoder catalog, TEXT wire format).

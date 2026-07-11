@@ -5,10 +5,10 @@
 // Requires a running cluster: `bun run test:setup`. public.t is READ-ONLY.
 import { test, expect, describe, beforeAll, afterAll } from 'bun:test'
 import { createHash, randomBytes } from 'node:crypto'
-import { testConnect, caught, PgError, TEST_TIMEOUT } from '../helpers/db.ts'
-import { defaultDecoders } from '../../src/index.ts'
-import { buildDecoders } from '../../src/codec.ts'
-import type { Connection } from '../../src/index.ts'
+import { testConnect, caught, PgError, TEST_TIMEOUT } from '../../helpers/db.ts'
+import { defaultDecoders } from '../../../src/index.ts'
+import { buildDecoders } from '../../../src/codec.ts'
+import type { Connection } from '../../../src/index.ts'
 
 // --- tiny accessors honoring noUncheckedIndexedAccess ---------------------
 const aCell = (r: { rows: unknown[] }, i = 0, j = 0): unknown => (r.rows[i] as unknown[])[j]

@@ -2,10 +2,10 @@
 // mappers (decode:'jit' and decode:'interpreted') and asserted equal + against the expected nested rows.
 // Uses VALUES-with-casts (no tables) to produce columns in a fixed wire order incl. NULLs (LEFT-JOIN miss).
 import { test, expect, describe, beforeAll, afterAll } from 'bun:test'
-import { testConnect, caught } from '../helpers/db.ts'
-import { Collect, CollectNullable, Transform, Nullable, Json } from '../../src/index.ts'
-import type { Connection } from '../../src/index.ts'
-import type { ShapeSpec } from '../../src/spec.ts'
+import { testConnect, caught } from '../../helpers/db.ts'
+import { Collect, CollectNullable, Transform, Nullable, Json } from '../../../src/index.ts'
+import type { Connection } from '../../../src/index.ts'
+import type { ShapeSpec } from '../../../src/spec.ts'
 
 let jit: Connection, interp: Connection
 beforeAll(async () => { jit = await testConnect({ decode: 'jit' }); interp = await testConnect({ decode: 'interpreted' }) })

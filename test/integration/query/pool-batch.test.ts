@@ -1,7 +1,7 @@
 // Domain: "pool lazy query API" — pool.query() is a lazy thenable, pool.execute() is eager, and
 // pool.batch() runs a set pipelined (one connection) or concurrently (fan-out). Read-only SELECTs.
 import { test, expect, describe } from 'bun:test'
-import { testPool, caught, PgError } from '../helpers/db.ts'
+import { testPool, caught, PgError } from '../../helpers/db.ts'
 
 const cell = (r: { rows: unknown[] }, k: string) => (r.rows[0] as Record<string, unknown>)[k]
 
@@ -15,6 +15,17 @@ describe('pool.query is lazy; pool.execute is eager', () => {
       expect(cell(r, 'n')).toBe(1)
       expect(pool.size).toBe(1)            // one connection opened by the await
       expect(await q).toBe(r)              // memoized: awaiting again runs it once (same result object)
+    } finally { await pool.end() }
+  })
+
+  test('toSQL() previews a lazy query without executing it', async () => {
+    const pool = testPool()
+    try {
+      const q = pool.query('select $1::int4 as n', [7], { mode: 'object' })
+      expect(q.toSQL()).toEqual({ sql: 'select $1::int4 as n', params: [7], options: { mode: 'object' } })
+      expect(pool.size).toBe(0) // still lazy — toSQL() had no side effects
+      const r = await q
+      expect(cell(r, 'n')).toBe(7) // and the query still runs normally afterwards
     } finally { await pool.end() }
   })
 

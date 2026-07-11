@@ -1,7 +1,7 @@
 // Regression tests pinning the bug fixes found during test planning.
 // Requires a running cluster: `bun run test:setup`.
 import { test, expect, describe } from 'bun:test'
-import { testConnect, testPool, caught, PgError, REMOTE } from '../helpers/db.ts'
+import { testConnect, testPool, caught, PgError, REMOTE } from '../../helpers/db.ts'
 
 describe('settlement / liveness invariants', () => {
   test('a decoder throw rejects the query instead of crashing, and the connection recovers', async () => {

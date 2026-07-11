@@ -5,9 +5,9 @@
 // Requires a running cluster: `bun run test:setup`. public.t is READ-ONLY;
 // all writes/DDL go through CONNECTION-SCOPED TEMP tables.
 import { test, expect, describe, beforeAll, afterAll } from 'bun:test'
-import { testConnect, withConn } from '../helpers/db.ts'
-import type { Connection } from '../../src/index.ts'
-import { PgError } from '../helpers/db.ts'
+import { testConnect, withConn } from '../../helpers/db.ts'
+import type { Connection } from '../../../src/index.ts'
+import { PgError } from '../../helpers/db.ts'
 
 // Shared read-only connection for the SELECT-only groups.
 let c: Connection

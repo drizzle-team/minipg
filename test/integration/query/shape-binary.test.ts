@@ -4,10 +4,10 @@
 // numeric/money (no binary decoder), json/jsonb (the scanner needs the JSON text), and `:string` targets
 // on non-int8 types (binary yields the decoded value, never the PG text). Runs under both decode variants.
 import { test, expect, describe } from 'bun:test'
-import { shapeCols } from '../../src/spec.ts'
-import { BINARY_FAST } from '../../src/decode2.ts'
-import { Json, type ShapeSpec } from '../../src/index.ts'
-import { withConn } from '../helpers/db.ts'
+import { shapeCols } from '../../../src/spec.ts'
+import { BINARY_FAST } from '../../../src/decode2.ts'
+import { Json, type ShapeSpec } from '../../../src/index.ts'
+import { withConn } from '../../helpers/db.ts'
 
 const fmtOf = (spec: ShapeSpec) => Object.fromEntries(shapeCols(spec).map((c) => [c.name, c.format ?? 'text']))
 

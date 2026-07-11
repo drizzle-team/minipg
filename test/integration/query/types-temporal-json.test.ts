@@ -6,9 +6,9 @@
 // json(114)/jsonb(3802) decode via JSON.parse; params encode object/array via a
 // single JSON.stringify, Date via toISOString().
 import { test, expect, describe, beforeAll, afterAll } from 'bun:test'
-import { testConnect, testPool, withConn, caught, PgError } from '../helpers/db.ts'
-import { encodeParam, buildDecoders, decoderFor, defaultDecoders } from '../../src/codec.ts'
-import type { Connection } from '../../src/index.ts'
+import { testConnect, testPool, withConn, caught, PgError } from '../../helpers/db.ts'
+import { encodeParam, buildDecoders, decoderFor, defaultDecoders } from '../../../src/codec.ts'
+import type { Connection } from '../../../src/index.ts'
 
 // ---------- helpers ----------
 const cell = (r: { rows: unknown[] }): unknown => (r.rows[0] as unknown[])[0]

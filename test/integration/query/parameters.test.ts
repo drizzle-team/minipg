@@ -4,8 +4,8 @@
 // and Bind ships encodeParam()'d values in order. These tests pin that contract.
 // Requires a running cluster (see test/helpers/db.ts). public.t is READ-ONLY.
 import { test, expect, describe } from 'bun:test'
-import { testConnect, caught, PgError } from '../helpers/db.ts'
-import { encodeParam } from '../../src/codec.ts'
+import { testConnect, caught, PgError } from '../../helpers/db.ts'
+import { encodeParam } from '../../../src/codec.ts'
 
 // ---- helpers for strict TS (noUncheckedIndexedAccess) ----
 const NUL = String.fromCharCode(0) // an actual 0x00 byte (source stays printable)
@@ -617,7 +617,7 @@ describe('caller-data integrity & bulk binding', () => {
 
 describe('public API surface (out-of-scope guard)', () => {
   test('only positional $N binding is offered - there is no sql`` template tag / sql() helper', async () => {
-    const mod = await import('../../src/index.ts')
+    const mod = await import('../../../src/index.ts')
     expect('sql' in mod).toBe(false)
     expect(typeof (mod as { sql?: unknown }).sql).toBe('undefined')
   })

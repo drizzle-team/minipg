@@ -2,10 +2,10 @@
 // JSON.parse), then the Transform fn visits the decoded value; 'unknown' passes the parsed value through as-is;
 // a NULL field skips the fn (null passes through). Run through BOTH mappers (jit + interpreted) and asserted equal.
 import { test, expect, describe, beforeAll, afterAll } from 'bun:test'
-import { testConnect } from '../helpers/db.ts'
-import { Json, JsonArray, Jsonb, Transform } from '../../src/index.ts'
-import type { Connection } from '../../src/index.ts'
-import type { ShapeSpec } from '../../src/spec.ts'
+import { testConnect } from '../../helpers/db.ts'
+import { Json, JsonArray, Jsonb, Transform } from '../../../src/index.ts'
+import type { Connection } from '../../../src/index.ts'
+import type { ShapeSpec } from '../../../src/spec.ts'
 
 let jit: Connection, interp: Connection
 beforeAll(async () => { jit = await testConnect({ decode: 'jit' }); interp = await testConnect({ decode: 'interpreted' }) })

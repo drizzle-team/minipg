@@ -353,13 +353,26 @@ export function resultSetSource(cols: CodegenCol[], mode: 'array' | 'object', cu
   return { source, helperCols, xforms }
 }
 
+// Virtual filename for each compiled mapper: with `//# sourceURL=` appended to the evaluated
+// text, runtime stack traces name THIS mapper (minipg-mapper-3.object.id_name.js:7:120) instead
+// of the opaque new Function eval site. The generated code itself is on fn.source /
+// result.debug.mapperSource / MINIPG_CODEGEN_DEBUG=1 (virtual line = source line + 3: the
+// Function constructor prepends its 2-line wrapper plus the `return (` line).
+let mapperSeq = 0
+function mapperSrcName(cols: CodegenCol[], mode: string): string {
+  const names = cols.map((c) => c.name).join('_').replace(/[^\w-]+/g, '').slice(0, 40) || 'cols'
+  return `minipg-mapper-${++mapperSeq}.${mode}.${names}.js`
+}
+
 /** Compile a cached, monomorphic single-row builder (v2). */
 export function compileRow(cols: CodegenCol[], mode: 'array' | 'object', map: Map<number, Decoder>): RowBuilder {
   const { source, helperCols, xforms } = rowBuilderSource(cols, mode, customOidsOf(map))
   const helpers = helperCols.map((col) => helperForCol(col, map))
-  if (DEBUG) console.error(`\n[minipg decode2] ${mode} builder for (${cols.map((c) => c.name).join(', ')}):\n${source}\n`)
-  const fn = new Function('d', 'P', 'X', `return (${source})`)(helpers, POW10, xforms) as RowBuilder
+  const srcName = mapperSrcName(cols, mode)
+  if (DEBUG) console.error(`\n[minipg decode2] ${mode} builder ${srcName} for (${cols.map((c) => c.name).join(', ')}):\n${source}\n`)
+  const fn = new Function('d', 'P', 'X', `return (${source})\n//# sourceURL=${srcName}`)(helpers, POW10, xforms) as RowBuilder
   Object.defineProperty(fn, 'source', { value: source, enumerable: false })
+  Object.defineProperty(fn, 'sourceName', { value: srcName, enumerable: false })
   return fn
 }
 
@@ -369,8 +382,10 @@ export type ResultSetMapper = ((rows: Buffer[]) => unknown[]) & { source: string
 export function compileResultSet(cols: CodegenCol[], mode: 'array' | 'object', map: Map<number, Decoder>): ResultSetMapper {
   const { source, helperCols, xforms } = resultSetSource(cols, mode, customOidsOf(map))
   const helpers = helperCols.map((col) => helperForCol(col, map))
-  if (DEBUG) console.error(`\n[minipg decode2] ${mode} result-set mapper for (${cols.map((c) => c.name).join(', ')}):\n${source}\n`)
-  const fn = new Function('d', 'P', 'X', `return (${source})`)(helpers, POW10, xforms) as ResultSetMapper
+  const srcName = mapperSrcName(cols, mode)
+  if (DEBUG) console.error(`\n[minipg decode2] ${mode} result-set mapper ${srcName} for (${cols.map((c) => c.name).join(', ')}):\n${source}\n`)
+  const fn = new Function('d', 'P', 'X', `return (${source})\n//# sourceURL=${srcName}`)(helpers, POW10, xforms) as ResultSetMapper
   Object.defineProperty(fn, 'source', { value: source, enumerable: false })
+  Object.defineProperty(fn, 'sourceName', { value: srcName, enumerable: false })
   return fn
 }

@@ -10,10 +10,10 @@
 // (NOT a PG array/record literal). These tests assert that CURRENT baseline and
 // mark the roadmap rich-decoder / array-literal-encode features as test.todo.
 import { test, expect, describe, beforeAll, afterAll } from 'bun:test'
-import { testConnect, caught, PgError } from '../helpers/db.ts'
-import { buildDecoders, defaultDecoders } from '../../src/codec.ts'
-import { decoderFor } from '../../src/codec.ts'
-import type { Connection } from '../../src/index.ts'
+import { testConnect, caught, PgError } from '../../helpers/db.ts'
+import { buildDecoders, defaultDecoders } from '../../../src/codec.ts'
+import { decoderFor } from '../../../src/codec.ts'
+import type { Connection } from '../../../src/index.ts'
 
 // One shared connection that owns the pg_temp enum/composite/domain types.
 // pg_temp objects are connection-scoped and auto-dropped on disconnect, so we
@@ -570,7 +570,7 @@ describe('ALL-COMMON-TYPES round-trip matrix', () => {
 // ---------------------------------------------------------------------------
 describe('out-of-scope guards', () => {
   test('no sql template tag is exported — query(sql, params) only', async () => {
-    const mod = (await import('../../src/index.ts')) as Record<string, unknown>
+    const mod = (await import('../../../src/index.ts')) as Record<string, unknown>
     expect(mod.sql).toBeUndefined()
     expect(typeof mod.connect).toBe('function')
   })

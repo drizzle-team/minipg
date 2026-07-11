@@ -18,6 +18,15 @@
 //   bigint:string  -> exact string (explicit; needs the scanner)
 //   bigint:number  -> JS number — you assert it fits 2^53, so JSON.parse is safe (fast path)
 //
+// ARRAYS of scalars: "<pgtype>[]" declares a JSON array field (row_to_json of an int8[] column,
+// json_agg(id), …); the element :target rides after the [] like PG array columns:
+//   bigint[]        -> BigInt[] exact (scanner)     bigint[]:number -> number[] (fast path)
+//   numeric[]       -> exact string[] (scanner)     timestamptz[]   -> Date[] (scanner)
+//   int4[]/text[]/… -> number[]/string[] (fast path — JSON.parse is already exact for them)
+// 'json[]'/'unknown[]' are rejected at shape build ('unknown' covers arbitrary arrays); arrays of
+// OBJECTS are JsonArray({…}). NB the interpreted (no-eval) engine fixes arrays up after JSON.parse,
+// so like scalar fields its int8 exactness beyond 2^53 needs jsonBigints (jit scanner is exact always).
+//
 // ORDERING: the scanner is positional (skips key text, doesn't match it). `json` preserves
 // production order (row_to_json -> column order, json_build_object -> arg order) so we read
 // in DECLARED order; `jsonb` normalizes keys to (length, then bytewise) so for type:'jsonb'
@@ -31,8 +40,9 @@ export interface JsonMarker {
   readonly type: 'json' | 'jsonb'
   readonly spec: JsonSpec
 }
-/** A nested JSON shape: field name -> TypeSpec (PG alias, optionally `:number`/`:string`), a nested
- *  Json()/Jsonb()/array, or a Transform(type, fn) applied to the decoded field value. */
+/** A nested JSON shape: field name -> TypeSpec (PG alias, optionally `:number`/`:string`; `'pg[]'`
+ *  for a JSON array of scalars), a nested Json()/Jsonb()/JsonArray, or a Transform(type, fn)
+ *  applied to the decoded field value. */
 export type JsonSpec = Record<string, TypeSpec | JsonMarker | TransformMarker>
 /** A json field's base type, unwrapping Transform(type, fn) to `type` (the fn is applied after decode). */
 const jsonBase = (f: TypeSpec | JsonMarker | TransformMarker): TypeSpec | JsonMarker => (isTransformMarker(f) ? f.type : f)
@@ -145,17 +155,37 @@ export function float4Target(pg: string, js?: JsTarget): 'precise' | 'pretty' | 
   return js === 'precise' ? 'precise' : 'pretty' // bare / :pretty -> pretty
 }
 
+// 'int8[]' / 'bigint[]:number' / 'timestamptz[]' etc. declare a JSON ARRAY of scalars: strip the
+// trailing [] (recursively — 'int8[][]' is a nested array) to get the ELEMENT type the scalar
+// rules apply to. The element :target rides after the [] (same convention as PG array columns).
+const arrayCore = (pg: string): string => { let c = pg; while (c.endsWith('[]')) c = c.slice(0, -2); return c }
+
 /** True if anywhere in the shape there's a field whose exact value JSON.parse can't produce
- *  (a precision type left as string). A `:number` override opts out — Number is JSON.parse-safe. */
+ *  (a precision type left as string). A `:number` override opts out — Number is JSON.parse-safe.
+ *  Array fields ('bigint[]') are judged by their ELEMENT type. */
 export function specHasPrecision(spec: JsonSpec): boolean {
   for (const raw of Object.values(spec)) {
     const v = jsonBase(raw) // Transform doesn't force the scanner; its base type decides
     if (isJsonMarker(v)) { if (specHasPrecision(v.spec)) return true; continue }
     const { pg, js } = splitType(v)
-    if (temporalTarget(pg, js)) return true // temporal (default Date, or :date/:ms) needs the positional scanner
-    if (PRECISION.has(pg.toLowerCase().trim()) && js !== 'number') return true
+    const core = arrayCore(pg)
+    if (temporalTarget(core, js)) return true // temporal (default Date, or :date/:ms) needs the positional scanner
+    if (PRECISION.has(core.toLowerCase().trim()) && js !== 'number') return true
   }
   return false
+}
+
+/** Reject Json() field specs that would silently mis-decode: arrays of arbitrary-JSON elements
+ *  ('json[]'/'jsonb[]'/'unknown[]') have no scalar element read. Called at shape-build time. */
+export function validateJsonSpec(spec: JsonSpec): void {
+  for (const [key, raw] of Object.entries(spec)) {
+    const v = jsonBase(raw)
+    if (isJsonMarker(v)) { validateJsonSpec(v.spec); continue }
+    const { pg } = splitType(v)
+    if (pg.endsWith('[]') && RAWJSON.has(arrayCore(pg).toLowerCase().trim())) {
+      throw new Error(`minipg: Json() field ${JSON.stringify(key)}: ${JSON.stringify(pg)} isn't supported inside a json shape — use 'unknown' for an arbitrary JSON array, or JsonArray({…}) for an array of shaped objects`)
+    }
+  }
 }
 
 /** True if the shape has any Transform field (anywhere) — the decoded value must be visited by its fn. */
@@ -168,14 +198,15 @@ export function specHasTransform(spec: JsonSpec): boolean {
 }
 
 /** True if the shape has any field the interpreted (no-eval) path must fix up after JSON.parse — a
- *  :ms/:date temporal (ISO string -> Date/number) or an int8/bigint (number/string -> BigInt). Only
- *  shapes that answer true need the post-parse walk below. */
+ *  :ms/:date temporal (ISO string -> Date/number) or an int8/bigint (number/string -> BigInt), scalar
+ *  or array element. Only shapes that answer true need the post-parse walk below. */
 export function specNeedsWalk(spec: JsonSpec): boolean {
   for (const raw of Object.values(spec)) {
     if (isTransformMarker(raw)) return true // the interpreted walk applies the transform fn after JSON.parse
     if (isJsonMarker(raw)) { if (specNeedsWalk(raw.spec)) return true; continue }
     const { pg, js } = splitType(raw)
-    if (temporalTarget(pg, js) || bigintField(pg, js) || float4Target(pg, js) === 'precise') return true
+    const core = arrayCore(pg)
+    if (temporalTarget(core, js) || bigintField(core, js) || float4Target(core, js) === 'precise') return true
   }
   return false
 }
@@ -196,20 +227,26 @@ function isoEpoch(s: string): number {
  *  precision, so BigInt(that) is a BigInt of the ROUNDED value — exact only with jsonBigints preserving it
  *  as a string. Access is by key, so jsonb's sorted wire order is irrelevant. */
 export function buildJsonWalk(marker: JsonMarker): (v: unknown) => unknown {
+  // Fixup for one scalar (or, via recursion, one array level): 'int8[]' maps the fixer over elements.
+  const fixFor = (pg: string, js?: JsTarget): ((x: unknown) => unknown) | null => {
+    if (pg.endsWith('[]')) {
+      const el = fixFor(pg.slice(0, -2), js)
+      return el ? (x) => (Array.isArray(x) ? x.map((e) => (e == null ? e : el(e))) : x) : null
+    }
+    const tt = temporalTarget(pg, js)
+    if (tt === 'ms') return (x) => (typeof x === 'string' ? isoEpoch(x) : x)
+    if (tt === 'date') return (x) => (typeof x === 'string' ? new Date(isoEpoch(x)) : x)
+    if (bigintField(pg, js)) return (x) => (typeof x === 'bigint' ? x : BigInt(x as string | number))
+    if (float4Target(pg, js) === 'precise') return (x) => (typeof x === 'number' ? Math.fround(x) : x)
+    return null
+  }
   const fns: Array<[string, (x: unknown) => unknown]> = []
   for (const [key, raw] of Object.entries(marker.spec)) {
     const field = isTransformMarker(raw) ? raw.type : raw // Transform: fixup the base type, then apply the fn
     const xf = isTransformMarker(raw) ? (raw.fn as (x: unknown) => unknown) : null
     let base: ((x: unknown) => unknown) | null = null
     if (isJsonMarker(field)) { if (specNeedsWalk(field.spec)) base = buildJsonWalk(field) }
-    else {
-      const { pg, js } = splitType(field)
-      const tt = temporalTarget(pg, js)
-      if (tt === 'ms') base = (x) => (typeof x === 'string' ? isoEpoch(x) : x)
-      else if (tt === 'date') base = (x) => (typeof x === 'string' ? new Date(isoEpoch(x)) : x)
-      else if (bigintField(pg, js)) base = (x) => (typeof x === 'bigint' ? x : BigInt(x as string | number))
-      else if (float4Target(pg, js) === 'precise') base = (x) => (typeof x === 'number' ? Math.fround(x) : x)
-    }
+    else { const { pg, js } = splitType(field); base = fixFor(pg, js) }
     if (base && xf) fns.push([key, (x) => xf(base!(x))]) // fixup then transform; null is skipped by walkObj below
     else if (xf) fns.push([key, xf])
     else if (base) fns.push([key, base])
@@ -299,6 +336,13 @@ function inlineValue(field: string | JsonMarker | TransformMarker, target: strin
     return inlineMarker(field, target, ctx) // recurse into the scanned object/array
   }
   const { pg, js } = splitType(field)
+  if (pg.endsWith('[]')) { // JSON array of scalars: '[' el (',' el)* ']'; each element re-enters inlineValue
+    const elemField = pg.slice(0, -2) + (js ? `:${js}` : '')
+    const id = ctx.n++, A = `_ja${id}`, EL = `_jel${id}`, C = `_jac${id}`
+    return `${SKIPWS} if (jb[jp] === 110) { ${target} = null; jp += 4 } else { jp++; const ${A} = []; ${SKIPWS} `
+      + `if (jb[jp] === 93) { jp++ } else { while (jp < je) { let ${EL} = null; ${SKIPWS} ${inlineValue(elemField, EL, type, ctx)}; ${A}.push(${EL}); `
+      + `${SKIPWS} const ${C} = jb[jp]; if (${C} === 44) { jp++; continue } if (${C} === 93) { jp++; break } break } } ${target} = ${A}; }`
+  }
   const tt = temporalTarget(pg, js)
   if (tt) return inlineEpoch(target, tt, ctx)
   if (bigintField(pg, js)) return `if (jb[jp] === 110) { ${target} = null; jp += 4 } else ${rdBigInt(target)}`

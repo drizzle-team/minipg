@@ -3,9 +3,9 @@
 // precision semantics (int8[]->BigInt, numeric[]->exact STRING, timestamptz[]->Date, bytea[]->Buffer). The
 // SQL executes on real Postgres, so this is a live round-trip. Needs a cluster (test:setup) or MINIPG_TEST_URL.
 import { test, expect, describe, beforeAll, afterAll } from 'bun:test'
-import { testConnect } from '../helpers/db.ts'
-import type { Connection } from '../../src/index.ts'
-import type { TypeSpec } from '../../src/spec.ts'
+import { testConnect } from '../../helpers/db.ts'
+import type { Connection } from '../../../src/index.ts'
+import type { TypeSpec } from '../../../src/spec.ts'
 
 let jit: Connection, interp: Connection
 beforeAll(async () => { jit = await testConnect({ decode: 'jit' }); interp = await testConnect({ decode: 'interpreted' }) })
