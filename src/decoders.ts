@@ -8,6 +8,7 @@ import { decoderFor, defaultDecoders, arrayDecoderFor } from './codec.ts'
 import { ASCII_SAFE, INSTANT_OIDS, INT_OIDS, defaultJs, type CodegenCol, type Target } from './decode2.ts'
 import { specNeedsWalk, buildJsonWalk } from './json.ts'
 import { extAt } from './geo.ts'
+import { ARRAY_OID } from './spec.ts'
 
 /** Decode a cell in place from (buffer, offset, length) — no per-cell subarray. */
 export type CellDecoder = (b: Buffer, o: number, l: number) => unknown
@@ -143,4 +144,76 @@ export function pickDecoder(col: CodegenCol, map: Map<number, Decoder>): CellDec
   const ext = extAt(col); if (ext) return ext // point / pgvector / PostGIS shape columns (custom override handled above)
   if (col.array) { const dec = arrayDecoderFor(col.oid, col.array.js); return (b, o, l) => dec(b.subarray(o, o + l)) } // '{…}' text -> JS array (same as the JIT helper)
   return pickText(col.oid, col.js) ?? wrap(decoderFor(col.oid, map))
+}
+
+// ---- Logical-replication BINARY tuples (`repl.start({ binary: true })`) --------------------------------
+// With pgoutput's `binary 'true'` the publisher sends every column whose type has a send function in
+// BINARY — the driver must decode it or fail loudly (there's no per-column opt-out). Coverage below =
+// pickBinary's set + numeric (exact string), json/jsonb (the map's json decoder, so jsonBigints applies;
+// jsonb strips its 1-byte version), and arrays (array_recv wire format -> a real JS array — richer than
+// text mode's raw '{…}' string, documented on the option). Unsupported oid -> null; the caller errors
+// with table.column when a binary value actually arrives for it.
+const ELEM_OF: Record<number, number> = {}
+for (const [elem, arr] of Object.entries(ARRAY_OID)) ELEM_OF[arr] = Number(elem)
+
+// numeric binary: u16 ndigits, i16 weight (base-10000 exponent of digits[0]), u16 sign, u16 dscale,
+// then ndigits × u16 base-10000 groups. Rendered to the EXACT text PG would emit (same digits, dscale).
+const binNumericStr: CellDecoder = (b, o) => {
+  const nd = b.readUInt16BE(o), weight = b.readInt16BE(o + 2), sign = b.readUInt16BE(o + 4), dscale = b.readUInt16BE(o + 6)
+  if (sign === 0xc000) return 'NaN'
+  if (sign === 0xd000) return 'Infinity'
+  if (sign === 0xf000) return '-Infinity'
+  let s = sign === 0x4000 ? '-' : ''
+  if (weight < 0 || nd === 0) s += '0'
+  else for (let i = 0; i <= weight; i++) { const d = i < nd ? b.readUInt16BE(o + 8 + i * 2) : 0; s += i === 0 ? String(d) : String(d).padStart(4, '0') }
+  if (dscale > 0) {
+    let frac = ''
+    for (let g = 0; frac.length < dscale; g++) {
+      const i = weight + 1 + g
+      frac += i >= 0 && i < nd ? String(b.readUInt16BE(o + 8 + i * 2)).padStart(4, '0') : '0000'
+    }
+    s += '.' + frac.slice(0, dscale)
+  }
+  return s
+}
+
+// array_recv: i32 ndim, i32 hasnull, i32 elemOid, ndim × (i32 len, i32 lbound), then row-major cells
+// (i32 len | -1 null, bytes). Nested per dims.
+const binArrayWith = (elem: CellDecoder): CellDecoder => (b, o) => {
+  const ndim = b.readInt32BE(o)
+  if (ndim === 0) return []
+  let p = o + 12
+  const dims: number[] = new Array(ndim)
+  for (let d = 0; d < ndim; d++) { dims[d] = b.readInt32BE(p); p += 8 }
+  const read = (dim: number): unknown[] => {
+    const n = dims[dim]!, out: unknown[] = new Array(n)
+    for (let i = 0; i < n; i++) {
+      if (dim + 1 < ndim) { out[i] = read(dim + 1); continue }
+      const len = b.readInt32BE(p); p += 4
+      if (len === -1) out[i] = null
+      else { out[i] = elem(b, p, len); p += len }
+    }
+    return out
+  }
+  return read(0)
+}
+
+/** Binary-tuple decoder for a replication column, or null when the type has no binary read
+ *  (or a config.types text override claims the oid — binary bytes can't honor it). */
+export function replBinaryFor(oid: number, map: Map<number, Decoder>): CellDecoder | null {
+  if (map !== defaultDecoders) { const d = map.get(oid); if (d && d !== defaultDecoders.get(oid)) return null }
+  if (oid === 1700) return binNumericStr
+  if (oid === 114) { const d = decoderFor(oid, map); return (b, o, l) => d(b.subarray(o, o + l)) }
+  if (oid === 3802) { const d = decoderFor(oid, map); return (b, o, l) => d(b.subarray(o + 1, o + l)) } // jsonb: version byte
+  const elemOid = ELEM_OF[oid]
+  if (elemOid !== undefined) { const elem = replBinaryFor(elemOid, map); return elem ? binArrayWith(elem) : null }
+  try { return pickBinary(oid) } catch { return null }
+}
+
+/** True when this oid's BINARY decode yields the IDENTICAL JS value as text mode — the gate for
+ *  auto-enabling binary replication. float4 (binary = exact f32 vs text = canonical shortest) and
+ *  arrays (JS array vs raw '{…}' literal) are binary-capable but value-DIVERGENT -> false. */
+export function replBinaryMatchesText(oid: number, map: Map<number, Decoder>): boolean {
+  if (oid === 700 || ELEM_OF[oid] !== undefined) return false
+  return replBinaryFor(oid, map) !== null
 }

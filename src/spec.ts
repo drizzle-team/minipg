@@ -21,7 +21,7 @@ const TYPE_OID = {
 export type PgType = keyof typeof TYPE_OID
 
 // scalar OID -> its array-type OID (pg_type.typarray), for `params: ['int8[]']` & bulkInsert casts
-const ARRAY_OID: Record<number, number> = {
+export const ARRAY_OID: Record<number, number> = {
   16: 1000, 21: 1005, 23: 1007, 26: 1028, 20: 1016, 700: 1021, 701: 1022, 1700: 1231, 790: 791,
   25: 1009, 1043: 1015, 1042: 1014, 18: 1002, 19: 1003, 114: 199, 3802: 3807, 17: 1001, 2950: 2951,
   1082: 1182, 1083: 1183, 1114: 1115, 1184: 1185, 1186: 1187,

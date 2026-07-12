@@ -15,7 +15,8 @@ import { md5Password, scram, type Scram } from './auth.ts'
 import { PgError, parseErrorFields } from './errors.ts'
 import { getDefaultTransport, type NormalizedConfig } from './connection.ts'
 import { resolveUrl } from './url.ts'
-import { buildDecoders, decoderFor } from './codec.ts'
+import { buildDecoders } from './codec.ts'
+import { pickDecoder, replBinaryFor, replBinaryMatchesText, type CellDecoder } from './decoders.ts'
 import type { ConnectConfig, Decoder } from './types.ts'
 
 const PG_EPOCH_US = 946684800000000n // 2000-01-01T00:00:00Z in µs
@@ -50,6 +51,16 @@ export interface StartOptions {
   messages?: boolean
   /** Standby-status heartbeat interval, ms (default 10_000). */
   statusIntervalMs?: number
+  /** BINARY tuple values (PG14+ pgoutput option). Default 'auto': enabled only when the server is
+   *  14+ AND a pre-start catalog probe shows every column of the published tables decodes to the
+   *  IDENTICAL JS value in binary and text — so auto can never change what your consumer sees.
+   *  (float4 and array columns are binary-capable but value-divergent — float4 binary is the exact
+   *  f32, arrays become real JS arrays instead of raw '{…}' text — so their presence keeps auto on
+   *  text.) `true` forces binary: fixed-width decode, exact numeric strings, JS arrays; a type with
+   *  no binary decoder (e.g. interval) then errors loudly naming table.column. `false` = text.
+   *  Caveat under 'auto'/'true': DDL AFTER the stream starts isn't re-probed — a new column of an
+   *  undecodable type errors on its first binary value. */
+  binary?: boolean | 'auto'
   /** When idle with nothing unacked, advance the flushed LSN to the server's keepalive
    *  position so an idle slot doesn't retain WAL forever (default true). */
   idleAck?: boolean
@@ -63,7 +74,7 @@ export async function replication(config: string | ReplicationConfig = {}): Prom
   return c
 }
 
-interface RelEntry { info: ReplicationRelation; decoders: (Decoder | null)[] }
+interface RelEntry { info: ReplicationRelation; decoders: CellDecoder[]; bin: (CellDecoder | null)[] | null }
 
 export class ReplicationConnection {
   private cfg: NormalizedConfig
@@ -79,6 +90,8 @@ export class ReplicationConnection {
   private lastReceived = 0n
   private flushed = 0n
   private lastDeliveredEnd = 0n // highest commit endLsn handed to the consumer (guards idleAck)
+  private binaryMode = false    // resolved binary decision for the active start() stream
+  private serverMajor = 0       // from the server_version ParameterStatus at startup
 
   constructor(config: ReplicationConfig = {}) {
     const rc = resolveUrl(config)
@@ -147,10 +160,16 @@ export class ReplicationConnection {
     const w = this.wake; this.wake = null; w?.()
   }
   private fail(e: Error): void { this.err ??= e; const w = this.wake; this.wake = null; w?.() }
+  private param(b: Buffer): void { // ParameterStatus: name\0value\0 — we only care about the version
+    let z = 0; while (b[z] !== 0) z++
+    if (b.toString('latin1', 0, z) !== 'server_version') return
+    let e = z + 1; while (b[e] !== 0) e++
+    this.serverMajor = parseInt(b.toString('latin1', z + 1, e), 10) || 0
+  }
   private async next(): Promise<RawMessage> {
     for (;;) {
       const m = this.q.shift()
-      if (m) { if (m.type === 'S' || m.type === 'K' || m.type === 'N' || m.type === 'A') continue; return m }
+      if (m) { if (m.type === 'S') { this.param(m.body); continue } if (m.type === 'K' || m.type === 'N' || m.type === 'A') continue; return m }
       if (this.err) throw this.err
       await new Promise<void>((r) => { this.wake = r })
     }
@@ -211,10 +230,26 @@ export class ReplicationConnection {
   /** START_REPLICATION: an async stream of decoded pgoutput events (proto v1 + messages).
    *  Tuple values decode via the driver's text decoder catalog (config.types honored).
    *  At-least-once: unacked events replay after a reconnect — dedupe by commit LSN. */
+  /** Whether the ACTIVE start() stream negotiated binary tuples (resolved 'auto' included). */
+  get binaryTuples(): boolean { return this.binaryMode }
+
   async *start(opts: StartOptions): AsyncGenerator<ReplicationEvent> {
     const from = opts.from !== undefined ? toLsn(opts.from) : 0n
     const pubs = opts.publications.map((p) => `"${p.replace(/"/g, '""')}"`).join(',')
-    const sql = `START_REPLICATION SLOT ${opts.slot} LOGICAL ${lsnToString(from)} (proto_version '1', publication_names '${pubs}'${opts.messages === false ? '' : ", messages 'true'"})`
+    const want = opts.binary ?? 'auto'
+    let bin = want === true
+    if (want === 'auto' && this.serverMajor >= 14) {
+      const lits = opts.publications.map((p) => `'${p.replace(/'/g, "''")}'`).join(',')
+      const probe = await this.command(
+        'select distinct a.atttypid from pg_publication_tables pt'
+        + ' join pg_namespace n on n.nspname = pt.schemaname'
+        + ' join pg_class c on c.relnamespace = n.oid and c.relname = pt.tablename'
+        + ' join pg_attribute a on a.attrelid = c.oid and a.attnum > 0 and not a.attisdropped'
+        + ` where pt.pubname in (${lits})`)
+      bin = probe.rows.length > 0 && probe.rows.every((r) => replBinaryMatchesText(Number(r[0]), this.decoders))
+    }
+    this.binaryMode = bin
+    const sql = `START_REPLICATION SLOT ${opts.slot} LOGICAL ${lsnToString(from)} (proto_version '1', publication_names '${pubs}'${opts.messages === false ? '' : ", messages 'true'"}${bin ? ", binary 'true'" : ''})`
     this.frame('Q', Buffer.from(sql + '\0', 'utf8'))
     for (;;) {
       const m = await this.next()
@@ -277,16 +312,22 @@ export class ReplicationConnection {
         const k = b[off]!; off += 1
         if (k === 0x6e) row[name] = null                                  // 'n' NULL
         else if (k === 0x75) unchanged.push(name)                         // 'u' unchanged TOAST — absent, NOT null
-        else { // 't' text
+        else {
           const len = b.readInt32BE(off); off += 4
-          const bytes = b.subarray(off, off + len); off += len
-          const dec = rel.decoders[i]
-          row[name] = dec ? dec(bytes) : bytes.toString('utf8')
+          if (k === 0x62) { // 'b' binary (start({ binary: true }))
+            const bd = rel.bin?.[i]
+            if (!bd) throw new Error(`minipg: binary tuple value for ${rel.info.schema}.${rel.info.table}.${name} (oid ${col?.oid}) has no binary decoder — start() without binary:true, or override config.types for this type`)
+            row[name] = bd(b, off, len)
+          } else { // 't' text
+            const dec = rel.decoders[i]
+            row[name] = dec ? dec(b, off, len) : b.toString('utf8', off, off + len)
+          }
+          off += len
         }
       }
       return { row, unchanged }
     }
-    const rel = (id: number): RelEntry => this.relations.get(id) ?? { info: { schema: '?', table: `?${id}`, replicaIdentity: 'd', columns: [] }, decoders: [] }
+    const rel = (id: number): RelEntry => this.relations.get(id) ?? { info: { schema: '?', table: `?${id}`, replicaIdentity: 'd', columns: [] }, decoders: [], bin: null }
     switch (tag) {
       case 'B': return { kind: 'begin', finalLsn: lsnToString(b.readBigUInt64BE(1)), commitTime: ts(b.readBigUInt64BE(9) ), xid: b.readInt32BE(17) }
       case 'C': return { kind: 'commit', lsn: lsnToString(b.readBigUInt64BE(2)), endLsn: lsnToString(b.readBigUInt64BE(10)), commitTime: ts(b.readBigUInt64BE(18)) }
@@ -298,7 +339,13 @@ export class ReplicationConnection {
         const columns: ReplicationRelation['columns'] = []
         for (let i = 0; i < n; i++) { const key = b[off]! === 1; off += 1; const cname = cstr(); const oid = b.readInt32BE(off); off += 8; columns.push({ name: cname, oid, key }) }
         const info: ReplicationRelation = { schema, table, replicaIdentity, columns }
-        this.relations.set(id, { info, decoders: columns.map((c) => decoderFor(c.oid, this.decoders)) })
+        // per-column decoders via pickDecoder = the SAME defaults as plain query() columns
+        // (int8 -> BigInt, temporal -> Date, config.types overrides, jsonBigints for json)
+        this.relations.set(id, {
+          info,
+          decoders: columns.map((c) => pickDecoder({ name: c.name, oid: c.oid }, this.decoders)),
+          bin: this.binaryMode ? columns.map((c) => replBinaryFor(c.oid, this.decoders)) : null,
+        })
         return { kind: 'relation', relation: info }
       }
       case 'I': { const r = rel(b.readInt32BE(off)); off += 5; const t = tuple(r); return { kind: 'insert', schema: r.info.schema, table: r.info.table, new: t.row } }

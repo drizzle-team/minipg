@@ -159,6 +159,97 @@ describe('replication()', () => {
       }
     })
   }, TEST_TIMEOUT)
+
+  test('tuple decode matches query() defaults: int8 -> BigInt, timestamptz -> Date, numeric -> exact string', async () => {
+    await withConn(async (c) => {
+      await c.query(`create table ${K}_d(id int8 primary key, at timestamptz, price numeric, tags int4[])`)
+      await c.query(`create publication ${K}_dpub for table ${K}_d`)
+      try {
+        const repl = await replication(TEST_CONFIG)
+        try {
+          const slot = await repl.createSlot(`${K}_dslot`, { temporary: true })
+          await c.query(`insert into ${K}_d values (9007199254740993, '2026-01-02T03:04:05.678Z', 10.50, array[1,2,3])`)
+          const events = await collectUntil(
+            repl.start({ slot: slot.slot, publications: [`${K}_dpub`] }),
+            (es) => es.some((e) => e.kind === 'commit'))
+          const ins = events.find((e) => e.kind === 'insert') as Extract<ReplicationEvent, { kind: 'insert' }>
+          expect(ins.new.id).toBe(9007199254740993n)                     // BigInt, exact (was a string before)
+          expect(ins.new.at).toBeInstanceOf(Date)
+          expect((ins.new.at as Date).getTime()).toBe(Date.UTC(2026, 0, 2, 3, 4, 5, 678))
+          expect(ins.new.price).toBe('10.50')                            // exact string, like query()
+          expect(ins.new.tags).toBe('{1,2,3}')                           // text mode: raw literal, like a plain query
+        } finally { repl.end() }
+      } finally {
+        await c.query(`drop publication ${K}_dpub`)
+        await c.query(`drop table ${K}_d`)
+      }
+    })
+  }, TEST_TIMEOUT)
+
+  test("binary 'auto' (default): engages on value-safe tables, stays text when float4/arrays present", async () => {
+    await withConn(async (c) => {
+      await c.query(`create table ${K}_a1(id int8 primary key, price numeric, name text)`)          // all value-safe
+      await c.query(`create table ${K}_a2(id int8 primary key, ns int4[])`)                          // array -> divergent
+      await c.query(`create publication ${K}_a1pub for table ${K}_a1`)
+      await c.query(`create publication ${K}_a2pub for table ${K}_a2`)
+      try {
+        for (const [pub, tbl, expectBinary] of [[`${K}_a1pub`, `${K}_a1`, true], [`${K}_a2pub`, `${K}_a2`, false]] as const) {
+          const repl = await replication(TEST_CONFIG)
+          try {
+            const slot = await repl.createSlot(`${tbl}_slot`, { temporary: true })
+            await c.query(tbl.endsWith('a1') ? `insert into ${tbl} values (1, 10.50, 'x')` : `insert into ${tbl} values (1, array[1,2])`)
+            const events = await collectUntil(
+              repl.start({ slot: slot.slot, publications: [pub] }), // binary unset -> 'auto'
+              (es) => es.some((e) => e.kind === 'commit'))
+            expect(repl.binaryTuples).toBe(expectBinary)
+            const ins = events.find((e) => e.kind === 'insert') as Extract<ReplicationEvent, { kind: 'insert' }>
+            expect(ins.new.id).toBe(1n) // identical values either way — that's the auto contract
+            if (!expectBinary) expect(ins.new.ns).toBe('{1,2}') // text mode kept the raw literal
+            else expect(ins.new.price).toBe('10.50')
+          } finally { repl.end() }
+        }
+      } finally {
+        await c.query(`drop publication ${K}_a1pub`); await c.query(`drop publication ${K}_a2pub`)
+        await c.query(`drop table ${K}_a1, ${K}_a2`)
+      }
+    })
+  }, TEST_TIMEOUT)
+
+  test('binary tuples: start({ binary: true }) — fixed-width decode, exact numeric, JS arrays', async () => {
+    await withConn(async (c) => {
+      await c.query(`create table ${K}_b(id int8 primary key, price numeric, u uuid, name text, ok bool, at timestamptz, ns int4[], meta jsonb, raw bytea)`)
+      await c.query(`create publication ${K}_bpub for table ${K}_b`)
+      try {
+        const repl = await replication(TEST_CONFIG)
+        try {
+          const slot = await repl.createSlot(`${K}_bslot`, { temporary: true })
+          await c.query(
+            `insert into ${K}_b values (9007199254740993, 10.50, 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', 'café 😀', true, '2026-01-02T03:04:05.678Z', array[1,null,3], '{"a":1}', '\\xdeadbeef')`)
+          await c.query(`insert into ${K}_b values (2, -0.00012, null, null, false, null, array[]::int4[], null, null)`)
+          await c.query(`insert into ${K}_b values (3, 'NaN', null, null, false, null, null, null, null)`)
+          const events = await collectUntil(
+            repl.start({ slot: slot.slot, publications: [`${K}_bpub`], binary: true }),
+            (es) => es.filter((e) => e.kind === 'commit').length >= 3)
+          const ins = events.filter((e) => e.kind === 'insert') as Extract<ReplicationEvent, { kind: 'insert' }>[]
+          expect(ins[0]!.new.id).toBe(9007199254740993n)
+          expect(ins[0]!.new.price).toBe('10.50')                        // binary numeric -> exact text render
+          expect(ins[0]!.new.u).toBe('a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11')
+          expect(ins[0]!.new.name).toBe('café 😀')
+          expect(ins[0]!.new.ok).toBe(true)
+          expect((ins[0]!.new.at as Date).getTime()).toBe(Date.UTC(2026, 0, 2, 3, 4, 5, 678))
+          expect(ins[0]!.new.ns).toEqual([1, null, 3])                   // binary mode: REAL JS array
+          expect(ins[0]!.new.meta).toEqual({ a: 1 })
+          expect(ins[0]!.new.raw).toEqual(Buffer.from('deadbeef', 'hex'))
+          expect(ins[1]!.new.price).toBe('-0.00012')                     // small-fraction numeric (weight < 0)
+          expect(ins[1]!.new.ns).toEqual([])
+          expect(ins[2]!.new.price).toBe('NaN')
+        } finally { repl.end() }
+      } finally {
+        await c.query(`drop publication ${K}_bpub`)
+        await c.query(`drop table ${K}_b`)
+      }
+    })
+  }, TEST_TIMEOUT)
 })
 
 // keep the import used even if helpers change
