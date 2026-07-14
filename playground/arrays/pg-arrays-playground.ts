@@ -6,7 +6,7 @@
 // Run against any Postgres:  PGURL='postgres://…' bun playground/arrays/pg-arrays-playground.ts
 // Defaults to the local test cluster (bun run test:setup). Never hardcode credentials here.
 import { connect } from '../../src/index.ts'
-import { arrayLiteral } from '../../src/codec.ts'
+import { arrayLiteral } from '../../src/encode.ts'
 import pg from 'pg'
 
 const URL = process.env.PGURL || 'postgres://postgres:postgres@127.0.0.1:54329/testdb'

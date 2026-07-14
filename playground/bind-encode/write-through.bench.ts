@@ -3,7 +3,7 @@
 //   bun playground/bind-encode/write-through.bench.ts
 import { run, bench, group, summary, do_not_optimize } from 'mitata'
 import { Writer } from '../../src/protocol.ts'
-import { arrayLiteral, arrayLiteralInto, copyRowsText } from '../../src/codec.ts'
+import { arrayLiteral, arrayLiteralInto, copyRowsText } from '../../src/encode.ts'
 
 // ---- old string-building references (pre-refactor) ----
 const escCopyText = (s: string) => s.replace(/\\/g, '\\\\').replace(/\t/g, '\\t').replace(/\n/g, '\\n').replace(/\r/g, '\\r')

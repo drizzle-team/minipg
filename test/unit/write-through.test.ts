@@ -4,7 +4,7 @@
 import { test, expect, describe } from 'bun:test'
 import fc from 'fast-check'
 import { Writer } from '../../src/protocol.ts'
-import { arrayLiteral, arrayLiteralInto, encodeValueInto, copyRowsText } from '../../src/codec.ts'
+import { arrayLiteral, arrayLiteralInto, encodeValueInto, copyRowsText } from '../../src/encode.ts'
 
 describe('arrayLiteralInto(w) == w.lpStr(arrayLiteral(arr))', () => {
   const into = (arr: unknown[]) => { const w = new Writer(1 << 16); arrayLiteralInto(w, arr); return Buffer.from(w.slice()) }

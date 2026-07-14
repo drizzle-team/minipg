@@ -5,7 +5,7 @@
 import { test, expect, describe } from 'bun:test'
 import { testConnect, withConn, caught, PgError, REMOTE } from '../../helpers/db.ts'
 import { W, Parser } from '../../../src/protocol.ts'
-import { encodeParam } from '../../../src/codec.ts'
+import { encodeParam } from '../../../src/encode.ts'
 
 // Extract the sequence of frontend message-type bytes from a buffer the driver
 // wrote to the socket (each msg = 1 type byte + Int32 length covering len+payload).

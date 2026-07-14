@@ -1,13 +1,14 @@
 // Domain: types-temporal-json
 // Pins minipg's decode/encode behavior for temporal (date/time/timetz/timestamp/
 // timestamptz/interval) and JSON (json/jsonb/jsonb[]) types. Grounded in
-// src/codec.ts: temporal types have no entry in defaultDecoders so they fall back
+// src/encode.ts: temporal types have no entry in defaultDecoders so they fall back
 // to asString (verbatim UTF-8 passthrough — sidesteps the TZ-shift bug class);
 // json(114)/jsonb(3802) decode via JSON.parse; params encode object/array via a
 // single JSON.stringify, Date via toISOString().
 import { test, expect, describe, beforeAll, afterAll } from 'bun:test'
 import { testConnect, testPool, withConn, caught, PgError } from '../../helpers/db.ts'
-import { encodeParam, buildDecoders, decoderFor, defaultDecoders } from '../../../src/codec.ts'
+import { encodeParam } from '../../../src/encode.ts'
+import { buildDecoders, decoderFor, defaultDecoders } from '../../../src/decode.ts'
 import type { Connection } from '../../../src/index.ts'
 
 // ---------- helpers ----------
@@ -246,7 +247,7 @@ describe('temporal param round-trips (Date / strings)', () => {
 })
 
 // ============================================================================
-describe('temporal param encoding (unit, codec.ts)', () => {
+describe('temporal param encoding (unit, encode.ts)', () => {
   test('encodeParam(Date) yields text-format ISO bytes', () => {
     const e = encodeParam(new Date('2020-06-01T13:45:00.000Z'))
     expect(e.format).toBe(0)

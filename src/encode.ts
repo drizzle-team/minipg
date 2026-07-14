@@ -1,75 +1,9 @@
-// Text-format value decoders for the parsed ('array'/'object') result modes, and
-// the param encoder for Bind. Deliberately minimal and precision-safe: int8 and
-// numeric default to STRING (the #1 silent-corruption footgun in pg & postgres.js),
-// and timestamps stay strings (Date conversion is lossy). Everything is overridable.
-import type { Decoder } from './types.ts'
+// ENCODE — everything that turns JS values into wire bytes: write-through param encoding
+// (text + binary plans from cached ParameterDescription OIDs), the JIT Bind encoder, COPY
+// FROM row encoding (text + binary), and the PG array-literal writers. The decode direction
+// lives in decode.ts; ELEM_OID (array OID -> element OID) is shared from there.
 import { Writer, W, type ParamsEncoder } from './protocol.ts' // protocol.ts only type-imports from here -> no runtime cycle
-import { parseJsonBuffer } from './jsonparse.ts'
-
-const asString: Decoder = (b) => b.toString('utf8')
-const asNumber: Decoder = (b) => Number(b.toString('utf8'))
-const asBool: Decoder = (b) => b[0] === 0x74 // 't'
-const asJson: Decoder = (b) => JSON.parse(b.toString('utf8'))
-const asBytea: Decoder = (b) => {
-  const s = b.toString('utf8')
-  return s.startsWith('\\x') ? Buffer.from(s.slice(2), 'hex') : Buffer.from(s, 'utf8')
-}
-
-/** OID -> decoder. Anything not listed (int8=20, numeric=1700, timestamps, arrays,
- *  uuid, ...) falls back to a UTF-8 string. */
-export const defaultDecoders = new Map<number, Decoder>([
-  [16, asBool],    // bool
-  [17, asBytea],   // bytea
-  [21, asNumber],  // int2
-  [23, asNumber],  // int4
-  [26, asNumber],  // oid
-  [700, asNumber], // float4
-  [701, asNumber], // float8
-  [114, asJson],   // json
-  [3802, asJson],  // jsonb
-])
-
-export type JsonBigints = 'number' | 'string' | 'bigint'
-
-// Native JSON source-text reviver (ctx.source): recent V8 (Node 21+) and Bun. Preserves
-// oversized integers by value (order-independent, so it works for jsonb too).
-export const jsonSourceSupported: boolean = (() => {
-  try { let ok = false; JSON.parse('{"x":1}', function (_k: string, v: unknown, ctx?: { source?: string }) { if (ctx && typeof ctx.source === 'string') ok = true; return v } as never); return ok } catch { return false }
-})()
-function bigintReviver(as: 'string' | 'bigint') {
-  return (_k: string, v: unknown, ctx?: { source?: string }) =>
-    typeof v === 'number' && Number.isInteger(v) && !Number.isSafeInteger(v) && ctx && typeof ctx.source === 'string' && /^-?\d+$/.test(ctx.source)
-      ? (as === 'bigint' ? BigInt(ctx.source) : ctx.source) : v
-}
-
-/** The json/jsonb decoder for a given jsonBigints mode. 'number' = plain native JSON.parse.
- *  'string'/'bigint' are HYBRID: a cheap byte pre-scan (mayHaveBigInt) detects whether a value
- *  could contain an integer > 2^53. The common case (none) takes the native JSON.parse fast
- *  path; only flagged values pay the slow exact path (source-text reviver, or the pure-JS
- *  buffer parser when ctx.source is unavailable). Order-independent (covers jsonb). Only whole
- *  integers are preserved; high-precision *decimals* still need a declared Json({x:'numeric'}). */
-export function jsonDecoder(mode: JsonBigints): Decoder {
-  if (mode === 'number') return asJson
-  // Detect a possible bigint (>=16 consecutive digits) with a native regex on the string we
-  // build for JSON.parse anyway — cheaper than a JS byte loop, and the slow path reuses the
-  // string. Never a false negative (correctness holds); false positives only take the slow path.
-  const BIG = /[0-9]{16}/ // no /g — stateless .test, safe to reuse
-  if (jsonSourceSupported) {
-    const rev = bigintReviver(mode)
-    return (b) => { const s = b.toString('utf8'); return BIG.test(s) ? JSON.parse(s, rev as never) : JSON.parse(s) }
-  }
-  return (b) => { const s = b.toString('utf8'); return BIG.test(s) ? parseJsonBuffer(b, 0, b.length, mode) : JSON.parse(s) }
-}
-
-export function buildDecoders(overrides?: Record<number, Decoder>, jsonBigints: JsonBigints = 'number'): Map<number, Decoder> {
-  if (!overrides && jsonBigints === 'number') return defaultDecoders
-  const m = new Map(defaultDecoders)
-  if (jsonBigints !== 'number') { const d = jsonDecoder(jsonBigints); m.set(114, d); m.set(3802, d) }
-  if (overrides) for (const [oid, fn] of Object.entries(overrides)) m.set(Number(oid), fn)
-  return m
-}
-
-export const decoderFor = (oid: number, map: Map<number, Decoder>): Decoder => map.get(oid) ?? asString
+import { ELEM_OID } from './decode.ts'
 
 export interface EncodedParam {
   format: number // 0 = text, 1 = binary
@@ -136,14 +70,6 @@ const PG_EPOCH_MS = 946684800000 // 2000-01-01T00:00:00Z
 const MS_SAFE = 9007199254740    // |ms since PG epoch| below this, ms*1000 stays a safe integer
 const I64_MIN = -9223372036854775808n
 const I64_MAX = 9223372036854775807n
-
-// Array type OID -> element type OID (pg_type.typelem), the inverse of spec.ts's ARRAY_OID. Kept LOCAL to
-// avoid a codec<->spec runtime import cycle (spec -> decode2 -> codec); these are stable PG built-in OIDs.
-const ELEM_OID: Record<number, number> = {
-  1000: 16, 1005: 21, 1007: 23, 1028: 26, 1016: 20, 1021: 700, 1022: 701, 1231: 1700, 791: 790,
-  1009: 25, 1015: 1043, 1014: 1042, 1002: 18, 1003: 19, 199: 114, 3807: 3802, 1001: 17, 2951: 2950,
-  1182: 1082, 1183: 1083, 1115: 1114, 1185: 1184, 1187: 1186,
-}
 
 type BinEnc = (w: Writer, v: unknown) => number
 
@@ -373,94 +299,6 @@ export function arrayLiteralInto(w: Writer, arr: readonly unknown[]): void {
   w.patch32(lp, w.mark() - s)
 }
 
-// ---- OUTPUT array decode: parse a PG '{…}' text literal into a JS array (shape-gated) ----------------
-// The inverse of arrayLiteral. Element leaves reproduce the SCALAR text-decode DEFAULTS (int8->BigInt,
-// numeric->exact string, temporal->Date, bytea->Buffer) — NOT decoderFor(elemOid), which is asString for
-// those. Lives here (not decoders.ts) so BOTH mappers reach it without a codec<-decoders import cycle.
-type Leaf = (s: string) => unknown
-const strLeaf: Leaf = (s) => s
-const numLeaf: Leaf = (s) => Number(s)
-const bigIntLeaf: Leaf = (s) => BigInt(s)
-const boolLeaf: Leaf = (s) => s === 't'
-const jsonLeaf: Leaf = (s) => JSON.parse(s)
-const byteaLeaf: Leaf = (s) => (s.charCodeAt(0) === 92 && s.charCodeAt(1) === 120 ? Buffer.from(s.slice(2), 'hex') : Buffer.from(s, 'utf8')) // '\x' hex
-
-/** ms-since-epoch from a PG temporal text element — a STRING port of decoders.tsParse (same field parse,
- *  bare +00 offset, year<=99 fixup) so array Date values are bit-identical to the scalar timestamp path. */
-function parseInstantMs(s: string): number {
-  if (s === 'infinity' || s === '-infinity') return NaN // PG ±infinity has no JS Date -> Invalid Date (matches the binary scalar)
-  let e = s.length, bc = false
-  if (e >= 3 && s.charCodeAt(e - 1) === 67 && s.charCodeAt(e - 2) === 66 && s.charCodeAt(e - 3) === 32) { bc = true; e -= 3 } // strip a trailing ' BC'
-  let p = 0
-  let Y = 0; for (; p < e; p++) { const c = s.charCodeAt(p); if (c < 48 || c > 57) break; Y = Y * 10 + (c - 48) } p++
-  const Mo = (s.charCodeAt(p) - 48) * 10 + (s.charCodeAt(p + 1) - 48); p += 3
-  const D = (s.charCodeAt(p) - 48) * 10 + (s.charCodeAt(p + 1) - 48); p += 2
-  let H = 0, Mi = 0, S = 0, ms = 0, off = 0
-  if (p < e && s.charCodeAt(p) === 32) {
-    p++
-    H = (s.charCodeAt(p) - 48) * 10 + (s.charCodeAt(p + 1) - 48); p += 3
-    Mi = (s.charCodeAt(p) - 48) * 10 + (s.charCodeAt(p + 1) - 48); p += 3
-    S = (s.charCodeAt(p) - 48) * 10 + (s.charCodeAt(p + 1) - 48); p += 2
-    if (p < e && s.charCodeAt(p) === 46) { p++; let f = 0, k = 0; for (; p < e && k < 3; p++) { const c = s.charCodeAt(p); if (c < 48 || c > 57) break; f = f * 10 + (c - 48); k++ } while (k < 3) { f *= 10; k++ } ms = f; while (p < e) { const c = s.charCodeAt(p); if (c < 48 || c > 57) break; p++ } }
-    if (p < e && (s.charCodeAt(p) === 43 || s.charCodeAt(p) === 45)) { const sg = s.charCodeAt(p) === 45 ? -1 : 1; p++; const th = (s.charCodeAt(p) - 48) * 10 + (s.charCodeAt(p + 1) - 48); p += 2; let tm = 0; if (p < e && s.charCodeAt(p) === 58) { p++; tm = (s.charCodeAt(p) - 48) * 10 + (s.charCodeAt(p + 1) - 48); p += 2 } off = sg * (th * 60 + tm) * 60000 }
-  }
-  const year = bc ? 1 - Y : Y // PG 'N BC' -> proleptic/astronomical year 1-N (44 BC -> -43, 1 BC -> 0)
-  let ems = Date.UTC(year, Mo - 1, D, H, Mi, S, ms)
-  if (year >= 0 && year <= 99) { const d = new Date(ems); d.setUTCFullYear(year); ems = d.getTime() } // Date.UTC remaps 0-99 to 1900+
-  return ems - off
-}
-
-/** Element OID (+ optional element :target) -> leaf decoder, mirroring the scalar pickText/defaultJs defaults. */
-function elemLeafFor(elemOid: number, js?: string): Leaf {
-  switch (elemOid) {
-    case 16: return boolLeaf                                          // bool -> boolean
-    case 17: return byteaLeaf                                         // bytea -> Buffer
-    case 20: return js === 'number' ? numLeaf : js === 'string' ? strLeaf : bigIntLeaf // int8 -> BigInt (default)
-    case 21: case 23: case 26: case 700: case 701: return numLeaf     // int2/int4/oid/float4/float8 -> Number
-    case 1700: case 790: return js === 'number' ? numLeaf : strLeaf   // numeric/money -> exact STRING (default)
-    case 114: case 3802: return jsonLeaf                             // json/jsonb -> JSON.parse
-    case 1082: case 1114: case 1184: return js === 'ms' ? parseInstantMs : js === 'string' ? strLeaf : (s: string) => new Date(parseInstantMs(s)) // date/timestamp(tz) -> Date (default)
-    default: return strLeaf                                           // text/varchar/bpchar/char/name/uuid/time/interval
-  }
-}
-
-/** Parse a PG array text literal ('{…}') into a nested JS array (inverse of arrayLiteral). Honors nesting,
- *  empty {}, unquoted bare NULL -> null, quoted backslash-escaped elements, and a leading [lb:ub]= prefix. */
-export function parseArrayLiteral(decodeLeaf: Leaf): (text: string) => unknown[] {
-  return (text) => {
-    let i = 0
-    if (text[0] === '[') { const eq = text.indexOf('='); if (eq >= 0) i = eq + 1 } // skip [lb:ub]= dimension prefix
-    function arr(): unknown[] {
-      const out: unknown[] = []
-      i++ // consume '{'
-      while (i < text.length) {
-        const c = text[i]
-        if (c === '}') { i++; break }
-        if (c === ',') { i++; continue }
-        if (c === '{') { out.push(arr()); continue } // nesting
-        if (c === '"') { // quoted, backslash-escaped element
-          i++; let s = ''
-          while (i < text.length) { const ch = text[i]!; if (ch === '\\') { s += text[i + 1]; i += 2; continue } if (ch === '"') { i++; break } s += ch; i++ }
-          out.push(decodeLeaf(s)); continue // a quoted "NULL" is the literal string
-        }
-        let j = i // unquoted -> read to ',' or '}'; a bare NULL is SQL null
-        while (j < text.length && text[j] !== ',' && text[j] !== '}') j++
-        const raw = text.slice(i, j); i = j
-        out.push(raw === 'NULL' ? null : decodeLeaf(raw))
-      }
-      return out
-    }
-    return arr()
-  }
-}
-
-/** Whole-value Decoder for an array column: '{…}' text -> JS array, elements decoded per the element OID. */
-export function arrayDecoderFor(arrayOid: number, js?: string): Decoder {
-  const elem = ELEM_OID[arrayOid]
-  const parse = parseArrayLiteral(elem === undefined ? strLeaf : elemLeafFor(elem, js))
-  return (b) => parse(b.toString('utf8'))
-}
-
 /** Compile the per-statement param plan from cached ParameterDescription OIDs. Returns null when
  *  no param has a binary encoder (pure-text statement — callers keep the plain path). */
 export function compileParamPlan(oids: readonly number[]): ParamsEncoder | null {
@@ -539,7 +377,7 @@ export function compileBindEncoder(name: string, oids: readonly number[], result
     ? `for (let r = 0; r < ${rowCount}; r++) { const vb = r * ${p}, fb = base + ${FMT0} + r * ${p * 2}; ${body} }`
     : `{ const vb = 0, fb = base + ${FMT0}; ${body} }` // single row (or zero): no loop overhead
   const src = `w.start("B"); const base = w.mark(); w.bytes(PREFIX); ${loop} w.bytes(RESULTFMT); w.end(); w.bytes(EXECSYNC);`
-  // sourceURL names this encoder in stack traces (see mapperSrcName in decode2.ts for the pattern)
+  // sourceURL names this encoder in stack traces (see mapperSrcName in decode.ts for the pattern)
   const srcName = `minipg-bind-${++bindSeq}.${name.replace(/[^\w-]+/g, '').slice(0, 40) || 'unnamed'}.p${p}.js`
   return new Function('PREFIX', 'RESULTFMT', 'EXECSYNC', 'enc', 'C', 'PG_EPOCH_MS', 'MS_SAFE', 'I64_MIN', 'I64_MAX', 'NUL_MSG',
     `return (w, v) => { ${src} }\n//# sourceURL=${srcName}`)(PREFIX, RESULTFMT, EXECSYNC, encodeValueInto, C, PG_EPOCH_MS, MS_SAFE, I64_MIN, I64_MAX, NUL_MSG) as BindEncoder

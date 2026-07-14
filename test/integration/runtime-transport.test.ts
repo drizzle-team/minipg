@@ -7,7 +7,7 @@ import { test, expect, describe, afterEach } from 'bun:test'
 import net from 'node:net'
 import { Duplex } from 'node:stream'
 import { connect } from '../../src/index.ts'
-import type { CodegenCol } from '../../src/decode2.ts'
+import type { CodegenCol } from '../../src/decode.ts'
 
 const CFG = { host: '127.0.0.1', port: 54329, user: 'postgres', password: 'postgres', database: 'testdb' }
 let open: Array<Awaited<ReturnType<typeof connect>>> = []

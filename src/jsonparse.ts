@@ -10,7 +10,7 @@
 // Only *integers* are preserved (matching the source-reviver path); high-precision decimals
 // still round to f64. Strings with escapes fall back to JSON.parse on the (small) quoted
 // slice; escape-free strings and all structure are decoded directly from bytes.
-import type { JsonBigints } from './codec.ts'
+import type { JsonBigints } from './decode.ts'
 
 // 2^53-1 (max safe integer) has 16 digits; any integer that overflows f64 is >= 16 digits.
 const MAX_SAFE_DIGITS = 16

@@ -3,9 +3,9 @@
 // in a DataRow, and decoded by the codegen binary path — asserting the round-trip. (The live server
 // agrees: test/integration/binary-golden.test.ts requests binary from real PG and decodes the same way.)
 import { test, expect, describe } from 'bun:test'
-import { compileRow } from '../../src/decode2.ts'
-import type { CodegenCol } from '../../src/decode2.ts'
-import { buildDecoders } from '../../src/codec.ts'
+import { compileRow } from '../../src/decode.ts'
+import type { CodegenCol } from '../../src/decode.ts'
+import { buildDecoders } from '../../src/decode.ts'
 import * as wire from '../helpers/wire.ts'
 
 const map = buildDecoders()

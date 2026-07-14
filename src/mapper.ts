@@ -2,11 +2,11 @@
 // decoder map. The ONLY difference between the two implementations is how the buffer→POJO mapping is
 // assembled — the JIT path compiles a monomorphic per-shape function (new Function, needs eval), the
 // interpreted path resolves a per-column CellDecoder[] and loops (no eval). Both call the SAME decode
-// strategies (JIT inlines them; interpreted picks them from the catalog in ./decoders.ts), so they
+// strategies (JIT inlines them; interpreted picks them from the catalog in ./decode.ts), so they
 // produce identical rows. `decode:'auto'` uses JIT where eval is available, else interpreted.
 import type { Decoder } from './types.ts'
-import { compileRow, type CodegenCol } from './decode2.ts'
-import { pickDecoder } from './decoders.ts'
+import { compileRow, type CodegenCol } from './decode.ts'
+import { pickDecoder } from './decode.ts'
 
 export type RowMapper = (body: Buffer) => unknown
 export type RowMapperFactory = (cols: CodegenCol[], mode: 'array' | 'object', map: Map<number, Decoder>) => RowMapper

@@ -1,10 +1,10 @@
-// Write-through Bind encoding (protocol.ts Writer lp* primitives + writeBindWith, codec.ts
+// Write-through Bind encoding (protocol.ts Writer lp* primitives + writeBindWith, encode.ts
 // encodeValueInto + compileParamPlan). The core invariant: the write-through TEXT path emits
 // byte-identical wire bytes to the legacy encodeParam + writeBind chain.
 import { test, expect, describe } from 'bun:test'
 import fc from 'fast-check'
 import { Writer, writeBind, writeBindWith, writeParse, parseParameterDescription } from '../../src/protocol.ts'
-import { encodeParam, encodeValueInto, compileParamPlan } from '../../src/codec.ts'
+import { encodeParam, encodeValueInto, compileParamPlan } from '../../src/encode.ts'
 
 const legacyBytes = (params: unknown[], resultFormat: number | number[] = 0): Buffer => {
   const w = new Writer()

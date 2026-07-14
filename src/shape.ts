@@ -13,8 +13,8 @@
 //   })
 //   user.$printMapper()              // prints the generated decoder
 //   const rows = user(dataRowBodies) // decode an array of DataRow bodies -> rows[]
-import { compileResultSet, type CodegenCol } from './decode2.ts'
-import { buildDecoders } from './codec.ts'
+import { compileResultSet, type CodegenCol } from './decode.ts'
+import { buildDecoders } from './decode.ts'
 import { shapeCols, type ShapeSpec, type ShapeOf } from './spec.ts'
 
 export type { ShapeSpec }

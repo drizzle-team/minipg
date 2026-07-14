@@ -15,8 +15,8 @@ import { md5Password, scram, type Scram } from './auth.ts'
 import { PgError, parseErrorFields } from './errors.ts'
 import { getDefaultTransport, type NormalizedConfig } from './connection.ts'
 import { resolveUrl } from './url.ts'
-import { buildDecoders } from './codec.ts'
-import { pickDecoder, replBinaryFor, replBinaryMatchesText, type CellDecoder } from './decoders.ts'
+import { buildDecoders } from './decode.ts'
+import { pickDecoder, replBinaryFor, replBinaryMatchesText, type CellDecoder } from './decode.ts'
 import type { ConnectConfig, Decoder } from './types.ts'
 
 const PG_EPOCH_US = 946684800000000n // 2000-01-01T00:00:00Z in µs

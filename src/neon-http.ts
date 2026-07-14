@@ -12,13 +12,13 @@
 // or minipg/neon-ws for interactive tx), no LISTEN/COPY/cursors, no prepared-statement reuse, no binary
 // wire format (text decode only). `$1` placeholders — same as the wire driver.
 import { buildMapperFactory, type RowMapperFactory } from './mapper.ts'
-import { buildDecoders } from './codec.ts'
-import { INSTANT_OIDS, type CodegenCol } from './decode2.ts'
+import { buildDecoders } from './decode.ts'
+import { INSTANT_OIDS, type CodegenCol } from './decode.ts'
 import { shapeCols, type ShapeSpec } from './spec.ts'
 import type { ShapeMapper } from './shape.ts'
 import { parseDataRow } from './protocol.ts'
 import { PgError } from './errors.ts'
-import { defaultDecoders } from './codec.ts'
+import { defaultDecoders } from './decode.ts'
 import { resolveUrl } from './url.ts'
 import type { Decoder, ResultMode, QueryResult } from './types.ts'
 

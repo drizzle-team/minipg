@@ -10,7 +10,7 @@
 // Both writers are pre-sized (2MB) so buffer-doubling noise doesn't pollute the comparison.
 import { run, bench, group, summary, do_not_optimize } from 'mitata'
 import { Writer, writeBind, writeBindWith, writeExecute, writeSync } from '../../src/protocol.ts'
-import { encodeParam, encodeValueInto, compileParamPlan } from '../../src/codec.ts'
+import { encodeParam, encodeValueInto, compileParamPlan } from '../../src/encode.ts'
 import { BindWriter, bindDirectText, bindDirectBinary, writeExecSync, BIN_PLAN, STMT } from './bind-direct.ts'
 
 // ---------- workload: same 6-col insert row as playground/inserts ----------

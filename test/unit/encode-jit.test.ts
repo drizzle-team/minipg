@@ -5,7 +5,7 @@
 import { test, expect, describe } from 'bun:test'
 import fc from 'fast-check'
 import { Writer, writeBindWith, writeExecute, writeSync } from '../../src/protocol.ts'
-import { compileParamPlan, compileBindEncoder, encodeValueInto } from '../../src/codec.ts'
+import { compileParamPlan, compileBindEncoder, encodeValueInto } from '../../src/encode.ts'
 
 const ref = (name: string, oids: number[], params: unknown[], rf: number | number[]): Buffer => {
   const w = new Writer(1 << 16)

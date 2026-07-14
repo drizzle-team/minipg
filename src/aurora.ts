@@ -13,8 +13,8 @@
 // Interactive transactions work (begin/transaction) via a threaded transactionId. No streaming/cursors
 // (1 MiB response cap), no COPY/LISTEN, no array bind params (pass as text/JSON) — Data API limitations.
 import { buildMapperFactory, type RowMapperFactory } from './mapper.ts'
-import { buildDecoders } from './codec.ts'
-import { INSTANT_OIDS, type CodegenCol } from './decode2.ts'
+import { buildDecoders } from './decode.ts'
+import { INSTANT_OIDS, type CodegenCol } from './decode.ts'
 import { parseDataRow } from './protocol.ts'
 import { PgError } from './errors.ts'
 import { signRequest, type AwsCredentials } from './sigv4.ts'

@@ -1,5 +1,5 @@
 // types-core — core scalar type decode/encode/NULL round-trips for minipg.
-// Grounded in src/codec.ts: text-format decode only; int8/numeric/money default
+// Grounded in src/encode.ts: text-format decode only; int8/numeric/money default
 // to STRING (precision-safe), bool->boolean, bytea->Buffer, ints/floats->number,
 // everything else (uuid, name, money, bit, arrays, ...) -> UTF-8 string.
 // Requires a running cluster: `bun run test:setup`. public.t is READ-ONLY.
@@ -7,7 +7,7 @@ import { test, expect, describe, beforeAll, afterAll } from 'bun:test'
 import { createHash, randomBytes } from 'node:crypto'
 import { testConnect, caught, PgError, TEST_TIMEOUT } from '../../helpers/db.ts'
 import { defaultDecoders } from '../../../src/index.ts'
-import { buildDecoders } from '../../../src/codec.ts'
+import { buildDecoders } from '../../../src/decode.ts'
 import type { Connection } from '../../../src/index.ts'
 
 // --- tiny accessors honoring noUncheckedIndexedAccess ---------------------

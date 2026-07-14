@@ -1,5 +1,10 @@
-// decode2 — a v2 of the JIT/codegen row mapper (a copy of codegen.ts) used as a playground to
-// gradually try performance optimizations against the v1 mapper. Compare with bench/mapper.bench.ts.
+// DECODE — everything that turns wire bytes into JS values, in four sections:
+//   1. the default decoder catalog (config.types / jsonBigints land here) + PG array-literal parsing
+//   2. the JIT engine: monomorphic new Function row/result-set mappers (compileRow/compileResultSet)
+//   3. the interpreted engine: the same strategies as CellDecoder functions (pickDecoder) — kept
+//      in exact parity with the JIT engine by the dual-variant suite
+//   4. logical-replication binary-tuple decoders (start({ binary }))
+// The encode direction lives in encode.ts.
 //
 // OPT #1 — latin1 for ASCII-guaranteed types: PostgreSQL's TEXT representation of int8, numeric,
 // float, all temporal types, uuid and bytea(hex) is always ASCII (a subset of latin1). Decoding
@@ -8,9 +13,176 @@
 // Types that can carry non-ASCII (text/varchar/bpchar/name/money/xml/json/jsonb, and anything routed
 // to the helper closure) stay UTF-8 so unicode is preserved.
 import type { Decoder } from './types.ts'
-import { decoderFor, defaultDecoders, arrayDecoderFor } from './codec.ts'
-import { genJsonParsers, type JsonMarker, type JsonPlan, type JsTarget } from './json.ts'
+import { parseJsonBuffer } from './jsonparse.ts'
+import { genJsonParsers, specNeedsWalk, buildJsonWalk, type JsonMarker, type JsonPlan, type JsTarget } from './json.ts'
 import { extAt } from './geo.ts'
+
+// ---------------------------------------------------------------------------------------------
+// Section 1a: the DEFAULT DECODER CATALOG — plain (Buffer) => value decoders keyed by OID. This is
+// the public override surface (config.types) and the fallback both engines consult for uncommon
+// types. Deliberately minimal; the engines below carry the per-column fast paths.
+// ---------------------------------------------------------------------------------------------
+const asString: Decoder = (b) => b.toString('utf8')
+const asNumber: Decoder = (b) => Number(b.toString('utf8'))
+const asBool: Decoder = (b) => b[0] === 0x74 // 't'
+const asJson: Decoder = (b) => JSON.parse(b.toString('utf8'))
+const asBytea: Decoder = (b) => {
+  const s = b.toString('utf8')
+  return s.startsWith('\\x') ? Buffer.from(s.slice(2), 'hex') : Buffer.from(s, 'utf8')
+}
+
+/** OID -> decoder. Anything not listed (int8=20, numeric=1700, timestamps, arrays,
+ *  uuid, ...) falls back to a UTF-8 string. */
+export const defaultDecoders = new Map<number, Decoder>([
+  [16, asBool],    // bool
+  [17, asBytea],   // bytea
+  [21, asNumber],  // int2
+  [23, asNumber],  // int4
+  [26, asNumber],  // oid
+  [700, asNumber], // float4
+  [701, asNumber], // float8
+  [114, asJson],   // json
+  [3802, asJson],  // jsonb
+])
+
+export type JsonBigints = 'number' | 'string' | 'bigint'
+
+// Native JSON source-text reviver (ctx.source): recent V8 (Node 21+) and Bun. Preserves
+// oversized integers by value (order-independent, so it works for jsonb too).
+export const jsonSourceSupported: boolean = (() => {
+  try { let ok = false; JSON.parse('{"x":1}', function (_k: string, v: unknown, ctx?: { source?: string }) { if (ctx && typeof ctx.source === 'string') ok = true; return v } as never); return ok } catch { return false }
+})()
+function bigintReviver(as: 'string' | 'bigint') {
+  return (_k: string, v: unknown, ctx?: { source?: string }) =>
+    typeof v === 'number' && Number.isInteger(v) && !Number.isSafeInteger(v) && ctx && typeof ctx.source === 'string' && /^-?\d+$/.test(ctx.source)
+      ? (as === 'bigint' ? BigInt(ctx.source) : ctx.source) : v
+}
+
+/** The json/jsonb decoder for a given jsonBigints mode. 'number' = plain native JSON.parse.
+ *  'string'/'bigint' are HYBRID: a cheap byte pre-scan (mayHaveBigInt) detects whether a value
+ *  could contain an integer > 2^53. The common case (none) takes the native JSON.parse fast
+ *  path; only flagged values pay the slow exact path (source-text reviver, or the pure-JS
+ *  buffer parser when ctx.source is unavailable). Order-independent (covers jsonb). Only whole
+ *  integers are preserved; high-precision *decimals* still need a declared Json({x:'numeric'}). */
+export function jsonDecoder(mode: JsonBigints): Decoder {
+  if (mode === 'number') return asJson
+  // Detect a possible bigint (>=16 consecutive digits) with a native regex on the string we
+  // build for JSON.parse anyway — cheaper than a JS byte loop, and the slow path reuses the
+  // string. Never a false negative (correctness holds); false positives only take the slow path.
+  const BIG = /[0-9]{16}/ // no /g — stateless .test, safe to reuse
+  if (jsonSourceSupported) {
+    const rev = bigintReviver(mode)
+    return (b) => { const s = b.toString('utf8'); return BIG.test(s) ? JSON.parse(s, rev as never) : JSON.parse(s) }
+  }
+  return (b) => { const s = b.toString('utf8'); return BIG.test(s) ? parseJsonBuffer(b, 0, b.length, mode) : JSON.parse(s) }
+}
+
+export function buildDecoders(overrides?: Record<number, Decoder>, jsonBigints: JsonBigints = 'number'): Map<number, Decoder> {
+  if (!overrides && jsonBigints === 'number') return defaultDecoders
+  const m = new Map(defaultDecoders)
+  if (jsonBigints !== 'number') { const d = jsonDecoder(jsonBigints); m.set(114, d); m.set(3802, d) }
+  if (overrides) for (const [oid, fn] of Object.entries(overrides)) m.set(Number(oid), fn)
+  return m
+}
+
+export const decoderFor = (oid: number, map: Map<number, Decoder>): Decoder => map.get(oid) ?? asString
+
+// Array type OID -> element type OID (pg_type.typelem; stable built-in OIDs). Shared with encode.ts.
+export const ELEM_OID: Record<number, number> = {
+  1000: 16, 1005: 21, 1007: 23, 1028: 26, 1016: 20, 1021: 700, 1022: 701, 1231: 1700, 791: 790,
+  1009: 25, 1015: 1043, 1014: 1042, 1002: 18, 1003: 19, 199: 114, 3807: 3802, 1001: 17, 2951: 2950,
+  1182: 1082, 1183: 1083, 1115: 1114, 1185: 1184, 1187: 1186,
+}
+
+// ---------------------------------------------------------------------------------------------
+// Section 1b: OUTPUT array decode — parse a PG '{…}' text literal into a JS array (shape-gated).
+// ---------------------------------------------------------------------------------------------
+// The inverse of encode.ts's arrayLiteral. Element leaves reproduce the SCALAR text-decode DEFAULTS
+// (int8->BigInt, numeric->exact string, temporal->Date, bytea->Buffer) — NOT decoderFor(elemOid),
+// which is asString for those.
+type Leaf = (s: string) => unknown
+const strLeaf: Leaf = (s) => s
+const numLeaf: Leaf = (s) => Number(s)
+const bigIntLeaf: Leaf = (s) => BigInt(s)
+const boolLeaf: Leaf = (s) => s === 't'
+const jsonLeaf: Leaf = (s) => JSON.parse(s)
+const byteaLeaf: Leaf = (s) => (s.charCodeAt(0) === 92 && s.charCodeAt(1) === 120 ? Buffer.from(s.slice(2), 'hex') : Buffer.from(s, 'utf8')) // '\x' hex
+
+/** ms-since-epoch from a PG temporal text element — a STRING port of the interpreted tsParse (same field parse,
+ *  bare +00 offset, year<=99 fixup) so array Date values are bit-identical to the scalar timestamp path. */
+function parseInstantMs(s: string): number {
+  if (s === 'infinity' || s === '-infinity') return NaN // PG ±infinity has no JS Date -> Invalid Date (matches the binary scalar)
+  let e = s.length, bc = false
+  if (e >= 3 && s.charCodeAt(e - 1) === 67 && s.charCodeAt(e - 2) === 66 && s.charCodeAt(e - 3) === 32) { bc = true; e -= 3 } // strip a trailing ' BC'
+  let p = 0
+  let Y = 0; for (; p < e; p++) { const c = s.charCodeAt(p); if (c < 48 || c > 57) break; Y = Y * 10 + (c - 48) } p++
+  const Mo = (s.charCodeAt(p) - 48) * 10 + (s.charCodeAt(p + 1) - 48); p += 3
+  const D = (s.charCodeAt(p) - 48) * 10 + (s.charCodeAt(p + 1) - 48); p += 2
+  let H = 0, Mi = 0, S = 0, ms = 0, off = 0
+  if (p < e && s.charCodeAt(p) === 32) {
+    p++
+    H = (s.charCodeAt(p) - 48) * 10 + (s.charCodeAt(p + 1) - 48); p += 3
+    Mi = (s.charCodeAt(p) - 48) * 10 + (s.charCodeAt(p + 1) - 48); p += 3
+    S = (s.charCodeAt(p) - 48) * 10 + (s.charCodeAt(p + 1) - 48); p += 2
+    if (p < e && s.charCodeAt(p) === 46) { p++; let f = 0, k = 0; for (; p < e && k < 3; p++) { const c = s.charCodeAt(p); if (c < 48 || c > 57) break; f = f * 10 + (c - 48); k++ } while (k < 3) { f *= 10; k++ } ms = f; while (p < e) { const c = s.charCodeAt(p); if (c < 48 || c > 57) break; p++ } }
+    if (p < e && (s.charCodeAt(p) === 43 || s.charCodeAt(p) === 45)) { const sg = s.charCodeAt(p) === 45 ? -1 : 1; p++; const th = (s.charCodeAt(p) - 48) * 10 + (s.charCodeAt(p + 1) - 48); p += 2; let tm = 0; if (p < e && s.charCodeAt(p) === 58) { p++; tm = (s.charCodeAt(p) - 48) * 10 + (s.charCodeAt(p + 1) - 48); p += 2 } off = sg * (th * 60 + tm) * 60000 }
+  }
+  const year = bc ? 1 - Y : Y // PG 'N BC' -> proleptic/astronomical year 1-N (44 BC -> -43, 1 BC -> 0)
+  let ems = Date.UTC(year, Mo - 1, D, H, Mi, S, ms)
+  if (year >= 0 && year <= 99) { const d = new Date(ems); d.setUTCFullYear(year); ems = d.getTime() } // Date.UTC remaps 0-99 to 1900+
+  return ems - off
+}
+
+/** Element OID (+ optional element :target) -> leaf decoder, mirroring the scalar pickText/defaultJs defaults. */
+function elemLeafFor(elemOid: number, js?: string): Leaf {
+  switch (elemOid) {
+    case 16: return boolLeaf                                          // bool -> boolean
+    case 17: return byteaLeaf                                         // bytea -> Buffer
+    case 20: return js === 'number' ? numLeaf : js === 'string' ? strLeaf : bigIntLeaf // int8 -> BigInt (default)
+    case 21: case 23: case 26: case 700: case 701: return numLeaf     // int2/int4/oid/float4/float8 -> Number
+    case 1700: case 790: return js === 'number' ? numLeaf : strLeaf   // numeric/money -> exact STRING (default)
+    case 114: case 3802: return jsonLeaf                             // json/jsonb -> JSON.parse
+    case 1082: case 1114: case 1184: return js === 'ms' ? parseInstantMs : js === 'string' ? strLeaf : (s: string) => new Date(parseInstantMs(s)) // date/timestamp(tz) -> Date (default)
+    default: return strLeaf                                           // text/varchar/bpchar/char/name/uuid/time/interval
+  }
+}
+
+/** Parse a PG array text literal ('{…}') into a nested JS array (inverse of arrayLiteral). Honors nesting,
+ *  empty {}, unquoted bare NULL -> null, quoted backslash-escaped elements, and a leading [lb:ub]= prefix. */
+export function parseArrayLiteral(decodeLeaf: Leaf): (text: string) => unknown[] {
+  return (text) => {
+    let i = 0
+    if (text[0] === '[') { const eq = text.indexOf('='); if (eq >= 0) i = eq + 1 } // skip [lb:ub]= dimension prefix
+    function arr(): unknown[] {
+      const out: unknown[] = []
+      i++ // consume '{'
+      while (i < text.length) {
+        const c = text[i]
+        if (c === '}') { i++; break }
+        if (c === ',') { i++; continue }
+        if (c === '{') { out.push(arr()); continue } // nesting
+        if (c === '"') { // quoted, backslash-escaped element
+          i++; let s = ''
+          while (i < text.length) { const ch = text[i]!; if (ch === '\\') { s += text[i + 1]; i += 2; continue } if (ch === '"') { i++; break } s += ch; i++ }
+          out.push(decodeLeaf(s)); continue // a quoted "NULL" is the literal string
+        }
+        let j = i // unquoted -> read to ',' or '}'; a bare NULL is SQL null
+        while (j < text.length && text[j] !== ',' && text[j] !== '}') j++
+        const raw = text.slice(i, j); i = j
+        out.push(raw === 'NULL' ? null : decodeLeaf(raw))
+      }
+      return out
+    }
+    return arr()
+  }
+}
+
+/** Whole-value Decoder for an array column: '{…}' text -> JS array, elements decoded per the element OID. */
+export function arrayDecoderFor(arrayOid: number, js?: string): Decoder {
+  const elem = ELEM_OID[arrayOid]
+  const parse = parseArrayLiteral(elem === undefined ? strLeaf : elemLeafFor(elem, js))
+  return (b) => parse(b.toString('utf8'))
+}
 
 // decode2 extends the JS-target set with temporal INSTANT targets: 'date' -> JS Date, 'ms' -> ms number.
 export type Target = JsTarget | 'date' | 'ms'
@@ -388,4 +560,213 @@ export function compileResultSet(cols: CodegenCol[], mode: 'array' | 'object', m
   Object.defineProperty(fn, 'source', { value: source, enumerable: false })
   Object.defineProperty(fn, 'sourceName', { value: srcName, enumerable: false })
   return fn
+}
+
+// ---------------------------------------------------------------------------------------------
+// Section 3: the INTERPRETED engine — the function-form of every strategy the JIT emits as inlined
+// code, as pre-selected per-column CellDecoders driven by a per-row loop. pickDecoder() mirrors the
+// JIT dispatch exactly (validated by the dual-variant suite against real Postgres).
+// ---------------------------------------------------------------------------------------------
+/** Decode a cell in place from (buffer, offset, length) — no per-cell subarray. */
+export type CellDecoder = (b: Buffer, o: number, l: number) => unknown
+
+type Sliceable = Buffer & { utf8Slice(s: number, e: number): string; latin1Slice(s: number, e: number): string }
+const HAS_UTF8 = typeof (Buffer.prototype as Partial<Sliceable>).utf8Slice === 'function'
+const HAS_LAT1 = typeof (Buffer.prototype as Partial<Sliceable>).latin1Slice === 'function'
+const utf8 = HAS_UTF8 ? (b: Buffer, o: number, l: number) => (b as Sliceable).utf8Slice(o, o + l) : (b: Buffer, o: number, l: number) => b.toString('utf8', o, o + l)
+const lat1 = HAS_LAT1 ? (b: Buffer, o: number, l: number) => (b as Sliceable).latin1Slice(o, o + l) : (b: Buffer, o: number, l: number) => b.toString('latin1', o, o + l)
+
+// ---- TEXT strategies (mirror decode2 inlineSnippet) ----
+const txtUtf8: CellDecoder = (b, o, l) => utf8(b, o, l)
+const txtLatin1: CellDecoder = (b, o, l) => lat1(b, o, l)
+const txtBool: CellDecoder = (b, o) => b[o] === 116
+const txtJson: CellDecoder = (b, o, l) => JSON.parse(utf8(b, o, l))
+const txtBytea: CellDecoder = (b, o, l) => { const s = lat1(b, o, l); return s.charCodeAt(0) === 92 && s.charCodeAt(1) === 120 ? Buffer.from(s.slice(2), 'hex') : Buffer.from(s, 'utf8') }
+// digit-parse straight from ASCII bytes -> JS number (int2/int4/oid, and int8/bigint:number)
+const txtInt: CellDecoder = (b, o, l) => { let p = o, s = false, x = 0; const e = o + l; if (b[o] === 45) { s = true; p++ } for (; p < e; p++) x = x * 10 + (b[p]! - 48); return s ? -x : x }
+const txtBigInt: CellDecoder = (b, o, l) => BigInt(lat1(b, o, l)) // int8/bigint -> exact JS BigInt
+
+// (POW10 shared with the JIT section above)
+const txtF64: CellDecoder = (b, o, l) => {
+  let p = o; const e = o + l; const c0 = b[p]!; let neg = false
+  if (c0 === 45) { neg = true; p++ } else if (c0 === 43) p++
+  if (b[p] === 78 || b[p] === 110) return NaN
+  if (b[p] === 73 || b[p] === 105) return neg ? -Infinity : Infinity
+  let sig = 0, nd = 0, fd = 0, dot = false, hard = false
+  for (; p < e; p++) { const c = b[p]!; if (c === 46) { dot = true; continue } if (c < 48 || c > 57) break; if (sig === 0 && c === 48) { if (dot) fd++; continue } if (nd < 15) { sig = sig * 10 + (c - 48); nd++; if (dot) fd++ } else hard = true }
+  let exp = 0, es = 1
+  if (b[p] === 101 || b[p] === 69) { p++; if (b[p] === 45) { es = -1; p++ } else if (b[p] === 43) p++; for (; p < e; p++) { const c = b[p]!; if (c < 48 || c > 57) break; exp = exp * 10 + (c - 48) } }
+  const eff = es * exp - fd
+  if (hard || eff > 22 || eff < -22) return Number(lat1(b, o, l))
+  const r = eff >= 0 ? sig * POW10[eff]! : sig / POW10[-eff]!
+  return neg ? -r : r
+}
+const txtF4Precise: CellDecoder = (b, o, l) => Math.fround(txtF64(b, o, l) as number) // float4:precise -> exact stored f32
+
+// temporal :date/:ms (direct field parse -> Date.UTC; naive = UTC, tz applies offset; micros -> ms)
+function tsParse(b: Buffer, o: number, l: number): number {
+  let p = o; const e = o + l
+  let Y = 0; for (; p < e; p++) { const c = b[p]!; if (c < 48 || c > 57) break; Y = Y * 10 + (c - 48) } p++
+  const Mo = (b[p]! - 48) * 10 + (b[p + 1]! - 48); p += 3
+  const D = (b[p]! - 48) * 10 + (b[p + 1]! - 48); p += 2
+  let H = 0, Mi = 0, S = 0, ms = 0, off = 0
+  if (p < e && b[p] === 32) {
+    p++
+    H = (b[p]! - 48) * 10 + (b[p + 1]! - 48); p += 3
+    Mi = (b[p]! - 48) * 10 + (b[p + 1]! - 48); p += 3
+    S = (b[p]! - 48) * 10 + (b[p + 1]! - 48); p += 2
+    if (p < e && b[p] === 46) { p++; let f = 0, k = 0; for (; p < e && k < 3; p++) { const c = b[p]!; if (c < 48 || c > 57) break; f = f * 10 + (c - 48); k++ } while (k < 3) { f *= 10; k++ } ms = f; while (p < e) { const c = b[p]!; if (c < 48 || c > 57) break; p++ } }
+    if (p < e && (b[p] === 43 || b[p] === 45)) { const sg = b[p] === 45 ? -1 : 1; p++; const th = (b[p]! - 48) * 10 + (b[p + 1]! - 48); p += 2; let tm = 0; if (p < e && b[p] === 58) { p++; tm = (b[p]! - 48) * 10 + (b[p + 1]! - 48); p += 2 } off = sg * (th * 60 + tm) * 60000 }
+  }
+  let ems = Date.UTC(Y, Mo - 1, D, H, Mi, S, ms)
+  if (Y <= 99) { const d = new Date(ems); d.setUTCFullYear(Y); ems = d.getTime() } // Date.UTC remaps years 0-99 to 1900+Y; undo it BEFORE applying the tz offset
+  return ems - off
+}
+const tsDate: CellDecoder = (b, o, l) => new Date(tsParse(b, o, l))
+const tsEpoch: CellDecoder = (b, o, l) => tsParse(b, o, l)
+
+// ---- BINARY strategies (mirror the JIT binarySnippet; PG_EPOCH_MS shared above) ----
+const rd64 = (b: Buffer, o: number) => { const hi = (b[o]! << 24) | (b[o + 1]! << 16) | (b[o + 2]! << 8) | b[o + 3]!, lo = ((b[o + 4]! << 24) | (b[o + 5]! << 16) | (b[o + 6]! << 8) | b[o + 7]!) >>> 0; return hi * 4294967296 + lo }
+const binBool: CellDecoder = (b, o) => b[o] === 1
+const binInt2: CellDecoder = (b, o) => b.readInt16BE(o)
+const binInt4: CellDecoder = (b, o) => b.readInt32BE(o)
+const binOid: CellDecoder = (b, o) => b.readUInt32BE(o)
+const binFloat4: CellDecoder = (b, o) => b.readFloatBE(o)
+const binFloat8: CellDecoder = (b, o) => b.readDoubleBE(o)
+const binInt8Num: CellDecoder = (b, o) => rd64(b, o)
+const binInt8Str: CellDecoder = (b, o) => { const n = rd64(b, o); return n >= -9007199254740991 && n <= 9007199254740991 ? '' + n : b.readBigInt64BE(o).toString() }
+const binInt8BigInt: CellDecoder = (b, o) => b.readBigInt64BE(o)
+const binTsEpoch: CellDecoder = (b, o) => Math.floor(rd64(b, o) / 1000) + PG_EPOCH_MS
+const binTsDate: CellDecoder = (b, o) => new Date(Math.floor(rd64(b, o) / 1000) + PG_EPOCH_MS)
+const binDateEpoch: CellDecoder = (b, o) => b.readInt32BE(o) * 86400000 + PG_EPOCH_MS
+const binDateDate: CellDecoder = (b, o) => new Date(b.readInt32BE(o) * 86400000 + PG_EPOCH_MS)
+const binBytea: CellDecoder = (b, o, l) => { const c = Buffer.allocUnsafe(l); b.copy(c, 0, o, o + l); return c }
+const binUuid: CellDecoder = (b, o) => { const h = b.toString('hex', o, o + 16); return h.slice(0, 8) + '-' + h.slice(8, 12) + '-' + h.slice(12, 16) + '-' + h.slice(16, 20) + '-' + h.slice(20, 32) }
+const binText: CellDecoder = (b, o, l) => utf8(b, o, l)
+
+const wrap = (d: Decoder): CellDecoder => (b, o, l) => d(b.subarray(o, o + l)) // public (buf)=>value override -> offset form
+
+function pickBinary(oid: number, js?: Target): CellDecoder {
+  switch (oid) {
+    case 16: return binBool
+    case 21: return binInt2
+    case 23: return binInt4
+    case 26: return binOid
+    case 20: return js === 'number' ? binInt8Num : js === 'string' ? binInt8Str : binInt8BigInt // default -> BigInt
+    case 700: return binFloat4
+    case 701: return binFloat8
+    case 1114: case 1184: return js === 'ms' ? binTsEpoch : binTsDate // default -> Date
+    case 1082: return js === 'ms' ? binDateEpoch : binDateDate
+    case 2950: return binUuid
+    case 17: return binBytea
+    case 18: case 19: case 25: case 1042: case 1043: return binText
+    default: throw new Error(`minipg: no binary decoder for oid ${oid} (request text format for this column)`)
+  }
+}
+
+// text strategy for an oid+target; null = "use the helper/map decoder" (uncommon/unknown types)
+function pickText(oid: number, js?: Target): CellDecoder | null {
+  if (!js && INSTANT_OIDS.has(oid)) js = 'date' // date/timestamp/timestamptz default to a JS Date (:string/:ms override)
+  if (js === 'date' || js === 'ms') { if (INSTANT_OIDS.has(oid)) return js === 'date' ? tsDate : tsEpoch; js = 'string' }
+  if (js === 'bigint' || (!js && oid === 20)) return txtBigInt // int8/bigint default to a JS BigInt (:number/:string override)
+  if (oid === 700 && js !== 'string') { if (js === 'precise') return txtF4Precise; js = undefined } // float4: :precise -> fround; bare/:pretty -> Number (canonical)
+  const eff = js ?? defaultJs(oid)
+  switch (eff) {
+    case 'number': return INT_OIDS.has(oid) ? txtInt : txtF64
+    case 'string': return ASCII_SAFE.has(oid) ? txtLatin1 : txtUtf8
+    case 'latin1': return txtLatin1 // caller asserts ASCII/latin1 (e.g. email) -> skip the utf8 scan
+    case 'bool': return txtBool
+    case 'json': return txtJson
+    case 'bytea': return txtBytea
+    default: return null // helper closure
+  }
+}
+
+/** Resolve the CellDecoder for a column, mirroring decode2's dispatch exactly. */
+export function pickDecoder(col: CodegenCol, map: Map<number, Decoder>): CellDecoder {
+  if (col.format === 'binary') return pickBinary(col.oid, col.js)
+  if (col.json) {
+    // shaped json in the no-eval path: JSON.parse (respects jsonBigints via the map's json decoder), then
+    // a temporal post-parse walk to match the jit scanner's :ms/:date output. Exact bigint/numeric
+    // precision beyond JSON.parse stays a jit-only / jsonBigints concern (documented).
+    const base = wrap(decoderFor(col.oid, map))
+    if (!specNeedsWalk(col.json.spec)) return base
+    const walk = buildJsonWalk(col.json)
+    return (b, o, l) => walk(base(b, o, l))
+  }
+  // a custom (config.types) override always wins — decode2 routes these to its helper too
+  if (map !== defaultDecoders) { const d = map.get(col.oid); if (d && d !== defaultDecoders.get(col.oid)) return wrap(d) }
+  const ext = extAt(col); if (ext) return ext // point / pgvector / PostGIS shape columns (custom override handled above)
+  if (col.array) { const dec = arrayDecoderFor(col.oid, col.array.js); return (b, o, l) => dec(b.subarray(o, o + l)) } // '{…}' text -> JS array (same as the JIT helper)
+  return pickText(col.oid, col.js) ?? wrap(decoderFor(col.oid, map))
+}
+
+// ---- Logical-replication BINARY tuples (`repl.start({ binary: true })`) --------------------------------
+// With pgoutput's `binary 'true'` the publisher sends every column whose type has a send function in
+// BINARY — the driver must decode it or fail loudly (there's no per-column opt-out). Coverage below =
+// pickBinary's set + numeric (exact string), json/jsonb (the map's json decoder, so jsonBigints applies;
+// jsonb strips its 1-byte version), and arrays (array_recv wire format -> a real JS array — richer than
+// text mode's raw '{…}' string, documented on the option). Unsupported oid -> null; the caller errors
+// with table.column when a binary value actually arrives for it.
+
+// numeric binary: u16 ndigits, i16 weight (base-10000 exponent of digits[0]), u16 sign, u16 dscale,
+// then ndigits × u16 base-10000 groups. Rendered to the EXACT text PG would emit (same digits, dscale).
+const binNumericStr: CellDecoder = (b, o) => {
+  const nd = b.readUInt16BE(o), weight = b.readInt16BE(o + 2), sign = b.readUInt16BE(o + 4), dscale = b.readUInt16BE(o + 6)
+  if (sign === 0xc000) return 'NaN'
+  if (sign === 0xd000) return 'Infinity'
+  if (sign === 0xf000) return '-Infinity'
+  let s = sign === 0x4000 ? '-' : ''
+  if (weight < 0 || nd === 0) s += '0'
+  else for (let i = 0; i <= weight; i++) { const d = i < nd ? b.readUInt16BE(o + 8 + i * 2) : 0; s += i === 0 ? String(d) : String(d).padStart(4, '0') }
+  if (dscale > 0) {
+    let frac = ''
+    for (let g = 0; frac.length < dscale; g++) {
+      const i = weight + 1 + g
+      frac += i >= 0 && i < nd ? String(b.readUInt16BE(o + 8 + i * 2)).padStart(4, '0') : '0000'
+    }
+    s += '.' + frac.slice(0, dscale)
+  }
+  return s
+}
+
+// array_recv: i32 ndim, i32 hasnull, i32 elemOid, ndim × (i32 len, i32 lbound), then row-major cells
+// (i32 len | -1 null, bytes). Nested per dims.
+const binArrayWith = (elem: CellDecoder): CellDecoder => (b, o) => {
+  const ndim = b.readInt32BE(o)
+  if (ndim === 0) return []
+  let p = o + 12
+  const dims: number[] = new Array(ndim)
+  for (let d = 0; d < ndim; d++) { dims[d] = b.readInt32BE(p); p += 8 }
+  const read = (dim: number): unknown[] => {
+    const n = dims[dim]!, out: unknown[] = new Array(n)
+    for (let i = 0; i < n; i++) {
+      if (dim + 1 < ndim) { out[i] = read(dim + 1); continue }
+      const len = b.readInt32BE(p); p += 4
+      if (len === -1) out[i] = null
+      else { out[i] = elem(b, p, len); p += len }
+    }
+    return out
+  }
+  return read(0)
+}
+
+/** Binary-tuple decoder for a replication column, or null when the type has no binary read
+ *  (or a config.types text override claims the oid — binary bytes can't honor it). */
+export function replBinaryFor(oid: number, map: Map<number, Decoder>): CellDecoder | null {
+  if (map !== defaultDecoders) { const d = map.get(oid); if (d && d !== defaultDecoders.get(oid)) return null }
+  if (oid === 1700) return binNumericStr
+  if (oid === 114) { const d = decoderFor(oid, map); return (b, o, l) => d(b.subarray(o, o + l)) }
+  if (oid === 3802) { const d = decoderFor(oid, map); return (b, o, l) => d(b.subarray(o + 1, o + l)) } // jsonb: version byte
+  const elemOid = ELEM_OID[oid]
+  if (elemOid !== undefined) { const elem = replBinaryFor(elemOid, map); return elem ? binArrayWith(elem) : null }
+  try { return pickBinary(oid) } catch { return null }
+}
+
+/** True when this oid's BINARY decode yields the IDENTICAL JS value as text mode — the gate for
+ *  auto-enabling binary replication. float4 (binary = exact f32 vs text = canonical shortest) and
+ *  arrays (JS array vs raw '{…}' literal) are binary-capable but value-DIVERGENT -> false. */
+export function replBinaryMatchesText(oid: number, map: Map<number, Decoder>): boolean {
+  if (oid === 700 || ELEM_OID[oid] !== undefined) return false
+  return replBinaryFor(oid, map) !== null
 }

@@ -1,10 +1,10 @@
-// Binary array param encoding (codec.ts arrayEnc/elemEncoderFor/arrayLiteral) and the
+// Binary array param encoding (encode.ts arrayEnc/elemEncoderFor/arrayLiteral) and the
 // params-name resolver (spec.ts paramTypeOid). Wire layout asserted against the documented
 // array_recv format: ndim, hasnull, elemOid, [len, lbound], elements.
 import { test, expect, describe } from 'bun:test'
 import { Writer } from '../../src/protocol.ts'
 import { writeBindWith } from '../../src/protocol.ts'
-import { compileParamPlan, arrayLiteral } from '../../src/codec.ts'
+import { compileParamPlan, arrayLiteral } from '../../src/encode.ts'
 import { paramTypeOid, resolveParamTypes } from '../../src/spec.ts'
 
 function bindVals(oids: number[], params: unknown[]): { fmts: number[]; vals: (Buffer | null)[] } {

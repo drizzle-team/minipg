@@ -2,7 +2,7 @@
 // network (inet/cidr/macaddr/macaddr8), geometric, hstore, tsvector/xml/pg_lsn/
 // bit, "char", plus the all-common-types round-trip matrix.
 //
-// Grounded in src/codec.ts: defaultDecoders only registers
+// Grounded in src/encode.ts: defaultDecoders only registers
 // bool/bytea/int2/int4/oid/float4/float8/json/jsonb; decoderFor falls back to
 // asString for everything else. So arrays/ranges/composites/enums/network/
 // geometric/hstore/uuid/numeric/int8/timestamps all decode to the raw PG text
@@ -11,8 +11,8 @@
 // mark the roadmap rich-decoder / array-literal-encode features as test.todo.
 import { test, expect, describe, beforeAll, afterAll } from 'bun:test'
 import { testConnect, caught, PgError } from '../../helpers/db.ts'
-import { buildDecoders, defaultDecoders } from '../../../src/codec.ts'
-import { decoderFor } from '../../../src/codec.ts'
+import { buildDecoders, defaultDecoders } from '../../../src/decode.ts'
+import { decoderFor } from '../../../src/decode.ts'
 import type { Connection } from '../../../src/index.ts'
 
 // One shared connection that owns the pg_temp enum/composite/domain types.

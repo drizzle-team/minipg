@@ -5,7 +5,7 @@
 // Requires the local cluster (`bun run test:setup`).
 import { test, expect, describe, beforeAll, afterAll } from 'bun:test'
 import { connect } from '../../src/index.ts'
-import type { CodegenCol } from '../../src/decode2.ts'
+import type { CodegenCol } from '../../src/decode.ts'
 
 const CFG = { host: '127.0.0.1', port: 54329, user: 'postgres', password: 'postgres', database: 'testdb' }
 let c: Awaited<ReturnType<typeof connect>>

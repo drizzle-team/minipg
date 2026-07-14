@@ -5,7 +5,7 @@
 // Requires a running cluster (see test/helpers/db.ts). public.t is READ-ONLY.
 import { test, expect, describe } from 'bun:test'
 import { testConnect, caught, PgError } from '../../helpers/db.ts'
-import { encodeParam } from '../../../src/codec.ts'
+import { encodeParam } from '../../../src/encode.ts'
 
 // ---- helpers for strict TS (noUncheckedIndexedAccess) ----
 const NUL = String.fromCharCode(0) // an actual 0x00 byte (source stays printable)

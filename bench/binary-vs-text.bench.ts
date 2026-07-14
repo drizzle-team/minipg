@@ -7,9 +7,9 @@
 // wire format differs. Needs `bun run test:setup`.
 //   bun bench/binary-vs-text.bench.ts   (or: bun run bench:binary)   — run node too for the isolated part
 import { run, bench, group, summary, do_not_optimize } from 'mitata'
-import { compileResultSet } from '../src/decode2.ts'
-import type { CodegenCol } from '../src/decode2.ts'
-import { buildDecoders } from '../src/codec.ts'
+import { compileResultSet } from '../src/decode.ts'
+import type { CodegenCol } from '../src/decode.ts'
+import { buildDecoders } from '../src/decode.ts'
 import { connect } from '../src/index.ts'
 import * as wire from '../test/helpers/wire.ts'
 

@@ -3,7 +3,7 @@
 // separate from shape.ts so the connection can resolve a `{ shape }` query option WITHOUT pulling in the
 // whole-result-set codegen used by the standalone Shape() helper. No node deps (imports only json/types).
 import { isJsonMarker, isCollectMarker, isTransformMarker, isNullableMarker, splitType, validateJsonSpec, type JsonMarker, type CollectMarker, type TransformMarker, type NullableMarker } from './json.ts'
-import { BINARY_FAST, type CodegenCol } from './decode2.ts'
+import { BINARY_FAST, type CodegenCol } from './decode.ts'
 import { EXT_VECTOR, EXT_GEOMETRY, EXT_HALFVEC, EXT_SPARSEVEC, EXT_BOX2D, EXT_BOX3D } from './geo.ts'
 
 // PG type alias -> OID. `satisfies` (not a `: Record<…>` annotation) keeps the literal keys so PgType can

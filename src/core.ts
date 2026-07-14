@@ -25,7 +25,7 @@ export type { ReplicationConfig, ReplicationEvent, ReplicationRelation, StartOpt
 export { PoolQuery } from './pool.ts'
 export { parseConnectionString } from './url.ts'
 export { PgError } from './errors.ts'
-export { defaultDecoders } from './codec.ts'
+export { defaultDecoders } from './decode.ts'
 export { Shape } from './shape.ts'
 export type { ShapeMapper } from './shape.ts'
 export type { ShapeSpec, TypeSpec, PgType } from './spec.ts'

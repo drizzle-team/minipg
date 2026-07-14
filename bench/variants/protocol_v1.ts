@@ -1,7 +1,7 @@
 // PostgreSQL frontend/backend wire protocol v3 — message framing only.
 // No I/O here: writers return Buffers; Parser turns socket bytes into messages.
 import type { Field } from '../../src/types.ts'
-import type { EncodedParam } from '../../src/codec.ts'
+import type { EncodedParam } from '../../src/encode.ts'
 
 const PROTOCOL_VERSION = 196608 // 3 << 16
 

@@ -6,7 +6,8 @@
 import { run, bench, group, summary, do_not_optimize } from 'mitata'
 import { W as Wlive, Parser as ParserLive } from '../src/protocol.ts'
 import { W as Wv1, Parser as ParserV1 } from './variants/protocol_v1.ts'
-import { buildDecoders as bdLive, decoderFor as dfLive, encodeParam } from '../src/codec.ts'
+import { encodeParam } from '../src/encode.ts'
+import { buildDecoders as bdLive, decoderFor as dfLive } from '../src/decode.ts'
 import { buildDecoders as bdV1, decoderFor as dfV1 } from './variants/codec_v1.ts'
 
 // ---------- write path: serialize one extended-query packet ----------

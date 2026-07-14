@@ -2,7 +2,7 @@
 // for the writers, chunk-reassembly + guards for the Parser, and the decoders.
 import { test, expect, describe } from 'bun:test'
 import { W, Parser, parseRowDescription, parseDataRow } from '../../src/protocol.ts'
-import { encodeParam } from '../../src/codec.ts'
+import { encodeParam } from '../../src/encode.ts'
 
 const u16 = (n: number) => { const b = Buffer.allocUnsafe(2); b.writeUInt16BE(n); return b }
 const i32 = (n: number) => { const b = Buffer.allocUnsafe(4); b.writeInt32BE(n); return b }

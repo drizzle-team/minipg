@@ -3,7 +3,7 @@
 // byte-identity at startup. Run: bun playground/bind-encode/src-jit.bench.ts
 import { run, bench, group, summary, do_not_optimize } from 'mitata'
 import { Writer, writeBindWith, writeExecute, writeSync } from '../../src/protocol.ts'
-import { compileParamPlan, compileBindEncoder } from '../../src/codec.ts'
+import { compileParamPlan, compileBindEncoder } from '../../src/encode.ts'
 
 const STMT = 'i_pipe'
 const OIDS = [20, 25, 23, 701, 16, 1184] // int8, text, int4, float8, bool, timestamptz

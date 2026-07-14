@@ -1,6 +1,6 @@
-// COPY row encoders (codec.ts copyRowsBinary / copyRowsText): binary layout + text escaping.
+// COPY row encoders (encode.ts copyRowsBinary / copyRowsText): binary layout + text escaping.
 import { test, expect, describe } from 'bun:test'
-import { copyRowsBinary, copyRowsText, copyBinarySupported } from '../../src/codec.ts'
+import { copyRowsBinary, copyRowsText, copyBinarySupported } from '../../src/encode.ts'
 
 const collect = (g: Generator<Buffer>): Buffer => Buffer.concat([...g])
 

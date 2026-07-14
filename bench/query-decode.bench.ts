@@ -6,9 +6,9 @@
 // (no network / DB in the loop). Requires the seeded DB (DATABASE_URL, default local port 58524).
 import { connect, JsonArray } from '../src/index.ts'
 import { buildMapperFactory } from '../src/mapper.ts'
-import { buildDecoders } from '../src/codec.ts'
+import { buildDecoders } from '../src/decode.ts'
 import { shapeCols } from '../src/spec.ts'
-import type { CodegenCol } from '../src/decode2.ts'
+import type { CodegenCol } from '../src/decode.ts'
 import { run, bench, group, summary, do_not_optimize } from 'mitata'
 
 const URL = process.env.DATABASE_URL ?? 'postgresql://postgres:postgres@localhost:58524/postgres'

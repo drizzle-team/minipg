@@ -5,7 +5,7 @@
 // on non-int8 types (binary yields the decoded value, never the PG text). Runs under both decode variants.
 import { test, expect, describe } from 'bun:test'
 import { shapeCols } from '../../../src/spec.ts'
-import { BINARY_FAST } from '../../../src/decode2.ts'
+import { BINARY_FAST } from '../../../src/decode.ts'
 import { Json, type ShapeSpec } from '../../../src/index.ts'
 import { withConn } from '../../helpers/db.ts'
 

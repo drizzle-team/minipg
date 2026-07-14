@@ -2,7 +2,7 @@
 // PostGIS `geometry`/`geography` (EWKB). Extension types have DYNAMIC OIDs (created per
 // database), so shapes reference them by NAME via sentinel OIDs — the decoder is chosen by the
 // declaration, never by the runtime OID. All are TEXT-wire-format decoders.
-import type { CodegenCol } from './decode2.ts'
+import type { CodegenCol } from './decode.ts'
 
 export const OID_POINT = 600
 export const EXT_VECTOR = -1000   // pgvector `vector` — sentinel (real OID is per-database)
