@@ -1,6 +1,7 @@
 // WKB/EWKB parser + point/vector text parsers (src/geo.ts).
 import { test, expect, describe } from 'bun:test'
-import { parseWkb, parseEwkbHex, parsePoint, parseVector, parseSparsevec, sparseToDense, parseBox } from '../../src/geo.ts'
+import { parsePoint, parseVector, parseSparsevec, sparseToDense } from '../../src/geo.ts'
+import { parseWkb, parseEwkbHex, parseBox } from '../../src/geometry.ts'
 
 // little WKB builder so fixtures are constructed, not hand-typed
 class B {
@@ -78,5 +79,15 @@ describe('text parsers', () => {
   })
   test('parseVector', () => {
     expect(parseVector('[1,2.5,-3]')).toEqual([1, 2.5, -3])
+  })
+})
+
+describe('line parsers', () => {
+  const { parseLineAbc, parseLineTuple } = require('../../src/geo.ts') as typeof import('../../src/geo.ts')
+  test('abc / tuple, negatives, floats, exponents', () => {
+    expect(parseLineAbc('{1,-2,3.5}')).toEqual({ a: 1, b: -2, c: 3.5 })
+    expect(parseLineTuple('{1,-2,3.5}')).toEqual([1, -2, 3.5])
+    expect(parseLineAbc('{1e-3,-2.5e2,0}')).toEqual({ a: 0.001, b: -250, c: 0 })
+    expect(parseLineTuple('{0,1,-7}')).toEqual([0, 1, -7])
   })
 })

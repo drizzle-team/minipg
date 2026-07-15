@@ -98,6 +98,40 @@ describe('scalar arrays inside Json()/Jsonb() shapes', () => {
     })
   }, TEST_TIMEOUT)
 
+  test('MULTIDIMENSIONAL arrays: one spec covers every dimensionality (report.md repro)', async () => {
+    await withConn(async (c) => {
+      // scanner path (precision elements) — was BROKEN: nested '[' consumed as a bogus scalar
+      const r1 = await c.query(`select row_to_json(x) as d from (select array[[1,2],[3,4]]::int8[] as v) x`,
+        [], { shape: { d: Json({ v: 'int8[]' }) } })
+      expect((r1.rows[0] as { d: { v: bigint[][] } }).d.v).toEqual([[1n, 2n], [3n, 4n]])
+      const r2 = await c.query(`select row_to_json(x) as d from (select array[[1,2],[3,4]]::int8[] as v) x`,
+        [], { shape: { d: Json({ v: 'int8[]:string' }) } })
+      expect((r2.rows[0] as { d: { v: string[][] } }).d.v).toEqual([['1', '2'], ['3', '4']])
+      // temporal elements through the walk/scanner, 2-D
+      const r3 = await c.query(
+        `select row_to_json(x) as d from (select array[['2026-01-02T03:04:05Z']]::timestamptz[] as v) x`,
+        [], { shape: { d: Json({ v: 'timestamptz[]:ms' }) } })
+      expect((r3.rows[0] as { d: { v: number[][] } }).d.v).toEqual([[Date.UTC(2026, 0, 2, 3, 4, 5)]])
+      // 3-D + null elements + null inner array
+      const r4 = await c.query(
+        `select json_build_object('v', json_build_array(json_build_array(json_build_array(1, null), null))) as d`,
+        [], { shape: { d: Json({ v: 'bigint[]' }) } })
+      expect((r4.rows[0] as { d: { v: unknown } }).d.v).toEqual([[[1n, null], null]])
+      // fast path (JSON.parse) unchanged
+      const r5 = await c.query(`select row_to_json(x) as d from (select array[[1,2],[3,4]]::int8[] as v) x`,
+        [], { shape: { d: Json({ v: 'int8[]:number' }) } })
+      expect((r5.rows[0] as { d: { v: number[][] } }).d.v).toEqual([[1, 2], [3, 4]])
+    })
+  }, TEST_TIMEOUT)
+
+  test.skipIf(VARIANT === 'interpreted')('multidim numeric[] -> exact string elements (jit scanner)', async () => {
+    await withConn(async (c) => {
+      const r = await c.query(`select row_to_json(x) as d from (select array[['10.50'],['0.1']]::numeric[] as v) x`,
+        [], { shape: { d: Json({ v: 'numeric[]' }) } })
+      expect((r.rows[0] as { d: { v: string[][] } }).d.v).toEqual([['10.50'], ['0.1']])
+    })
+  }, TEST_TIMEOUT)
+
   test(`'json[]'/'unknown[]' inside Json() throw at shape build (no silent mis-decode)`, async () => {
     await withConn(async (c) => {
       const e = await caught(() => c.query('select 1 as d', [], { shape: { d: Json({ x: 'json[]' as never }) } }))

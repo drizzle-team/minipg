@@ -15,7 +15,8 @@
 import type { Decoder } from './types.ts'
 import { parseJsonBuffer } from './jsonparse.ts'
 import { genJsonParsers, specNeedsWalk, buildJsonWalk, type JsonMarker, type JsonPlan, type JsTarget } from './json.ts'
-import { extAt } from './geo.ts'
+import { extAt, extLeafFor, parseLineAbc, parseLineTuple } from './geo.ts'
+import { customAt, customLeafFor } from './registry.ts'
 
 // ---------------------------------------------------------------------------------------------
 // Section 1a: the DEFAULT DECODER CATALOG — plain (Buffer) => value decoders keyed by OID. This is
@@ -91,7 +92,7 @@ export const decoderFor = (oid: number, map: Map<number, Decoder>): Decoder => m
 export const ELEM_OID: Record<number, number> = {
   1000: 16, 1005: 21, 1007: 23, 1028: 26, 1016: 20, 1021: 700, 1022: 701, 1231: 1700, 791: 790,
   1009: 25, 1015: 1043, 1014: 1042, 1002: 18, 1003: 19, 199: 114, 3807: 3802, 1001: 17, 2951: 2950,
-  1182: 1082, 1183: 1083, 1115: 1114, 1185: 1184, 1187: 1186,
+  1182: 1082, 1183: 1083, 1115: 1114, 1185: 1184, 1187: 1186, 629: 628, 1017: 600,
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -135,6 +136,10 @@ function parseInstantMs(s: string): number {
 
 /** Element OID (+ optional element :target) -> leaf decoder, mirroring the scalar pickText/defaultJs defaults. */
 function elemLeafFor(elemOid: number, js?: string): Leaf {
+  const cus = customLeafFor(elemOid, js) // defineType() element (sentinel oid; bare -> raw text)
+  if (cus) return cus
+  const ext = extLeafFor(elemOid, js) // point/line/vector element targets; bare -> raw text below
+  if (ext) return ext
   switch (elemOid) {
     case 16: return boolLeaf                                          // bool -> boolean
     case 17: return byteaLeaf                                         // bytea -> Buffer
@@ -177,11 +182,15 @@ export function parseArrayLiteral(decodeLeaf: Leaf): (text: string) => unknown[]
   }
 }
 
-/** Whole-value Decoder for an array column: '{…}' text -> JS array, elements decoded per the element OID. */
-export function arrayDecoderFor(arrayOid: number, js?: string): Decoder {
-  const elem = ELEM_OID[arrayOid]
+/** Whole-value Decoder for an array column, by ELEMENT type (works for extension elements whose
+ *  array OID is per-database — the shape's declared element drives the decode). */
+export function arrayDecoderForElem(elem: number | undefined, js?: string): Decoder {
   const parse = parseArrayLiteral(elem === undefined ? strLeaf : elemLeafFor(elem, js))
   return (b) => parse(b.toString('utf8'))
+}
+/** Same, keyed by a STATIC array OID (built-in types). */
+export function arrayDecoderFor(arrayOid: number, js?: string): Decoder {
+  return arrayDecoderForElem(ELEM_OID[arrayOid], js)
 }
 
 // decode2 extends the JS-target set with temporal INSTANT targets: 'date' -> JS Date, 'ms' -> ms number.
@@ -388,8 +397,9 @@ function helperFor(oid: number, map: Map<number, Decoder>): AtDecoder {
  *  target — UNLESS the user overrode that array OID via config.types (map.has), which wins in both mappers
  *  (interpreted checks the override first). Every scalar column keeps the OID-keyed helperFor path. */
 function helperForCol(col: CodegenCol, map: Map<number, Decoder>): AtDecoder {
-  if (col.array && !map.has(col.oid)) { const dec = arrayDecoderFor(col.oid, col.array.js); return (b, o, l) => dec(b.subarray(o, o + l)) }
-  if (!map.has(col.oid)) { const ext = extAt(col); if (ext) return ext } // point / pgvector / PostGIS shape columns (config.types override wins)
+  if (col.array && !map.has(col.oid)) { const dec = arrayDecoderForElem(col.array.elem, col.array.js); return (b, o, l) => dec(b.subarray(o, o + l)) }
+  if (!map.has(col.oid)) { const cus = customAt(col); if (cus) return cus } // defineType() columns (config.types override wins)
+  if (!map.has(col.oid)) { const ext = extAt(col); if (ext) return ext } // point / pgvector shape columns
   return helperFor(col.oid, map)
 }
 
@@ -696,8 +706,9 @@ export function pickDecoder(col: CodegenCol, map: Map<number, Decoder>): CellDec
   }
   // a custom (config.types) override always wins — decode2 routes these to its helper too
   if (map !== defaultDecoders) { const d = map.get(col.oid); if (d && d !== defaultDecoders.get(col.oid)) return wrap(d) }
-  const ext = extAt(col); if (ext) return ext // point / pgvector / PostGIS shape columns (custom override handled above)
-  if (col.array) { const dec = arrayDecoderFor(col.oid, col.array.js); return (b, o, l) => dec(b.subarray(o, o + l)) } // '{…}' text -> JS array (same as the JIT helper)
+  if (col.array) { const dec = arrayDecoderForElem(col.array.elem, col.array.js); return (b, o, l) => dec(b.subarray(o, o + l)) } // '{…}' text -> JS array (BEFORE customAt/extAt: array cols carry the element's sentinel as col.oid)
+  const cus = customAt(col); if (cus) return cus // defineType() columns (config.types override handled above)
+  const ext = extAt(col); if (ext) return ext // point / pgvector shape columns
   return pickText(col.oid, col.js) ?? wrap(decoderFor(col.oid, map))
 }
 

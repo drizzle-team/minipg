@@ -34,6 +34,7 @@
 // NOT expose a JSON column's inner types — only the OID (json=114 / jsonb=3802) — which is
 // why `type` is declared here.
 import type { TypeSpec, ShapeOf, ShapeSpec } from './spec.ts' // type-only (erased): typed value union + generic mapped form
+import { isCustomMarker, type CustomMarker } from './registry.ts'
 
 export interface JsonMarker {
   readonly __json: 'object' | 'array'
@@ -84,8 +85,8 @@ export function Transform<T extends TypeSpec, R>(type: T, fn: (v: never) => R): 
 export const isTransformMarker = (x: unknown): x is TransformMarker => typeof x === 'object' && x !== null && (x as { __transform?: unknown }).__transform === true
 
 /** Inside a Collect: mark a field as legitimately nullable — excluded from the group's required-presence check. */
-export interface NullableMarker { readonly __nullable: true; readonly inner: TypeSpec | TransformMarker | JsonMarker }
-export function Nullable(inner: TypeSpec | TransformMarker | JsonMarker): NullableMarker { return { __nullable: true, inner } }
+export interface NullableMarker { readonly __nullable: true; readonly inner: TypeSpec | TransformMarker | JsonMarker | CustomMarker }
+export function Nullable(inner: TypeSpec | TransformMarker | JsonMarker | CustomMarker): NullableMarker { return { __nullable: true, inner } }
 export const isNullableMarker = (x: unknown): x is NullableMarker => typeof x === 'object' && x !== null && (x as { __nullable?: unknown }).__nullable === true
 
 // JS-target overrides:
@@ -94,15 +95,15 @@ export const isNullableMarker = (x: unknown): x is NullableMarker => typeof x ==
 //   date    -> Date object        epoch  -> epoch milliseconds (number)
 // date/epoch apply to timestamp/date/timestamptz: top-level columns parse the wire value; inside a shaped
 // json column they re-parse the ISO string PG serialized into the JSON (Date.parse / new Date).
-export type JsTarget = 'number' | 'string' | 'latin1' | 'date' | 'ms' | 'bigint' | 'precise' | 'pretty' | 'tuple' | 'xy' | 'array' | 'f32' | 'sparse' | 'hex' | 'wkb' | 'geojson'
+export type JsTarget = 'number' | 'string' | 'latin1' | 'date' | 'ms' | 'bigint' | 'precise' | 'pretty' | 'tuple' | 'xy' | 'abc' | 'array' | 'f32' | 'sparse' | 'hex' | 'wkb' | 'geojson'
 /** Split a "<pgtype>" or "<pgtype>:number|string|latin1|date|ms|bigint|precise|pretty" spec into PG type + JS-target override. */
 export function splitType(s: string): { pg: string; js?: JsTarget } {
   const i = s.indexOf(':')
   if (i === -1) return { pg: s.trim() }
   const js = s.slice(i + 1).trim().toLowerCase()
   if (js !== 'number' && js !== 'string' && js !== 'latin1' && js !== 'date' && js !== 'ms' && js !== 'bigint' && js !== 'precise' && js !== 'pretty'
-    && js !== 'tuple' && js !== 'xy' && js !== 'array' && js !== 'f32' && js !== 'sparse' && js !== 'hex' && js !== 'wkb' && js !== 'geojson') {
-    throw new Error(`unknown JS target ${JSON.stringify(js)} in ${JSON.stringify(s)} (use ':number', ':string', ':latin1', ':date', ':ms', ':bigint', ':precise', ':pretty', ':tuple', ':xy', ':array', ':f32', ':sparse', ':hex', ':wkb' or ':geojson')`)
+    && js !== 'tuple' && js !== 'xy' && js !== 'abc' && js !== 'array' && js !== 'f32' && js !== 'sparse' && js !== 'hex' && js !== 'wkb' && js !== 'geojson') {
+    throw new Error(`unknown JS target ${JSON.stringify(js)} in ${JSON.stringify(s)} (use ':number', ':string', ':latin1', ':date', ':ms', ':bigint', ':precise', ':pretty', ':tuple', ':xy', ':abc', ':array', ':f32', ':sparse', ':hex', ':wkb' or ':geojson')`)
   }
   return { pg: s.slice(0, i).trim(), js: js as JsTarget }
 }
@@ -180,6 +181,7 @@ export function specHasPrecision(spec: JsonSpec): boolean {
 export function validateJsonSpec(spec: JsonSpec): void {
   for (const [key, raw] of Object.entries(spec)) {
     const v = jsonBase(raw)
+    if (isCustomMarker(v)) throw new Error(`minipg: Json() field ${JSON.stringify(key)}: defineType() markers aren't supported inside a json shape yet — decode the field as 'unknown'/text and parse with Transform()`)
     if (isJsonMarker(v)) { validateJsonSpec(v.spec); continue }
     const { pg } = splitType(v)
     if (pg.endsWith('[]') && RAWJSON.has(arrayCore(pg).toLowerCase().trim())) {
@@ -207,6 +209,8 @@ export function specNeedsWalk(spec: JsonSpec): boolean {
     const { pg, js } = splitType(raw)
     const core = arrayCore(pg)
     if (temporalTarget(core, js) || bigintField(core, js) || float4Target(core, js) === 'precise') return true
+    const cl = core.toLowerCase().trim() // precision-as-string fields need the String() fixup below
+    if (PRECISION.has(cl) && (js === 'string' || (!js && !BIGINT_PG.has(cl)))) return true
   }
   return false
 }
@@ -227,17 +231,26 @@ function isoEpoch(s: string): number {
  *  precision, so BigInt(that) is a BigInt of the ROUNDED value — exact only with jsonBigints preserving it
  *  as a string. Access is by key, so jsonb's sorted wire order is irrelevant. */
 export function buildJsonWalk(marker: JsonMarker): (v: unknown) => unknown {
-  // Fixup for one scalar (or, via recursion, one array level): 'int8[]' maps the fixer over elements.
+  // Fixup for one scalar or an array of them. The array fixer recurses on DATA depth (an element
+  // that is itself an array descends), since one '<type>[]' spec covers every dimensionality.
   const fixFor = (pg: string, js?: JsTarget): ((x: unknown) => unknown) | null => {
     if (pg.endsWith('[]')) {
       const el = fixFor(pg.slice(0, -2), js)
-      return el ? (x) => (Array.isArray(x) ? x.map((e) => (e == null ? e : el(e))) : x) : null
+      if (!el) return null
+      const fixArr = (x: unknown): unknown =>
+        Array.isArray(x) ? x.map((e) => (e == null ? e : Array.isArray(e) ? fixArr(e) : el(e))) : x
+      return fixArr
     }
     const tt = temporalTarget(pg, js)
     if (tt === 'ms') return (x) => (typeof x === 'string' ? isoEpoch(x) : x)
     if (tt === 'date') return (x) => (typeof x === 'string' ? new Date(isoEpoch(x)) : x)
     if (bigintField(pg, js)) return (x) => (typeof x === 'bigint' ? x : BigInt(x as string | number))
     if (float4Target(pg, js) === 'precise') return (x) => (typeof x === 'number' ? Math.fround(x) : x)
+    // precision types whose jit output is a STRING (int8:string, bare/:string numeric/decimal/money):
+    // JSON.parse gave a number — stringify it so the TYPE matches the scanner (value is best-effort,
+    // like the BigInt fixer above; exactness beyond 2^53 stays a jit/jsonBigints concern).
+    const pl = pg.toLowerCase().trim()
+    if (PRECISION.has(pl) && (js === 'string' || (!js && !BIGINT_PG.has(pl)))) return (x) => (typeof x === 'number' ? String(x) : x)
     return null
   }
   const fns: Array<[string, (x: unknown) => unknown]> = []
@@ -336,12 +349,16 @@ function inlineValue(field: string | JsonMarker | TransformMarker, target: strin
     return inlineMarker(field, target, ctx) // recurse into the scanned object/array
   }
   const { pg, js } = splitType(field)
-  if (pg.endsWith('[]')) { // JSON array of scalars: '[' el (',' el)* ']'; each element re-enters inlineValue
+  if (pg.endsWith('[]')) { // JSON array of scalars: '[' el (',' el)* ']'; each element re-enters inlineValue.
+    // PG uses ONE oid/spec for every dimensionality ('int8[]' covers [[1,2],[3,4]] too), so the parse is a
+    // NAMED LOCAL FUNCTION: an element starting with '[' recurses into it — data-driven depth, like the
+    // wire array parser's nested '{' and the fast path's JSON.parse.
     const elemField = pg.slice(0, -2) + (js ? `:${js}` : '')
-    const id = ctx.n++, A = `_ja${id}`, EL = `_jel${id}`, C = `_jac${id}`
-    return `${SKIPWS} if (jb[jp] === 110) { ${target} = null; jp += 4 } else { jp++; const ${A} = []; ${SKIPWS} `
-      + `if (jb[jp] === 93) { jp++ } else { while (jp < je) { let ${EL} = null; ${SKIPWS} ${inlineValue(elemField, EL, type, ctx)}; ${A}.push(${EL}); `
-      + `${SKIPWS} const ${C} = jb[jp]; if (${C} === 44) { jp++; continue } if (${C} === 93) { jp++; break } break } } ${target} = ${A}; }`
+    const id = ctx.n++, F = `_jrd${id}`, A = `_ja${id}`, EL = `_jel${id}`, C = `_jac${id}`
+    return `${SKIPWS} if (jb[jp] === 110) { ${target} = null; jp += 4 } else { const ${F} = () => { jp++; const ${A} = []; ${SKIPWS} `
+      + `if (jb[jp] === 93) { jp++ } else { while (jp < je) { let ${EL} = null; ${SKIPWS} `
+      + `if (jb[jp] === 91) { ${EL} = ${F}() } else { ${inlineValue(elemField, EL, type, ctx)}; } ${A}.push(${EL}); `
+      + `${SKIPWS} const ${C} = jb[jp]; if (${C} === 44) { jp++; continue } if (${C} === 93) { jp++; break } break } } return ${A} }; ${target} = ${F}(); }`
   }
   const tt = temporalTarget(pg, js)
   if (tt) return inlineEpoch(target, tt, ctx)

@@ -52,6 +52,10 @@
       "types": "./dist/neon-http.d.ts",
       "import": "./dist/neon-http.js"
     },
+    "./geometry": {
+      "types": "./dist/geometry.d.ts",
+      "import": "./dist/geometry.js"
+    },
     "./aurora": {
       "types": "./dist/aurora.d.ts",
       "import": "./dist/aurora.js"

@@ -4,6 +4,7 @@
 import { test, expect, describe, beforeAll, afterAll } from 'bun:test'
 import { testConnect, caught } from '../../helpers/db.ts'
 import { Collect, CollectNullable, Transform, Nullable, Json } from '../../../src/index.ts'
+import { geometry, box2d, box3d } from '../../../src/geometry.ts'
 import type { Connection } from '../../../src/index.ts'
 import type { ShapeSpec } from '../../../src/spec.ts'
 
@@ -141,7 +142,7 @@ describe('Collect / Transform / Nullable', () => {
     const r = await rows(sql, {
       p: 'point:xy', pt: 'point:tuple', ps: 'point', // bare = raw text (explicit-only parsing)
       v: 'vector:array', vf: 'vector:f32',
-      g: 'geometry:geojson', gh: 'geometry',
+      g: geometry('geojson'), gh: geometry(), // minipg/geometry markers (PostGIS left core)
     })
     const row = r[0] as Record<string, unknown>
     expect(row.p).toEqual({ x: 1.5, y: 2.5 })
@@ -154,12 +155,54 @@ describe('Collect / Transform / Nullable', () => {
     expect(row.gh).toBe('0101000020E6100000000000000000F03F0000000000000040') // bare 'geometry' -> raw hex
   })
 
+  test('built-in line: raw text default, :abc / :tuple targets, arrays', async () => {
+    const sql = `SELECT '{1,-2,3.5}'::line l, '{1,-2,3.5}'::line la, '{1,-2,3.5}'::line lt,
+                        array['{1,-2,3.5}'::line, '{0,1,-7}'::line] ls,
+                        array['{1,-2,3.5}'::line, '{0,1,-7}'::line] lsa`
+    const r = await rows(sql, {
+      l: 'line', la: 'line:abc', lt: 'line:tuple', // bare = raw '{A,B,C}' text (explicit-only parsing)
+      ls: 'line[]', lsa: 'line[]:abc',
+    })
+    const row = r[0] as Record<string, unknown>
+    expect(row.l).toBe('{1,-2,3.5}')
+    expect(row.la).toEqual({ a: 1, b: -2, c: 3.5 })
+    expect(row.lt).toEqual([1, -2, 3.5])
+    expect(row.ls).toEqual(['{1,-2,3.5}', '{0,1,-7}'])                       // bare elements = raw text
+    expect(row.lsa).toEqual([{ a: 1, b: -2, c: 3.5 }, { a: 0, b: 1, c: -7 }]) // element :target after []
+  })
+
+  test('ARRAYS of geo/extension types: element :target rides after []', async () => {
+    // extension arrays come through as ::text array-literal fixtures (dynamic OIDs — decode is
+    // driven by the DECLARED element name, so the cluster needs neither pgvector nor PostGIS)
+    const sql = `SELECT array['(1.5,2.5)'::point, '(3,4)'::point] p,
+                        array['(1.5,2.5)'::point, '(3,4)'::point] pt,
+                        array['(1.5,2.5)'::point, '(3,4)'::point] praw,
+                        '{"[1,2.5]","[3,4]"}'::text v, '{"[1,2.5]","[3,4]"}'::text vf,
+                        '{"0101000020E6100000000000000000F03F0000000000000040"}'::text g,
+                        '{"BOX(1 2,3 4)"}'::text b2`
+    const r = await rows(sql, {
+      p: 'point[]:xy', pt: 'point[]:tuple', praw: 'point[]',
+      v: 'vector[]:array', vf: 'vector[]:f32',
+      g: geometry.array('geojson'), b2: box2d.array('xy'),
+    })
+    const row = r[0] as Record<string, unknown>
+    expect(row.p).toEqual([{ x: 1.5, y: 2.5 }, { x: 3, y: 4 }])
+    expect(row.pt).toEqual([[1.5, 2.5], [3, 4]])
+    expect(row.praw).toEqual(['(1.5,2.5)', '(3,4)'])                 // bare elements = raw text
+    expect(row.v).toEqual([[1, 2.5], [3, 4]])
+    const vf = row.vf as Float32Array[]
+    expect(vf[0]).toBeInstanceOf(Float32Array)
+    expect(Array.from(vf[1]!)).toEqual([3, 4])
+    expect(row.g).toEqual([{ type: 'Point', coordinates: [1, 2], srid: 4326 }])
+    expect(row.b2).toEqual([{ xmin: 1, ymin: 2, xmax: 3, ymax: 4 }])
+  })
+
   test('pgvector halfvec/sparsevec + PostGIS boxes', async () => {
     const sql = `SELECT '[1,2.5]'::text hv, '{1:1.5,3:2}/5'::text sv, '{1:1.5,3:2}/5'::text sd,
                         'BOX(1 2,3 4)'::text b2, 'BOX3D(1 2 3,4 5 6)'::text b3, 'BOX(1 2,3 4)'::text braw`
     const r = await rows(sql, {
       hv: 'halfvec:array', sv: 'sparsevec:sparse', sd: 'sparsevec:array',
-      b2: 'box2d:xy', b3: 'box3d:xy', braw: 'box2d',
+      b2: box2d('xy'), b3: box3d('xy'), braw: box2d(),
     })
     const row = r[0] as Record<string, unknown>
     expect(row.hv).toEqual([1, 2.5])

@@ -9,8 +9,13 @@ import type { TxFn } from './connection.ts'
 import { resolveUrl } from './url.ts'
 import type { PoolConfig, QueryOptions, QueryResult, TxOptions } from './types.ts'
 import { Cursor, type CursorOptions } from './cursor.ts'
+import { installVercelCompat, type VercelPoolSurface } from './compat/vercel.ts'
 
 interface Waiter { resolve: (c: Connection) => void; reject: (e: Error) => void }
+
+// The Vercel attachDatabasePool() surface (options.idleTimeoutMillis + on('release')) is grafted onto
+// every instance by compat/vercel.ts; this declaration merge puts it on Pool's TYPE.
+export interface Pool extends VercelPoolSurface {}
 
 // Errors that mean "this database will never come back on its own" — don't probe.
 function classify(err: unknown): 'fatal' | 'unavailable' {
@@ -29,12 +34,12 @@ export class Pool {
   private waiters: Waiter[] = [] // waiting because the pool is at max
   private closed = false
 
-  // Idle-connection eviction + a minimal EventEmitter surface, so `pool.options.idleTimeoutMillis` and
-  // the `'release'` event let Vercel's attachDatabasePool() drive Fluid-compute connection draining.
+  // Idle-connection eviction (a connection sitting in `idle` past idleMs is closed and dropped).
   private idleMs: number
   private idleTimers = new Map<Connection, ReturnType<typeof setTimeout>>()
-  private listeners = new Map<string, Array<(...args: unknown[]) => void>>()
-  readonly options: { idleTimeoutMillis: number }
+  // compat/vercel.ts grafts the attachDatabasePool() surface (options + on) onto the instance;
+  // release() fires this notifier so Vercel can extend the instance's lifetime.
+  private notifyRelease: () => void
 
   // reconnect / circuit breaker
   private rcEnabled: boolean
@@ -56,20 +61,13 @@ export class Pool {
     this.maxBackoff = o.maxMs ?? 2000
     this.acquireTimeout = o.acquireTimeoutMs ?? 30000
     this.idleMs = cfg.idleTimeoutMillis ?? 0
-    this.options = { idleTimeoutMillis: this.idleMs } // detection surface for attachDatabasePool()
+    this.notifyRelease = installVercelCompat(this, this.idleMs)
   }
 
   get size(): number { return this.all.size }
   get idleCount(): number { return this.idle.length }
   get waiting(): number { return this.waiters.length }
   get isDown(): boolean { return this.down }
-
-  /** EventEmitter-style subscription (only `'release'` is emitted). Present so attachDatabasePool()
-   *  recognizes the pool and can extend the instance lifetime on release. */
-  on(event: string, listener: (...args: unknown[]) => void): this {
-    const arr = this.listeners.get(event) ?? []; arr.push(listener); this.listeners.set(event, arr); return this
-  }
-  private emit(event: string): void { const arr = this.listeners.get(event); if (arr) for (const l of arr) try { l() } catch { /* listener errors never break the pool */ } }
 
   // idle eviction: a connection sitting in `idle` past idleMs is closed and dropped
   private armIdleTimer(conn: Connection): void {
@@ -178,7 +176,7 @@ export class Pool {
   release(conn: Connection): void {
     if (!this.out.has(conn)) return // double-release / foreign connection
     this.out.delete(conn)
-    this.emit('release') // signal to attachDatabasePool() that a client returned (extends instance life)
+    this.notifyRelease() // attachDatabasePool() listens for 'release' (extends instance life)
     if (conn.state === 'closed') { this.all.delete(conn); this.refill(); return }
     if (this.closed) { this.all.delete(conn); void conn.end(); return }
     if (conn.inTransaction) { // never leak tx state across checkouts
