@@ -4,6 +4,7 @@
 // and only once the probe reconnects is the herd released — no reconnect storm into a
 // recovering database. Dead idle connections are evicted on checkout; open transactions
 // are rolled back before reuse. In-flight queries are never silently replayed.
+import { AsyncLocalStorage } from 'node:async_hooks'
 import { Connection } from './connection.ts'
 import type { TxFn } from './connection.ts'
 import { resolveUrl } from './url.ts'
@@ -12,6 +13,11 @@ import { Cursor, type CursorOptions } from './cursor.ts'
 import { installVercelCompat, type VercelPoolSurface } from './compat/vercel.ts'
 
 interface Waiter { resolve: (c: Connection) => void; reject: (e: Error) => void }
+
+// The txGuard marker. `active` is flipped off when the transaction settles, so work that was merely
+// STARTED inside the callback but runs after it (a detached task) is not falsely rejected — the ban is
+// scoped to the transaction's LIFETIME, not just to the async context that inherits it.
+interface TxMark { active: boolean }
 
 // The Vercel attachDatabasePool() surface (options.idleTimeoutMillis + on('release')) is grafted onto
 // every instance by compat/vercel.ts; this declaration merge puts it on Pool's TYPE.
@@ -24,6 +30,14 @@ function classify(err: unknown): 'fatal' | 'unavailable' {
   return 'unavailable' // ECONNREFUSED/RESET/timeout, 57P0x shutdown, connection terminated, ...
 }
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms))
+
+const TX_GUARD_MSG =
+  'minipg: this pool was used INSIDE its own transaction() callback. That checks out a second connection, so the ' +
+  'query would run outside the transaction — blind to its uncommitted rows, and untouched by its rollback — and ' +
+  'deadlocks the pool once every connection is held. Use the handle the callback is given: ' +
+  'pool.transaction(async (tx) => { await tx.query(...) }). Naming that parameter `pool` shadows the outer one and ' +
+  'makes the mistake unwriteable. If you really do want a separate connection here, wrap it in ' +
+  'pool.outsideTransaction(() => ...). Disable this check with { txGuard: false }.'
 
 export class Pool {
   private cfg: PoolConfig
@@ -50,6 +64,13 @@ export class Pool {
   private broken: Error | null = null // fatal, unrecoverable (e.g. auth)
   private recovered: (() => void)[] = [] // wake-ups for acquirers waiting on recovery
 
+  // How long an acquire may sit at max before failing (0 = forever, the old behaviour).
+  private acquireMs: number
+  // txGuard: PER-POOL AsyncLocalStorage, created lazily on the first transaction() — a pool that never
+  // opens one pays literally nothing, and per-pool (not global) means poolA's tx never bans poolB.
+  private guardTx: boolean
+  private als?: AsyncLocalStorage<TxMark>
+
   constructor(config: string | PoolConfig = {}) {
     const cfg = resolveUrl(typeof config === 'string' ? { url: config } : config) // string / url -> config
     this.cfg = cfg
@@ -60,6 +81,8 @@ export class Pool {
     this.base = o.baseMs ?? 50
     this.maxBackoff = o.maxMs ?? 2000
     this.acquireTimeout = o.acquireTimeoutMs ?? 30000
+    this.acquireMs = cfg.acquireTimeoutMillis ?? 30000
+    this.guardTx = cfg.txGuard !== false
     this.idleMs = cfg.idleTimeoutMillis ?? 0
     this.notifyRelease = installVercelCompat(this, this.idleMs)
   }
@@ -80,8 +103,21 @@ export class Pool {
   }
   private clearIdleTimer(conn: Connection): void { const t = this.idleTimers.get(conn); if (t) { clearTimeout(t); this.idleTimers.delete(conn) } }
 
+  /** Run `fn` with the txGuard lifted — for the rare deliberate "I want a SEPARATE connection here, one
+   *  that outlives this transaction's rollback" (an audit row that must survive). Uses run(), never
+   *  enterWith()/disable(), which Workers' AsyncLocalStorage omits. */
+  outsideTransaction<T>(fn: () => T | Promise<T>): Promise<T> {
+    if (!this.als) return Promise.resolve(fn())
+    // `await` INSIDE the scope: pool.query() is LAZY, so returning its PoolQuery unawaited would run the
+    // acquire in the CALLER's context (guard still armed) and defeat the hatch.
+    return this.als.run({ active: false }, async () => await fn())
+  }
+
   async acquire(): Promise<Connection> {
     if (this.closed) throw new Error('pool is closed')
+    // Every pool op funnels through acquire(), so ONE check covers query/execute/batch/pipeline/
+    // cursor/connect/bulk*/copy* and nested transaction().
+    if (this.als?.getStore()?.active) throw new Error(TX_GUARD_MSG)
     if (this.broken) throw this.broken
     if (this.down && this.rcEnabled) await this.waitForRecovery()
     // reuse a live idle connection (evict dead ones that died while idle)
@@ -104,7 +140,42 @@ export class Pool {
         return this.acquire() // breaker is now down -> wait for the single probe
       }
     }
-    return new Promise<Connection>((resolve, reject) => this.waiters.push({ resolve, reject }))
+    return this.waitForFree()
+  }
+
+  // At max: park until someone releases. Bounded by acquireTimeoutMillis so exhaustion surfaces as a
+  // loud, self-describing error instead of an unbounded hang.
+  private waitForFree(): Promise<Connection> {
+    return new Promise<Connection>((resolve, reject) => {
+      if (this.acquireMs <= 0) { this.waiters.push({ resolve, reject }); return }
+      const w: Waiter = {
+        resolve: (c) => { clearTimeout(to); resolve(c) },
+        reject: (e) => { clearTimeout(to); reject(e) },
+      }
+      const to = setTimeout(() => {
+        const i = this.waiters.indexOf(w); if (i >= 0) this.waiters.splice(i, 1)
+        reject(new Error(`minipg: pool acquire timed out after ${this.acquireMs}ms — all ${this.max} connection(s) are checked out.${this.stuckHint()}`))
+      }, this.acquireMs)
+      // never let a pending acquire keep the process alive (pg-pool does the same); workerd's
+      // setTimeout returns a number with no unref
+      ;(to as { unref?: () => void }).unref?.()
+      this.waiters.push(w)
+    })
+  }
+
+  // Diagnostic ONLY, evaluated after the timeout already fired — never a trigger. A snapshot cannot tell
+  // a deadlock from a tx awaiting slow non-DB work, but once the wait has expired, "every holder is idle
+  // inside a transaction" is a strong enough signal to name the usual culprit (as knex's message does).
+  private stuckHint(): string {
+    if (!this.out.size) return ''
+    for (const c of this.out) {
+      if (!c.inTransaction) return ''
+      const s = c.stats
+      if (s.inflight || s.queued) return ''
+    }
+    return ' Every one of them is sitting IDLE inside an open transaction, so none will be released:' +
+      ' a common cause is using the pool inside a transaction() callback (which needs a second connection' +
+      ' while the first is still held) — use the `tx` handle passed to the callback instead.'
   }
 
   private async open(): Promise<Connection> {
@@ -296,9 +367,16 @@ export class Pool {
   transaction<T>(a: TxOptions | TxFn<T>, b?: TxFn<T>): Promise<T> { return this.withTx(a, b) }
 
   private async withTx<T>(a: TxOptions | TxFn<T>, b?: TxFn<T>): Promise<T> {
-    const conn = await this.acquire()
-    try { return await (typeof a === 'function' ? conn.begin(a) : conn.begin(a, b!)) }
-    finally { this.release(conn) } // release() rolls back if fn left the conn in a tx (defensive) and checks it back in
+    const conn = await this.acquire() // BEFORE the guard scope is entered — a tx's own checkout is legal
+    const run = () => (typeof a === 'function' ? conn.begin(a) : conn.begin(a, b!))
+    if (!this.guardTx) {
+      try { return await run() } finally { this.release(conn) }
+    }
+    this.als ??= new AsyncLocalStorage<TxMark>() // first transaction on this pool arms the guard
+    const mark: TxMark = { active: true }
+    try { return await this.als.run(mark, run) }
+    // mark BEFORE release: a waiter woken by release() must not still see this tx as active
+    finally { mark.active = false; this.release(conn) } // release() rolls back if fn left the conn in a tx (defensive) and checks it back in
   }
 
   async end(): Promise<void> {

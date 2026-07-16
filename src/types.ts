@@ -194,4 +194,14 @@ export interface PoolConfig extends ConnectConfig {
   /** Single-flight reconnect on connection failure. `false` disables it (fail fast).
    *  Object tunes backoff (baseMs/maxMs) and how long an acquire waits for recovery. */
   reconnect?: boolean | { baseMs?: number; maxMs?: number; acquireTimeoutMs?: number }
+  /** Reject an acquire that has waited this long for a free connection (default 30000; 0 = wait forever).
+   *  Without it an exhausted pool hangs with no diagnostic — the failure mode every pool has shipped at
+   *  some point (pg's connectionTimeoutMillis defaults to off; knex's defaults to 60s). */
+  acquireTimeoutMillis?: number
+  /** Throw when this pool is used INSIDE its own transaction() callback (default true). Such a query
+   *  checks out a SECOND connection, so it silently runs OUTSIDE the tx — blind to its uncommitted rows,
+   *  and unaffected by its rollback — and deadlocks outright once the pool is saturated. Requires
+   *  AsyncLocalStorage; where that is absent the guard is skipped and acquireTimeoutMillis is the
+   *  backstop. Purely additive: it only ever rejects a call that was already a bug. */
+  txGuard?: boolean
 }

@@ -297,7 +297,11 @@ describe('pure net/tls/crypto surface (static-import audit of src/)', () => {
     // match actual imports/native artifacts, not prose (comments may mention cloudflare:sockets etc.)
     const forbidden = /(from ['"]pg-native|from ['"]libpq|from ['"]cloudflare:sockets|require\(['"]net['"]\)|node-gyp|\.node['"])/
     const nodeImport = /from\s+['"]node:([a-z_]+)['"]/g
-    const allowed = new Set(['net', 'tls', 'crypto', 'os', 'stream', 'module', 'path', 'url', 'fs', 'assert'])
+    // async_hooks: the pool's txGuard (AsyncLocalStorage). Safe to import statically for the same reason
+    // node:crypto is — core already needs crypto for auth, so every runtime that can run the pool at all
+    // (node/bun/deno/workers-with-nodejs_compat) supplies both. A runtime lacking async_hooks would have
+    // already failed on crypto.
+    const allowed = new Set(['net', 'tls', 'crypto', 'os', 'stream', 'module', 'path', 'url', 'fs', 'assert', 'async_hooks'])
     const builtinsSeen = new Set<string>()
     for (const f of srcFiles) {
       const text = readFileSync(join(SRC_DIR, f), 'utf8')
