@@ -36,9 +36,19 @@ describe('defineType registry', () => {
 
   test('minipg/geometry is a registry customer: same machinery end to end', async () => {
     await withConn(async (c) => {
-      const r = await c.query(`select '0101000020E6100000000000000000F03F0000000000000040'::text g`,
-        [], { shape: { g: geometry('geojson') } })
-      expect((r.rows[0] as { g: unknown }).g).toEqual({ type: 'Point', coordinates: [1, 2], srid: 4326 })
+      const PT = '0101000020E6100000000000000000F03F0000000000000040' // SRID=4326 POINT(1 2)
+      const LINE = '010200000002000000' + '0000000000000000'.repeat(2) + '000000000000F03F'.repeat(2) // LINESTRING(0 0,1 1)
+      const r = await c.query(`select '${PT}'::text g, '${PT}'::text gxy, '${PT}'::text gt, '{"${PT}"}'::text gs`,
+        [], { shape: { g: geometry('geojson'), gxy: geometry('xy'), gt: geometry('tuple'), gs: geometry.array('xy') } })
+      const row = r.rows[0] as Record<string, unknown>
+      expect(row.g).toEqual({ type: 'Point', coordinates: [1, 2], srid: 4326 })
+      expect(row.gxy).toEqual({ x: 1, y: 2 })
+      expect(row.gt).toEqual([1, 2])
+      expect(row.gs).toEqual([{ x: 1, y: 2 }])
+      // the declared-Point contract is LOUD: a LineString under :xy rejects, connection survives
+      const e = await caught(() => c.query(`select '${LINE}'::text g`, [], { shape: { g: geometry('xy') } }))
+      expect(String((e as Error).message)).toMatch(/expect a Point geometry, got LineString/)
+      expect((await c.query('select 1', [])).rowCount).toBe(1)
     })
   }, TEST_TIMEOUT)
 

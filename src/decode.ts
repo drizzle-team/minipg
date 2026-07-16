@@ -16,7 +16,7 @@ import type { Decoder } from './types.ts'
 import { parseJsonBuffer } from './jsonparse.ts'
 import { genJsonParsers, specNeedsWalk, buildJsonWalk, type JsonMarker, type JsonPlan, type JsTarget } from './json.ts'
 import { extAt, extLeafFor, parseLineAbc, parseLineTuple } from './geo.ts'
-import { customAt, customLeafFor } from './registry.ts'
+import { customAt, customDelimFor, customLeafFor } from './registry.ts'
 
 // ---------------------------------------------------------------------------------------------
 // Section 1a: the DEFAULT DECODER CATALOG — plain (Buffer) => value decoders keyed by OID. This is
@@ -145,7 +145,8 @@ function elemLeafFor(elemOid: number, js?: string): Leaf {
     case 17: return byteaLeaf                                         // bytea -> Buffer
     case 20: return js === 'number' ? numLeaf : js === 'string' ? strLeaf : bigIntLeaf // int8 -> BigInt (default)
     case 21: case 23: case 26: case 700: case 701: return numLeaf     // int2/int4/oid/float4/float8 -> Number
-    case 1700: case 790: return js === 'number' ? numLeaf : strLeaf   // numeric/money -> exact STRING (default)
+    case 1700: return js === 'number' ? numLeaf : js === 'bigint' ? bigIntLeaf : strLeaf // numeric -> exact STRING (default); :bigint = integer-only contract (fractional throws)
+    case 790: return js === 'number' ? numLeaf : strLeaf              // money -> exact STRING (default)
     case 114: case 3802: return jsonLeaf                             // json/jsonb -> JSON.parse
     case 1082: case 1114: case 1184: return js === 'ms' ? parseInstantMs : js === 'string' ? strLeaf : (s: string) => new Date(parseInstantMs(s)) // date/timestamp(tz) -> Date (default)
     default: return strLeaf                                           // text/varchar/bpchar/char/name/uuid/time/interval
@@ -153,8 +154,10 @@ function elemLeafFor(elemOid: number, js?: string): Leaf {
 }
 
 /** Parse a PG array text literal ('{…}') into a nested JS array (inverse of arrayLiteral). Honors nesting,
- *  empty {}, unquoted bare NULL -> null, quoted backslash-escaped elements, and a leading [lb:ub]= prefix. */
-export function parseArrayLiteral(decodeLeaf: Leaf): (text: string) => unknown[] {
+ *  empty {}, unquoted bare NULL -> null, quoted backslash-escaped elements, and a leading [lb:ub]= prefix.
+ *  `delim` is the element type's typdelim — ',' for almost everything, but ':' for PostGIS
+ *  geometry/geography and ';' for box, which emit '{a:b}' / '{a;b}'. */
+export function parseArrayLiteral(decodeLeaf: Leaf, delim = ','): (text: string) => unknown[] {
   return (text) => {
     let i = 0
     if (text[0] === '[') { const eq = text.indexOf('='); if (eq >= 0) i = eq + 1 } // skip [lb:ub]= dimension prefix
@@ -164,15 +167,15 @@ export function parseArrayLiteral(decodeLeaf: Leaf): (text: string) => unknown[]
       while (i < text.length) {
         const c = text[i]
         if (c === '}') { i++; break }
-        if (c === ',') { i++; continue }
+        if (c === delim) { i++; continue }
         if (c === '{') { out.push(arr()); continue } // nesting
         if (c === '"') { // quoted, backslash-escaped element
           i++; let s = ''
           while (i < text.length) { const ch = text[i]!; if (ch === '\\') { s += text[i + 1]; i += 2; continue } if (ch === '"') { i++; break } s += ch; i++ }
           out.push(decodeLeaf(s)); continue // a quoted "NULL" is the literal string
         }
-        let j = i // unquoted -> read to ',' or '}'; a bare NULL is SQL null
-        while (j < text.length && text[j] !== ',' && text[j] !== '}') j++
+        let j = i // unquoted -> read to the delimiter or '}'; a bare NULL is SQL null
+        while (j < text.length && text[j] !== delim && text[j] !== '}') j++
         const raw = text.slice(i, j); i = j
         out.push(raw === 'NULL' ? null : decodeLeaf(raw))
       }
@@ -185,7 +188,11 @@ export function parseArrayLiteral(decodeLeaf: Leaf): (text: string) => unknown[]
 /** Whole-value Decoder for an array column, by ELEMENT type (works for extension elements whose
  *  array OID is per-database — the shape's declared element drives the decode). */
 export function arrayDecoderForElem(elem: number | undefined, js?: string): Decoder {
-  const parse = parseArrayLiteral(elem === undefined ? strLeaf : elemLeafFor(elem, js))
+  // Resolved here, not at the call sites, so every array path (shape/helper/interpreted) agrees.
+  // Built-in box (603) is the only other non-',' type in PG — give it ';' if it ever joins TYPE_OID.
+  const parse = elem === undefined
+    ? parseArrayLiteral(strLeaf)
+    : parseArrayLiteral(elemLeafFor(elem, js), customDelimFor(elem) ?? ',')
   return (b) => parse(b.toString('utf8'))
 }
 /** Same, keyed by a STATIC array OID (built-in types). */

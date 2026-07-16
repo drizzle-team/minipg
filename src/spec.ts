@@ -57,6 +57,7 @@ export function resolveParamTypes(ts: readonly (number | string)[]): readonly nu
 type TemporalType = 'date' | 'timestamp' | 'timestamptz'
 type IntType = 'int8' | 'bigint'                     // default BigInt; :number (lossy) / :string
 type NumericType = 'numeric' | 'decimal' | 'money'   // default exact string; :number (lossy)
+type BigNumericType = 'numeric' | 'decimal'          // :bigint = declared INTEGER-only numeric (uint256 pattern); fractional values THROW (BigInt(text) is loud). money excluded (locale text)
 type Float4Type = 'float4' | 'real'                  // default/:pretty -> canonical shortest; :precise -> exact f32
 type TextType = 'text' | 'varchar' | 'bpchar' | 'char' | 'name'
 /** A column's type in a shape: a PG alias, plus the JS-target overrides valid for it (autocompletes to the
@@ -74,6 +75,7 @@ export type TypeSpec =
   | `${TemporalType}:${'date' | 'ms'}`
   | `${IntType}:${'number' | 'bigint'}`
   | `${NumericType}:number`
+  | `${BigNumericType}${'' | '[]'}:bigint`
   | `${Float4Type}:${'precise' | 'pretty'}`
   | `${TextType}:latin1`
   // array forms — decode a '{…}' result column to a JS array; the element :target binds AFTER the []

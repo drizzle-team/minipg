@@ -19,6 +19,7 @@ export interface CustomTypeDef {
   readonly name: string
   readonly oid: number // allocated sentinel (negative) — the col/cache identity for this def
   readonly ascii: boolean
+  readonly delim: string // PG's per-type typdelim: how ITS array literals separate elements
   readonly targets: Record<string, (text: string) => unknown>
   readonly rawTargets: Record<string, RawCell>
 }
@@ -45,10 +46,12 @@ const DEFS = new Map<number, CustomTypeDef>() // sentinel oid -> def (array elem
 
 export function defineType<K extends string = never, R extends string = never>(
   name: string,
-  spec: { ascii?: boolean; targets?: Record<K, (text: string) => unknown>; rawTargets?: Record<R, RawCell> },
+  spec: { ascii?: boolean; delim?: string; targets?: Record<K, (text: string) => unknown>; rawTargets?: Record<R, RawCell> },
 ): CustomType<K | R> {
+  // PG stores typdelim as a single char; a longer one would silently mis-split every array literal.
+  if (spec.delim !== undefined && spec.delim.length !== 1) throw new Error(`minipg: type "${name}" delim must be a single character, got ${JSON.stringify(spec.delim)}`)
   const def: CustomTypeDef = {
-    name, oid: nextCustomOid--, ascii: spec.ascii === true,
+    name, oid: nextCustomOid--, ascii: spec.ascii === true, delim: spec.delim ?? ',',
     targets: (spec.targets ?? {}) as CustomTypeDef['targets'],
     rawTargets: (spec.rawTargets ?? {}) as CustomTypeDef['rawTargets'],
   }
@@ -87,6 +90,11 @@ export function customAt(col: { oid: number; js?: string; array?: unknown }): Ra
   const slice = def.ascii ? sliceLat1 : sliceUtf8
   return (b, o, l) => slice(b, o, l) // bare = raw text
 }
+
+/** Element delimiter for a registry ARRAY, or undefined when the oid isn't a registry sentinel.
+ *  Fixed per type by its CREATE TYPE (PostGIS pins ':' for geometry/geography), so it's declared,
+ *  not discovered — RowDescription never carries typdelim. */
+export const customDelimFor = (elem: number): string | undefined => DEFS.get(elem)?.delim
 
 /** String-leaf for a registry ARRAY ELEMENT (array literals carry element text), or null. */
 export function customLeafFor(elem: number, target?: string): ((s: string) => unknown) | null {

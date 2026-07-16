@@ -132,6 +132,30 @@ describe('scalar arrays inside Json()/Jsonb() shapes', () => {
     })
   }, TEST_TIMEOUT)
 
+  test('numeric:bigint — the uint256 contract: exact beyond int8, LOUD throw on fractional', async () => {
+    await withConn(async (c) => {
+      const big = 2n ** 100n // far beyond int8's 64 bits — the reason the target exists
+      // wire: scalar + array + multidim
+      const r = await c.query(
+        `select ${big}::numeric(40,0) as v, array[${big}, 2]::numeric[] as a, array[[${big}],[7]]::numeric[] as aa`,
+        [], { shape: { v: 'numeric:bigint', a: 'numeric[]:bigint', aa: 'numeric[]:bigint' } })
+      const row = r.rows[0] as { v: bigint; a: bigint[]; aa: bigint[][] }
+      expect(row.v).toBe(big)
+      expect(row.a).toEqual([big, 2n])
+      expect(row.aa).toEqual([[big], [7n]])
+      // shaped json (the scanner reads exact digit tokens — both engines)
+      const j = await c.query(`select row_to_json(x) as d from (select ${big}::numeric(40,0) as v, array[${big}]::numeric[] as a) x`,
+        [], { shape: { d: Json({ v: 'numeric:bigint', a: 'numeric[]:bigint' }) } })
+      const dj = (j.rows[0] as { d: { v: bigint; a: bigint[] } }).d
+      expect(dj.v).toBe(big)
+      expect(dj.a).toEqual([big])
+      // fractional value violates the declared integer contract -> LOUD error, connection survives
+      const e = await caught(() => c.query('select 10.50::numeric as v', [], { shape: { v: 'numeric:bigint' } }))
+      expect(String((e as Error).message)).toMatch(/Cannot convert|Failed to parse|invalid BigInt/)
+      expect(((await c.query('select 1 as ok', [], { mode: 'object' })).rows[0] as { ok: number }).ok).toBe(1)
+    })
+  }, TEST_TIMEOUT)
+
   test(`'json[]'/'unknown[]' inside Json() throw at shape build (no silent mis-decode)`, async () => {
     await withConn(async (c) => {
       const e = await caught(() => c.query('select 1 as d', [], { shape: { d: Json({ x: 'json[]' as never }) } }))

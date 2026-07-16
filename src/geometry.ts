@@ -59,15 +59,25 @@ export function parseWkb(b: Buffer, pos = 0): { geo: GeoJson; end: number } {
 }
 export const parseEwkbHex = (hex: string): GeoJson => parseWkb(Buffer.from(hex, 'hex')).geo
 
+// :xy/:tuple are the DECLARED-POINT contract (drizzle's geometry(point) modes): a non-Point
+// value under them throws loudly — same never-silent precedent as numeric:bigint's integer contract.
+const ewkbPointCoords = (s: string): number[] => {
+  const geo = parseEwkbHex(s)
+  if (geo.type !== 'Point') throw new Error(`minipg/geometry: :xy/:tuple expect a Point geometry, got ${geo.type || 'an empty geometry'} — use :geojson for mixed geometry columns`)
+  return geo.coordinates as number[]
+}
 const GEO_TARGETS = {
   geojson: parseEwkbHex,
   wkb: (s: string): Buffer => Buffer.from(s, 'hex'),
   hex: (s: string): string => s, // explicit alias of the bare raw text
+  xy: (s: string): { x: number; y: number } => { const c = ewkbPointCoords(s); return { x: c[0]!, y: c[1]! } },
+  tuple: ewkbPointCoords, // full coordinate array — XYZ/XYZM points keep their extra dimensions
 }
-/** PostGIS `geometry`: raw EWKB hex text bare/:hex; GeoJSON-shaped object (:geojson); Buffer (:wkb). */
-export const geometry = defineType('geometry', { ascii: true, targets: GEO_TARGETS })
+/** PostGIS `geometry`: raw EWKB hex text bare/:hex; GeoJSON-shaped object (:geojson); Buffer (:wkb);
+ *  Point-declared columns: {x,y} (:xy) or the coordinate array (:tuple) — non-Point values THROW. */
+export const geometry = defineType('geometry', { ascii: true, delim: ':', targets: GEO_TARGETS })
 /** PostGIS `geography` — same wire text as geometry. */
-export const geography = defineType('geography', { ascii: true, targets: GEO_TARGETS })
+export const geography = defineType('geography', { ascii: true, delim: ':', targets: GEO_TARGETS })
 
 const boxTargets = (is3d: boolean) => ({
   tuple: parseBox,
