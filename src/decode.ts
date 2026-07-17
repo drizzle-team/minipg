@@ -126,7 +126,7 @@ function parseInstantMs(s: string): number {
     Mi = (s.charCodeAt(p) - 48) * 10 + (s.charCodeAt(p + 1) - 48); p += 3
     S = (s.charCodeAt(p) - 48) * 10 + (s.charCodeAt(p + 1) - 48); p += 2
     if (p < e && s.charCodeAt(p) === 46) { p++; let f = 0, k = 0; for (; p < e && k < 3; p++) { const c = s.charCodeAt(p); if (c < 48 || c > 57) break; f = f * 10 + (c - 48); k++ } while (k < 3) { f *= 10; k++ } ms = f; while (p < e) { const c = s.charCodeAt(p); if (c < 48 || c > 57) break; p++ } }
-    if (p < e && (s.charCodeAt(p) === 43 || s.charCodeAt(p) === 45)) { const sg = s.charCodeAt(p) === 45 ? -1 : 1; p++; const th = (s.charCodeAt(p) - 48) * 10 + (s.charCodeAt(p + 1) - 48); p += 2; let tm = 0; if (p < e && s.charCodeAt(p) === 58) { p++; tm = (s.charCodeAt(p) - 48) * 10 + (s.charCodeAt(p + 1) - 48); p += 2 } off = sg * (th * 60 + tm) * 60000 }
+    if (p < e && (s.charCodeAt(p) === 43 || s.charCodeAt(p) === 45)) { const sg = s.charCodeAt(p) === 45 ? -1 : 1; p++; const th = (s.charCodeAt(p) - 48) * 10 + (s.charCodeAt(p + 1) - 48); p += 2; let tm = 0, tsc = 0; if (p < e && s.charCodeAt(p) === 58) { p++; tm = (s.charCodeAt(p) - 48) * 10 + (s.charCodeAt(p + 1) - 48); p += 2; if (p < e && s.charCodeAt(p) === 58) { p++; tsc = (s.charCodeAt(p) - 48) * 10 + (s.charCodeAt(p + 1) - 48); p += 2 } } off = sg * ((th * 60 + tm) * 60 + tsc) * 1000 } // LMT offsets carry SECONDS (named tz, pre-standard/BC dates)
   }
   const year = bc ? 1 - Y : Y // PG 'N BC' -> proleptic/astronomical year 1-N (44 BC -> -43, 1 BC -> 0)
   let ems = Date.UTC(year, Mo - 1, D, H, Mi, S, ms)
@@ -301,7 +301,7 @@ const tsFromBytes = (v: string, kind: 'date' | 'ms') => `{ let p = o; const e = 
         Mi = (b[p] - 48) * 10 + (b[p + 1] - 48); p += 3;
         S = (b[p] - 48) * 10 + (b[p + 1] - 48); p += 2;
         if (p < e && b[p] === 46) { p++; let f = 0, k = 0; for (; p < e && k < 3; p++) { const c = b[p]; if (c < 48 || c > 57) break; f = f * 10 + (c - 48); k++ } while (k < 3) { f *= 10; k++ } ms = f; while (p < e) { const c = b[p]; if (c < 48 || c > 57) break; p++ } }
-        if (p < e && (b[p] === 43 || b[p] === 45)) { const sg = b[p] === 45 ? -1 : 1; p++; const th = (b[p] - 48) * 10 + (b[p + 1] - 48); p += 2; let tm = 0; if (p < e && b[p] === 58) { p++; tm = (b[p] - 48) * 10 + (b[p + 1] - 48); p += 2 } off = sg * (th * 60 + tm) * 60000 }
+        if (p < e && (b[p] === 43 || b[p] === 45)) { const sg = b[p] === 45 ? -1 : 1; p++; const th = (b[p] - 48) * 10 + (b[p + 1] - 48); p += 2; let tm = 0, tsc = 0; if (p < e && b[p] === 58) { p++; tm = (b[p] - 48) * 10 + (b[p + 1] - 48); p += 2; if (p < e && b[p] === 58) { p++; tsc = (b[p] - 48) * 10 + (b[p + 1] - 48); p += 2 } } off = sg * ((th * 60 + tm) * 60 + tsc) * 1000 }
       }
       let ems = Date.UTC(Y, Mo - 1, D, H, Mi, S, ms); if (Y <= 99) { const dd = new Date(ems); dd.setUTCFullYear(Y); ems = dd.getTime() } ems -= off; ${kind === 'date' ? `${v} = new Date(ems)` : `${v} = ems`} }`
 
@@ -633,7 +633,7 @@ function tsParse(b: Buffer, o: number, l: number): number {
     Mi = (b[p]! - 48) * 10 + (b[p + 1]! - 48); p += 3
     S = (b[p]! - 48) * 10 + (b[p + 1]! - 48); p += 2
     if (p < e && b[p] === 46) { p++; let f = 0, k = 0; for (; p < e && k < 3; p++) { const c = b[p]!; if (c < 48 || c > 57) break; f = f * 10 + (c - 48); k++ } while (k < 3) { f *= 10; k++ } ms = f; while (p < e) { const c = b[p]!; if (c < 48 || c > 57) break; p++ } }
-    if (p < e && (b[p] === 43 || b[p] === 45)) { const sg = b[p] === 45 ? -1 : 1; p++; const th = (b[p]! - 48) * 10 + (b[p + 1]! - 48); p += 2; let tm = 0; if (p < e && b[p] === 58) { p++; tm = (b[p]! - 48) * 10 + (b[p + 1]! - 48); p += 2 } off = sg * (th * 60 + tm) * 60000 }
+    if (p < e && (b[p] === 43 || b[p] === 45)) { const sg = b[p] === 45 ? -1 : 1; p++; const th = (b[p]! - 48) * 10 + (b[p + 1]! - 48); p += 2; let tm = 0, tsc = 0; if (p < e && b[p] === 58) { p++; tm = (b[p]! - 48) * 10 + (b[p + 1]! - 48); p += 2; if (p < e && b[p] === 58) { p++; tsc = (b[p]! - 48) * 10 + (b[p + 1]! - 48); p += 2 } } off = sg * ((th * 60 + tm) * 60 + tsc) * 1000 }
   }
   let ems = Date.UTC(Y, Mo - 1, D, H, Mi, S, ms)
   if (Y <= 99) { const d = new Date(ems); d.setUTCFullYear(Y); ems = d.getTime() } // Date.UTC remaps years 0-99 to 1900+Y; undo it BEFORE applying the tz offset
@@ -787,4 +787,46 @@ export function replBinaryFor(oid: number, map: Map<number, Decoder>): CellDecod
 export function replBinaryMatchesText(oid: number, map: Map<number, Decoder>): boolean {
   if (oid === 700 || ELEM_OID[oid] !== undefined) return false
   return replBinaryFor(oid, map) !== null
+}
+
+// ---- Binary tuples for SHAPED replication columns (`start({ shapes })`) ------------------------
+// Same contract as replBinaryFor, but honoring the column's DECLARED js target: null whenever
+// binary bytes cannot produce the value the declaration promises (e.g. 'timestamptz:string' is
+// PG's exact text — binary carries µs since 2000, not that text). Null -> the loud lazy error
+// naming table.column when a binary value actually arrives.
+
+// oids whose binary decode reproduces the EXACT text-mode string for a :string target
+const BIN_TEXT_EXACT = new Set([20, 18, 19, 25, 1042, 1043, 2950])
+
+function replShapedLeaf(oid: number, map: Map<number, Decoder>, js?: Target): CellDecoder | null {
+  if (oid <= 0) return null // defineType()/extension sentinels: their targets take TEXT (hex/literals), binary bytes can't honor them
+  if (map !== defaultDecoders) { const d = map.get(oid); if (d && d !== defaultDecoders.get(oid)) return null }
+  if (oid === 1700) {
+    if (js === 'bigint') return (b, o, l) => BigInt(binNumericStr(b, o, l) as string) // integer-only contract: fractional throws, same as text
+    if (js === 'number') return (b, o, l) => Number(binNumericStr(b, o, l) as string)
+    return binNumericStr // default & :string = the exact PG text
+  }
+  if (oid === 114 || oid === 3802) { // binary json payload IS the json text (jsonb prepends a version byte)
+    const skip = oid === 3802 ? 1 : 0
+    if (js === 'string' || js === 'latin1') return (b, o, l) => utf8(b, o + skip, l - skip)
+    const d = decoderFor(oid, map)
+    return (b, o, l) => d(b.subarray(o + skip, o + l))
+  }
+  const elemOid = ELEM_OID[oid]
+  if (elemOid !== undefined) { const elem = replShapedLeaf(elemOid, map, js); return elem ? binArrayWith(elem) : null } // element target rides through array_recv
+  if (js === 'string' || js === 'latin1') {
+    if (oid === 21 || oid === 23 || oid === 26) { const d = pickBinary(oid); return (b, o, l) => '' + (d(b, o, l) as number) }
+    if (!BIN_TEXT_EXACT.has(oid)) return null
+    js = 'string'
+  }
+  if (oid === 700 && js !== 'precise') return null // bare/:pretty float4 promise the canonical-text number; binary is the exact f32
+  try { return pickBinary(oid, js) } catch { return null }
+}
+
+/** Binary-tuple decoder for a shaped replication column, or null when binary can't honor the
+ *  declaration. Json() markers reuse the text decode path (the payload is the json text). */
+export function replBinaryForCol(col: CodegenCol, map: Map<number, Decoder>): CellDecoder | null {
+  if (col.json) { const d = pickDecoder(col, map); return col.oid === 3802 ? (b, o, l) => d(b, o + 1, l - 1) : d }
+  if (col.array) { const elem = replShapedLeaf(col.array.elem, map, col.array.js); return elem ? binArrayWith(elem) : null }
+  return replShapedLeaf(col.oid, map, col.js)
 }

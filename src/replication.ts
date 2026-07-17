@@ -16,7 +16,10 @@ import { PgError, parseErrorFields } from './errors.ts'
 import { getDefaultTransport, type NormalizedConfig } from './connection.ts'
 import { resolveUrl } from './url.ts'
 import { buildDecoders } from './decode.ts'
-import { pickDecoder, replBinaryFor, replBinaryMatchesText, type CellDecoder } from './decode.ts'
+import { pickDecoder, replBinaryFor, replBinaryForCol, replBinaryMatchesText, type CellDecoder, type CodegenCol } from './decode.ts'
+import { shapeCols, type TypeSpec } from './spec.ts'
+import type { JsonMarker, TransformMarker } from './json.ts'
+import type { CustomMarker } from './registry.ts'
 import type { ConnectConfig, Decoder } from './types.ts'
 
 const PG_EPOCH_US = 946684800000000n // 2000-01-01T00:00:00Z in µs
@@ -42,9 +45,29 @@ export type ReplicationEvent =
 export type ReplicationConfig = Pick<ConnectConfig,
   'url' | 'host' | 'port' | 'user' | 'password' | 'database' | 'ssl' | 'path' | 'socket' | 'applicationName' | 'connectTimeout' | 'types' | 'jsonBigints'>
 
+/** One table's declared decode shape for `start({ shapes })`. An ARRAY of these (not a keyed
+ *  object) so schema/table names containing dots or quotes never need escaping. */
+export interface TableShape {
+  /** Table schema; default 'public'. */
+  schema?: string
+  table: string
+  /** column name -> spec: the SAME grammar as query()'s { shape } — TypeSpec strings
+   *  ('int8:number', 'numeric:bigint', 'int8[]:number', …), Json()/Jsonb() markers,
+   *  Transform(), and defineType()/minipg-geometry markers. Collect() groups several
+   *  result columns and can't apply to a replication row — it throws at start(). */
+  shape: Record<string, TypeSpec | JsonMarker | TransformMarker | CustomMarker>
+}
+
 export interface StartOptions {
   slot: string
   publications: string[]
+  /** Per-table decode shapes, matched by (schema, table) when the relation is announced.
+   *  Declared columns decode exactly like the same spec in a query() shape; undeclared columns
+   *  and unlisted tables keep the default catalog decoding (int8 -> BigInt, temporal -> Date).
+   *  'unknown' defers a column to its live relation oid. NEVER silent: a declared column the
+   *  live relation doesn't have throws (also on a mid-stream DDL re-announce). Applies to
+   *  new AND old (REPLICA IDENTITY) tuples. */
+  shapes?: TableShape[]
   /** LSN to start from; default = the server resumes from the slot's confirmed position. */
   from?: string | bigint
   /** Deliver pg_logical_emit_message() events (default true). */
@@ -87,6 +110,7 @@ export class ReplicationConnection {
   private ended = false
   private scramState?: Scram
   private relations = new Map<number, RelEntry>()
+  private shaped = new Map<string, CodegenCol[]>() // '<schema>\0<table>' -> resolved shape cols for the active start() stream
   private lastReceived = 0n
   private flushed = 0n
   private lastDeliveredEnd = 0n // highest commit endLsn handed to the consumer (guards idleAck)
@@ -236,6 +260,15 @@ export class ReplicationConnection {
   async *start(opts: StartOptions): AsyncGenerator<ReplicationEvent> {
     const from = opts.from !== undefined ? toLsn(opts.from) : 0n
     const pubs = opts.publications.map((p) => `"${p.replace(/"/g, '""')}"`).join(',')
+    this.shaped.clear()
+    this.relations.clear() // relations re-announce per stream; stale entries would carry the previous stream's shapes
+    for (const s of opts.shapes ?? []) {
+      const schema = s.schema ?? 'public'
+      if (this.shaped.has(schema + '\0' + s.table)) throw new Error(`minipg: duplicate replication shape for ${schema}.${s.table}`)
+      const cols = shapeCols(s.shape) // resolves + validates specs NOW (unknown types/targets fail before streaming)
+      for (const c of cols) if (c.path) throw new Error(`minipg: replication shape for ${schema}.${s.table}: Collect() groups several result columns and can't apply to a replication row (group ${JSON.stringify(c.path[0])})`)
+      this.shaped.set(schema + '\0' + s.table, cols)
+    }
     const want = opts.binary ?? 'auto'
     let bin = want === true
     if (want === 'auto' && this.serverMajor >= 14) {
@@ -316,7 +349,7 @@ export class ReplicationConnection {
           const len = b.readInt32BE(off); off += 4
           if (k === 0x62) { // 'b' binary (start({ binary: true }))
             const bd = rel.bin?.[i]
-            if (!bd) throw new Error(`minipg: binary tuple value for ${rel.info.schema}.${rel.info.table}.${name} (oid ${col?.oid}) has no binary decoder — start() without binary:true, or override config.types for this type`)
+            if (!bd) throw new Error(`minipg: binary tuple value for ${rel.info.schema}.${rel.info.table}.${name} (oid ${col?.oid}) has no binary decoder for its declared/default decode — start() without binary:true, use a binary-capable shape target, or override config.types for this type`)
             row[name] = bd(b, off, len)
           } else { // 't' text
             const dec = rel.decoders[i]
@@ -339,13 +372,7 @@ export class ReplicationConnection {
         const columns: ReplicationRelation['columns'] = []
         for (let i = 0; i < n; i++) { const key = b[off]! === 1; off += 1; const cname = cstr(); const oid = b.readInt32BE(off); off += 8; columns.push({ name: cname, oid, key }) }
         const info: ReplicationRelation = { schema, table, replicaIdentity, columns }
-        // per-column decoders via pickDecoder = the SAME defaults as plain query() columns
-        // (int8 -> BigInt, temporal -> Date, config.types overrides, jsonBigints for json)
-        this.relations.set(id, {
-          info,
-          decoders: columns.map((c) => pickDecoder({ name: c.name, oid: c.oid }, this.decoders)),
-          bin: this.binaryMode ? columns.map((c) => replBinaryFor(c.oid, this.decoders)) : null,
-        })
+        this.relations.set(id, this.relEntry(info))
         return { kind: 'relation', relation: info }
       }
       case 'I': { const r = rel(b.readInt32BE(off)); off += 5; const t = tuple(r); return { kind: 'insert', schema: r.info.schema, table: r.info.table, new: t.row } }
@@ -375,6 +402,35 @@ export class ReplicationConnection {
       case 'O': case 'Y': return null // origin / type metadata — not surfaced
       default: throw new Error(`minipg: unknown pgoutput message '${tag}'`)
     }
+  }
+
+  /** Per-column decoders for an announced relation. Shape-declared columns decode via their
+   *  declared spec — the SAME resolution as a query() { shape }; the rest via pickDecoder's
+   *  defaults (int8 -> BigInt, temporal -> Date, config.types overrides, jsonBigints). */
+  private relEntry(info: ReplicationRelation): RelEntry {
+    const shape = this.shaped.get(info.schema + '\0' + info.table)
+    const byName = shape && new Map(shape.map((c) => [c.name, c]))
+    if (byName) {
+      for (const name of byName.keys()) {
+        if (!info.columns.some((c) => c.name === name)) throw new Error(`minipg: replication shape for ${info.schema}.${info.table} declares column ${JSON.stringify(name)} but the relation has: ${info.columns.map((c) => c.name).join(', ')}`)
+      }
+    }
+    const xf = (d: CellDecoder, f: (v: unknown) => unknown): CellDecoder => (b, o, l) => f(d(b, o, l))
+    const decoders = info.columns.map((c) => {
+      const sc = byName?.get(c.name)
+      if (!sc) return pickDecoder({ name: c.name, oid: c.oid }, this.decoders)
+      // oid 0 = 'unknown': defer to the live relation oid. format:'binary' is a QUERY wire
+      // request (BINARY_FAST auto-request in resolveLeaf) — these tuple values arrive as text.
+      const d = pickDecoder({ ...sc, oid: sc.oid === 0 ? c.oid : sc.oid, format: undefined }, this.decoders)
+      return sc.xform ? xf(d, sc.xform) : d
+    })
+    const bin = this.binaryMode ? info.columns.map((c) => {
+      const sc = byName?.get(c.name)
+      if (!sc) return replBinaryFor(c.oid, this.decoders)
+      const d = sc.oid === 0 && !sc.json ? replBinaryFor(c.oid, this.decoders) : replBinaryForCol(sc, this.decoders)
+      return d && sc.xform ? xf(d, sc.xform) : d
+    }) : null
+    return { info, decoders, bin }
   }
 
   end(): void {

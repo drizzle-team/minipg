@@ -386,7 +386,7 @@ function inlineEpoch(target: string, js: 'ms' | 'date', ctx: { n: number }): str
     + `const _p = ${S}; const _Y=(jb[_p]-48)*1000+(jb[_p+1]-48)*100+(jb[_p+2]-48)*10+(jb[_p+3]-48), _Mo=(jb[_p+5]-48)*10+(jb[_p+6]-48), _D=(jb[_p+8]-48)*10+(jb[_p+9]-48); `
     + `const _H=(jb[_p+11]-48)*10+(jb[_p+12]-48), _Mi=(jb[_p+14]-48)*10+(jb[_p+15]-48), _Sc=(jb[_p+17]-48)*10+(jb[_p+18]-48); `
     + `let _q=_p+19, _ms=0; if (jb[_q]===46){ _q++; let _f=0,_k=0; while(_k<3&&jb[_q]>=48&&jb[_q]<=57){_f=_f*10+(jb[_q]-48);_q++;_k++} while(_k<3){_f*=10;_k++} _ms=_f; while(_q<${E}&&jb[_q]>=48&&jb[_q]<=57)_q++ } `
-    + `let _off=0; const _sg=jb[_q]; if(_sg===43||_sg===45){ _q++; const _oh=(jb[_q]-48)*10+(jb[_q+1]-48); _q+=2; let _om=0; if(jb[_q]===58){_q++;_om=(jb[_q]-48)*10+(jb[_q+1]-48);_q+=2} _off=(_sg===45?-1:1)*(_oh*60+_om)*60000 } `
+    + `let _off=0; const _sg=jb[_q]; if(_sg===43||_sg===45){ _q++; const _oh=(jb[_q]-48)*10+(jb[_q+1]-48); _q+=2; let _om=0,_os=0; if(jb[_q]===58){_q++;_om=(jb[_q]-48)*10+(jb[_q+1]-48);_q+=2; if(jb[_q]===58){_q++;_os=(jb[_q]-48)*10+(jb[_q+1]-48);_q+=2}} _off=(_sg===45?-1:1)*((_oh*60+_om)*60+_os)*1000 } `
     + `${P} = Date.UTC(_Y,_Mo-1,_D,_H,_Mi,_Sc,_ms); if (_Y <= 99) { const _dd = new Date(${P}); _dd.setUTCFullYear(_Y); ${P} = _dd.getTime() } ${P} -= _off; } else { ${P} = Date.parse(jb.toString('utf8', ${S}, ${E})) } `
     + `${target} = ${js === 'date' ? `new Date(${P})` : P}; }`
 }

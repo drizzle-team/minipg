@@ -1,7 +1,7 @@
 // replication(): logical replication over the real auth/transport stack (TCP + SCRAM here).
 // Requires the local cluster with wal_level=logical (test/setup-pg.sh cluster, reconfigured).
 import { test, expect, describe } from 'bun:test'
-import { replication, connect, type ReplicationEvent } from '../../src/index.ts'
+import { replication, connect, defineType, Jsonb, Collect, Transform, type ReplicationEvent } from '../../src/index.ts'
 import { TEST_CONFIG, withConn, testPool, TEST_TIMEOUT } from '../helpers/db.ts'
 
 const K = `repl_${process.pid}`
@@ -247,6 +247,128 @@ describe('replication()', () => {
       } finally {
         await c.query(`drop publication ${K}_bpub`)
         await c.query(`drop table ${K}_b`)
+      }
+    })
+  }, TEST_TIMEOUT)
+
+  test('start({ shapes }): declared columns decode like a query() shape; undeclared keep defaults', async () => {
+    const doubler = defineType(`${K}_doubler`, { ascii: true, targets: { x2: (s) => Number(s) * 2 } })
+    await withConn(async (c) => {
+      await c.query(`create table ${K}_s(id int4 primary key, big int8, n numeric, at timestamptz, tags int8[], meta jsonb, label text, loc point, dbl int4)`)
+      await c.query(`create publication ${K}_spub for table ${K}_s`)
+      try {
+        const repl = await replication(TEST_CONFIG)
+        try {
+          const slot = await repl.createSlot(`${K}_sslot`, { temporary: true })
+          await c.query(
+            `insert into ${K}_s values (7, 42, '1267650600228229401496703205376', '2024-01-02T03:04:05Z', array[1,2], '{"when":"2024-01-02T03:04:05"}', 'hi', '(1.5,2.5)', 21)`)
+          await c.query(`update ${K}_s set label = 'yo' where id = 7`)
+          const events = await collectUntil(
+            repl.start({
+              slot: slot.slot, publications: [`${K}_spub`],
+              shapes: [{
+                table: `${K}_s`,
+                shape: {
+                  big: 'int8:number',
+                  n: 'numeric:bigint',
+                  at: 'timestamptz:ms',
+                  tags: 'int8[]:number',
+                  meta: Jsonb({ when: 'timestamp:ms' }),
+                  label: Transform('text', (s) => (s as string).toUpperCase()),
+                  loc: 'point:xy',
+                  dbl: doubler('x2'),
+                },
+              }],
+            }),
+            (es) => es.filter((e) => e.kind === 'commit').length >= 2)
+          const ins = events.find((e) => e.kind === 'insert') as Extract<ReplicationEvent, { kind: 'insert' }>
+          expect(ins.new.id).toBe(7)                                            // undeclared -> default int4
+          expect(ins.new.big).toBe(42)                                          // :number -> a JS number, not the default 42n
+          expect(ins.new.n).toBe(1267650600228229401496703205376n)              // numeric:bigint = 2^100 exact
+          expect(ins.new.at).toBe(Date.UTC(2024, 0, 2, 3, 4, 5))                // :ms epoch number
+          expect(ins.new.tags).toEqual([1, 2])                                  // int8[]:number -> JS numbers (default: raw '{1,2}')
+          expect(ins.new.meta).toEqual({ when: Date.UTC(2024, 0, 2, 3, 4, 5) }) // Jsonb() field target
+          expect(ins.new.label).toBe('HI')                                      // Transform()
+          expect(ins.new.loc).toEqual({ x: 1.5, y: 2.5 })                       // point:xy
+          expect(ins.new.dbl).toBe(42)                                          // defineType() marker (name-driven, real oid irrelevant)
+          const upd = events.find((e) => e.kind === 'update') as Extract<ReplicationEvent, { kind: 'update' }>
+          expect(upd.new.label).toBe('YO')                                      // shapes apply to every tuple of the table
+        } finally { repl.end() }
+      } finally {
+        await c.query(`drop publication ${K}_spub`)
+        await c.query(`drop table ${K}_s`)
+      }
+    })
+  }, TEST_TIMEOUT)
+
+  test('start({ shapes }): never silent — bad column, Collect(), duplicates all throw', async () => {
+    await withConn(async (c) => {
+      await c.query(`create table ${K}_e(id int4 primary key, name text)`)
+      await c.query(`create publication ${K}_epub for table ${K}_e`)
+      try {
+        // Collect() and duplicate entries fail on the first pull, before any streaming
+        const repl = await replication(TEST_CONFIG)
+        try {
+          const slot = await repl.createSlot(`${K}_eslot`, { temporary: true })
+          await expect(
+            repl.start({ slot: slot.slot, publications: [`${K}_epub`], shapes: [{ table: `${K}_e`, shape: { g: Collect({ id: 'int4' }) as never } }] }).next(),
+          ).rejects.toThrow(/Collect\(\) groups/)
+          await expect(
+            repl.start({ slot: slot.slot, publications: [`${K}_epub`], shapes: [{ table: `${K}_e`, shape: {} }, { table: `${K}_e`, shape: {} }] }).next(),
+          ).rejects.toThrow(/duplicate replication shape/)
+          // a declared column the live relation doesn't have throws when the relation is announced
+          await c.query(`insert into ${K}_e values (1, 'x')`)
+          await expect(
+            collectUntil(
+              repl.start({ slot: slot.slot, publications: [`${K}_epub`], shapes: [{ table: `${K}_e`, shape: { nope: 'text' } }] }),
+              (es) => es.some((e) => e.kind === 'commit')),
+          ).rejects.toThrow(/declares column "nope" but the relation has: id, name/)
+        } finally { repl.end() }
+      } finally {
+        await c.query(`drop publication ${K}_epub`)
+        await c.query(`drop table ${K}_e`)
+      }
+    })
+  }, TEST_TIMEOUT)
+
+  test('start({ shapes, binary: true }): declared targets decode from binary tuples; unhonorable targets error loudly', async () => {
+    await withConn(async (c) => {
+      await c.query(`create table ${K}_sb(id int8 primary key, n numeric, at timestamptz, ns int8[], meta jsonb)`)
+      await c.query(`create publication ${K}_sbpub for table ${K}_sb`)
+      try {
+        const repl = await replication(TEST_CONFIG)
+        try {
+          const slot = await repl.createSlot(`${K}_sbslot`, { temporary: true })
+          await c.query(`insert into ${K}_sb values (1, '1267650600228229401496703205376', '2024-01-02T03:04:05Z', array[1,2], '{"when":"2024-01-02T03:04:05"}')`)
+          const events = await collectUntil(
+            repl.start({
+              slot: slot.slot, publications: [`${K}_sbpub`], binary: true,
+              shapes: [{ table: `${K}_sb`, shape: { id: 'int8:number', n: 'numeric:bigint', at: 'timestamptz:ms', ns: 'int8[]:number', meta: Jsonb({ when: 'timestamp:ms' }) } }],
+            }),
+            (es) => es.some((e) => e.kind === 'commit'))
+          expect(repl.binaryTuples).toBe(true)
+          const ins = events.find((e) => e.kind === 'insert') as Extract<ReplicationEvent, { kind: 'insert' }>
+          expect(ins.new.id).toBe(1)
+          expect(ins.new.n).toBe(1267650600228229401496703205376n)              // BigInt(exact binary numeric render)
+          expect(ins.new.at).toBe(Date.UTC(2024, 0, 2, 3, 4, 5))
+          expect(ins.new.ns).toEqual([1, 2])                                    // array_recv with :number elements
+          expect(ins.new.meta).toEqual({ when: Date.UTC(2024, 0, 2, 3, 4, 5) }) // binary json payload = the json text
+        } finally { repl.end() }
+
+        // 'timestamptz:string' promises PG's exact text — binary bytes can't honor it: loud error on arrival
+        const repl2 = await replication(TEST_CONFIG)
+        try {
+          const slot = await repl2.createSlot(`${K}_sbslot2`, { temporary: true })
+          await c.query(`update ${K}_sb set n = 2 where id = 1`)
+          await expect(
+            collectUntil(
+              repl2.start({ slot: slot.slot, publications: [`${K}_sbpub`], binary: true, shapes: [{ table: `${K}_sb`, shape: { at: 'timestamptz:string' } }] }),
+              (es) => es.some((e) => e.kind === 'commit')),
+          ).rejects.toThrow(/no binary decoder/)
+        } finally { repl2.end() }
+      } finally {
+        await c.query(`drop publication ${K}_sbpub`)
+        await c.query(`drop table ${K}_sb`)
       }
     })
   }, TEST_TIMEOUT)
