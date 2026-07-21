@@ -18,7 +18,7 @@ import { resolveUrl } from './url.ts'
 import { buildDecoders } from './decode.ts'
 import { pickDecoder, replBinaryFor, replBinaryForCol, replBinaryMatchesText, type CellDecoder, type CodegenCol } from './decode.ts'
 import { shapeCols, type TypeSpec } from './spec.ts'
-import type { JsonMarker, TransformMarker } from './json.ts'
+import type { JsonMarker, TransformMarker, SpecEntries } from './json.ts'
 import type { CustomMarker } from './registry.ts'
 import type { ConnectConfig, Decoder } from './types.ts'
 
@@ -51,22 +51,30 @@ export interface TableShape {
   /** Table schema; default 'public'. */
   schema?: string
   table: string
-  /** column name -> spec: the SAME grammar as query()'s { shape } — TypeSpec strings
-   *  ('int8:number', 'numeric:bigint', 'int8[]:number', …), Json()/Jsonb() markers,
-   *  Transform(), and defineType()/minipg-geometry markers. Collect() groups several
-   *  result columns and can't apply to a replication row — it throws at start(). */
-  shape: Record<string, TypeSpec | JsonMarker | TransformMarker | CustomMarker>
+  /** shape key -> SQL column name, for keys that differ from the column (e.g. drizzle JS
+   *  property names: `{ bigIntCol: 'big_int_col' }`). Keys absent here read the column named
+   *  like the key. Every entry's key must exist in `shape` (a typo throws). */
+  columns?: Record<string, string>
+  /** OUTPUT key -> spec: the SAME grammar (and the same key semantics) as query()'s { shape } —
+   *  TypeSpec strings ('int8:number', 'numeric:bigint', 'int8[]:number', …), Json()/Jsonb()
+   *  markers, Transform(), and defineType()/minipg-geometry markers; object literal or ordered
+   *  [key, spec] entries. Collect() groups several result columns and can't apply to a
+   *  replication row — it throws at start(). */
+  shape: Record<string, TypeSpec | JsonMarker | TransformMarker | CustomMarker> | SpecEntries<TypeSpec | JsonMarker | TransformMarker | CustomMarker>
 }
 
 export interface StartOptions {
   slot: string
   publications: string[]
   /** Per-table decode shapes, matched by (schema, table) when the relation is announced.
-   *  Declared columns decode exactly like the same spec in a query() shape; undeclared columns
-   *  and unlisted tables keep the default catalog decoding (int8 -> BigInt, temporal -> Date).
-   *  'unknown' defers a column to its live relation oid. NEVER silent: a declared column the
-   *  live relation doesn't have throws (also on a mid-stream DDL re-announce). Applies to
-   *  new AND old (REPLICA IDENTITY) tuples. */
+   *  Declared columns decode exactly like the same spec in a query() shape, and — like a
+   *  query() shape — the row is keyed by the SHAPE keys (`columns` maps a key to its SQL
+   *  column when they differ; `unchanged` uses the same keys). Undeclared columns and
+   *  unlisted tables keep the default catalog decoding (int8 -> BigInt, temporal -> Date)
+   *  under their SQL names. 'unknown' defers a column to its live relation oid. NEVER
+   *  silent: a declared column the live relation doesn't have, two keys mapping to one
+   *  column, and an output-key collision all throw (also on a mid-stream DDL re-announce).
+   *  Applies to new AND old (REPLICA IDENTITY) tuples. */
   shapes?: TableShape[]
   /** LSN to start from; default = the server resumes from the slot's confirmed position. */
   from?: string | bigint
@@ -97,7 +105,7 @@ export async function replication(config: string | ReplicationConfig = {}): Prom
   return c
 }
 
-interface RelEntry { info: ReplicationRelation; decoders: CellDecoder[]; bin: (CellDecoder | null)[] | null }
+interface RelEntry { info: ReplicationRelation; names: string[]; decoders: CellDecoder[]; bin: (CellDecoder | null)[] | null } // names[i] = row OUTPUT key for column i (shape key when shaped, else the SQL name)
 
 export class ReplicationConnection {
   private cfg: NormalizedConfig
@@ -110,7 +118,7 @@ export class ReplicationConnection {
   private ended = false
   private scramState?: Scram
   private relations = new Map<number, RelEntry>()
-  private shaped = new Map<string, CodegenCol[]>() // '<schema>\0<table>' -> resolved shape cols for the active start() stream
+  private shaped = new Map<string, { cols: CodegenCol[]; columns?: Record<string, string> }>() // '<schema>\0<table>' -> resolved shape for the active start() stream
   private lastReceived = 0n
   private flushed = 0n
   private lastDeliveredEnd = 0n // highest commit endLsn handed to the consumer (guards idleAck)
@@ -267,7 +275,9 @@ export class ReplicationConnection {
       if (this.shaped.has(schema + '\0' + s.table)) throw new Error(`minipg: duplicate replication shape for ${schema}.${s.table}`)
       const cols = shapeCols(s.shape) // resolves + validates specs NOW (unknown types/targets fail before streaming)
       for (const c of cols) if (c.path) throw new Error(`minipg: replication shape for ${schema}.${s.table}: Collect() groups several result columns and can't apply to a replication row (group ${JSON.stringify(c.path[0])})`)
-      this.shaped.set(schema + '\0' + s.table, cols)
+      const keys = new Set(cols.map((c) => c.name))
+      for (const k of Object.keys(s.columns ?? {})) if (!keys.has(k)) throw new Error(`minipg: replication shape for ${schema}.${s.table}: columns maps ${JSON.stringify(k)} but the shape has no such key`)
+      this.shaped.set(schema + '\0' + s.table, { cols, columns: s.columns })
     }
     const want = opts.binary ?? 'auto'
     let bin = want === true
@@ -340,8 +350,7 @@ export class ReplicationConnection {
       const row: Row = {}
       const unchanged: string[] = []
       for (let i = 0; i < n; i++) {
-        const col = rel.info.columns[i]
-        const name = col?.name ?? String(i)
+        const name = rel.names[i] ?? String(i)
         const k = b[off]!; off += 1
         if (k === 0x6e) row[name] = null                                  // 'n' NULL
         else if (k === 0x75) unchanged.push(name)                         // 'u' unchanged TOAST — absent, NOT null
@@ -349,7 +358,7 @@ export class ReplicationConnection {
           const len = b.readInt32BE(off); off += 4
           if (k === 0x62) { // 'b' binary (start({ binary: true }))
             const bd = rel.bin?.[i]
-            if (!bd) throw new Error(`minipg: binary tuple value for ${rel.info.schema}.${rel.info.table}.${name} (oid ${col?.oid}) has no binary decoder for its declared/default decode — start() without binary:true, use a binary-capable shape target, or override config.types for this type`)
+            if (!bd) throw new Error(`minipg: binary tuple value for ${rel.info.schema}.${rel.info.table}.${name} (oid ${rel.info.columns[i]?.oid}) has no binary decoder for its declared/default decode — start() without binary:true, use a binary-capable shape target, or override config.types for this type`)
             row[name] = bd(b, off, len)
           } else { // 't' text
             const dec = rel.decoders[i]
@@ -360,7 +369,7 @@ export class ReplicationConnection {
       }
       return { row, unchanged }
     }
-    const rel = (id: number): RelEntry => this.relations.get(id) ?? { info: { schema: '?', table: `?${id}`, replicaIdentity: 'd', columns: [] }, decoders: [], bin: null }
+    const rel = (id: number): RelEntry => this.relations.get(id) ?? { info: { schema: '?', table: `?${id}`, replicaIdentity: 'd', columns: [] }, names: [], decoders: [], bin: null }
     switch (tag) {
       case 'B': return { kind: 'begin', finalLsn: lsnToString(b.readBigUInt64BE(1)), commitTime: ts(b.readBigUInt64BE(9) ), xid: b.readInt32BE(17) }
       case 'C': return { kind: 'commit', lsn: lsnToString(b.readBigUInt64BE(2)), endLsn: lsnToString(b.readBigUInt64BE(10)), commitTime: ts(b.readBigUInt64BE(18)) }
@@ -404,20 +413,30 @@ export class ReplicationConnection {
     }
   }
 
-  /** Per-column decoders for an announced relation. Shape-declared columns decode via their
-   *  declared spec — the SAME resolution as a query() { shape }; the rest via pickDecoder's
-   *  defaults (int8 -> BigInt, temporal -> Date, config.types overrides, jsonBigints). */
+  /** Per-column decoders + output keys for an announced relation. Shape-declared columns decode
+   *  via their declared spec — the SAME resolution as a query() { shape } — and the row is keyed
+   *  by the SHAPE key (TableShape.columns maps key -> SQL column when they differ); the rest via
+   *  pickDecoder's defaults (int8 -> BigInt, temporal -> Date, config.types, jsonBigints). */
   private relEntry(info: ReplicationRelation): RelEntry {
     const shape = this.shaped.get(info.schema + '\0' + info.table)
-    const byName = shape && new Map(shape.map((c) => [c.name, c]))
-    if (byName) {
-      for (const name of byName.keys()) {
-        if (!info.columns.some((c) => c.name === name)) throw new Error(`minipg: replication shape for ${info.schema}.${info.table} declares column ${JSON.stringify(name)} but the relation has: ${info.columns.map((c) => c.name).join(', ')}`)
+    const names = info.columns.map((c) => c.name)
+    const bySql = new Map<string, CodegenCol>() // SQL column name -> shape col (the OUTPUT key rides in col.name)
+    if (shape) {
+      for (const sc of shape.cols) {
+        const sql = shape.columns?.[sc.name] ?? sc.name
+        const i = info.columns.findIndex((c) => c.name === sql)
+        if (i < 0) throw new Error(`minipg: replication shape for ${info.schema}.${info.table} declares column ${JSON.stringify(sc.name)}${sql !== sc.name ? ` (-> ${JSON.stringify(sql)})` : ''} but the relation has: ${info.columns.map((c) => c.name).join(', ')}`)
+        const prev = bySql.get(sql)
+        if (prev) throw new Error(`minipg: replication shape for ${info.schema}.${info.table}: ${JSON.stringify(prev.name)} and ${JSON.stringify(sc.name)} both map to column ${JSON.stringify(sql)}`)
+        bySql.set(sql, sc)
+        names[i] = sc.name
       }
+      const dup = names.find((n, i) => names.indexOf(n) !== i)
+      if (dup !== undefined) throw new Error(`minipg: replication shape for ${info.schema}.${info.table}: output key ${JSON.stringify(dup)} collides with another column — map one of them via columns`)
     }
     const xf = (d: CellDecoder, f: (v: unknown) => unknown): CellDecoder => (b, o, l) => f(d(b, o, l))
     const decoders = info.columns.map((c) => {
-      const sc = byName?.get(c.name)
+      const sc = bySql.get(c.name)
       if (!sc) return pickDecoder({ name: c.name, oid: c.oid }, this.decoders)
       // oid 0 = 'unknown': defer to the live relation oid. format:'binary' is a QUERY wire
       // request (BINARY_FAST auto-request in resolveLeaf) — these tuple values arrive as text.
@@ -425,12 +444,12 @@ export class ReplicationConnection {
       return sc.xform ? xf(d, sc.xform) : d
     })
     const bin = this.binaryMode ? info.columns.map((c) => {
-      const sc = byName?.get(c.name)
+      const sc = bySql.get(c.name)
       if (!sc) return replBinaryFor(c.oid, this.decoders)
       const d = sc.oid === 0 && !sc.json ? replBinaryFor(c.oid, this.decoders) : replBinaryForCol(sc, this.decoders)
       return d && sc.xform ? xf(d, sc.xform) : d
     }) : null
-    return { info, decoders, bin }
+    return { info, names, decoders, bin }
   }
 
   end(): void {

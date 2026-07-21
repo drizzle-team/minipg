@@ -2,7 +2,7 @@
 // JS-target override, or a Json()/Jsonb() marker) into the driver's column plan (CodegenCol[]). Kept
 // separate from shape.ts so the connection can resolve a `{ shape }` query option WITHOUT pulling in the
 // whole-result-set codegen used by the standalone Shape() helper. No node deps (imports only json/types).
-import { isJsonMarker, isCollectMarker, isTransformMarker, isNullableMarker, splitType, validateJsonSpec, type JsonMarker, type CollectMarker, type TransformMarker, type NullableMarker } from './json.ts'
+import { isJsonMarker, isCollectMarker, isTransformMarker, isNullableMarker, splitType, validateJsonSpec, specEntries, type SpecEntries, type JsonMarker, type CollectMarker, type TransformMarker, type NullableMarker } from './json.ts'
 import { BINARY_FAST, type CodegenCol } from './decode.ts'
 import { EXT_VECTOR, EXT_HALFVEC, EXT_SPARSEVEC } from './geo.ts'
 import { isCustomMarker, type CustomMarker } from './registry.ts'
@@ -86,9 +86,14 @@ export type TypeSpec =
   | `${IntType}[]:${'number' | 'bigint'}`
   | `${NumericType}[]:number`
   | `${TextType}[]:latin1`
-/** A row shape: column name -> TypeSpec, a Json()/Jsonb() marker (one json cell), a Collect() group (several
+/** A shape column's value: TypeSpec, a Json()/Jsonb() marker (one json cell), a Collect() group (several
  *  result columns -> nested object), a Transform() (per-column decode-time fn), or a Nullable() wrapper. */
-export type ShapeSpec = Record<string, TypeSpec | JsonMarker | CollectMarker | TransformMarker | NullableMarker | CustomMarker>
+export type ShapeValue = TypeSpec | JsonMarker | CollectMarker | TransformMarker | NullableMarker | CustomMarker
+/** The ordered entries form of a row shape: [column name, value] tuples. Order-safe for ANY key —
+ *  the escape hatch for integer-string column names the object form must reject (see specEntries). */
+export type ShapeEntries = SpecEntries<ShapeValue>
+/** A row shape: column name -> value, as an object literal or ordered [name, value] entries. */
+export type ShapeSpec = Record<string, ShapeValue> | ShapeEntries
 /** The same value type as ShapeSpec, but over KNOWN keys `K`. The public shape-taking functions use this
  *  generic form (`fn<K extends string>(spec: ShapeOf<K>)`) so editors offer value autocomplete — TypeScript
  *  does NOT surface value completions through a `Record<string, …>` index signature, but does through a
@@ -102,7 +107,7 @@ export function shapeCols(spec: ShapeSpec): CodegenCol[] {
   const out: CodegenCol[] = []
   // gn[k] = is the k-th path group a CollectNullable (auto-null on a LEFT-JOIN miss) vs a plain Collect (always an object)?
   const walk = (s: ShapeSpec, path: readonly string[], gn: readonly boolean[]): void => {
-    for (const [name, t] of Object.entries(s)) {
+    for (const [name, t] of specEntries(s)) {
       if (isCollectMarker(t)) { walk(t.spec, [...path, name], [...gn, t.nullable]); continue } // group -> recurse, extend path + group-null flags
       let m: TypeSpec | JsonMarker | TransformMarker | NullableMarker | CustomMarker = t
       let nullable = false

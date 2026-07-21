@@ -29,9 +29,9 @@ export { defaultDecoders } from './decode.ts'
 export { defineType, isCustomMarker, type CustomMarker, type CustomType, type CustomTypeDef, type RawCell } from './registry.ts'
 export { Shape } from './shape.ts'
 export type { ShapeMapper } from './shape.ts'
-export type { ShapeSpec, TypeSpec, PgType } from './spec.ts'
+export type { ShapeSpec, ShapeEntries, ShapeValue, TypeSpec, PgType } from './spec.ts'
 export { Json, JsonArray, Jsonb, JsonbArray, Collect, CollectNullable, Transform, Nullable } from './json.ts'
-export type { JsonSpec, JsonMarker, JsTarget, CollectMarker, TransformMarker, NullableMarker } from './json.ts'
+export type { JsonSpec, SpecEntries, JsonMarker, JsTarget, CollectMarker, TransformMarker, NullableMarker } from './json.ts'
 export type {
   ConnectConfig, PoolConfig, QueryOptions, StreamOptions, TxOptions,
   QueryResult, ResultMode, Decoder, Field,

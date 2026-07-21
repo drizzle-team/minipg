@@ -15,7 +15,7 @@
 //   const rows = user(dataRowBodies) // decode an array of DataRow bodies -> rows[]
 import { compileResultSet, type CodegenCol } from './decode.ts'
 import { buildDecoders } from './decode.ts'
-import { shapeCols, type ShapeSpec, type ShapeOf } from './spec.ts'
+import { shapeCols, type ShapeSpec, type ShapeOf, type ShapeEntries } from './spec.ts'
 
 export type { ShapeSpec }
 export interface ShapeMapper {
@@ -33,7 +33,7 @@ export interface ShapeMapper {
 
 /** Build a callable, codegen-compiled whole-result-set mapper from a declared shape.
  *  Generic over the column names so editors autocomplete each value to the known type list. */
-export function Shape<K extends string>(spec: ShapeOf<K>, mode: 'object' | 'array' = 'object'): ShapeMapper {
+export function Shape<K extends string>(spec: ShapeOf<K> | ShapeEntries, mode: 'object' | 'array' = 'object'): ShapeMapper {
   const cols: CodegenCol[] = shapeCols(spec as ShapeSpec)
   const mapper = compileResultSet(cols, mode, buildDecoders())
   const fn = ((rows: Buffer[]) => mapper(rows)) as ShapeMapper

@@ -1,7 +1,7 @@
 // replication(): logical replication over the real auth/transport stack (TCP + SCRAM here).
 // Requires the local cluster with wal_level=logical (test/setup-pg.sh cluster, reconfigured).
 import { test, expect, describe } from 'bun:test'
-import { replication, connect, defineType, Jsonb, Collect, Transform, type ReplicationEvent } from '../../src/index.ts'
+import { replication, connect, defineType, Jsonb, Collect, Transform, type ReplicationEvent, type TableShape } from '../../src/index.ts'
 import { TEST_CONFIG, withConn, testPool, TEST_TIMEOUT } from '../helpers/db.ts'
 
 const K = `repl_${process.pid}`
@@ -327,6 +327,68 @@ describe('replication()', () => {
       } finally {
         await c.query(`drop publication ${K}_epub`)
         await c.query(`drop table ${K}_e`)
+      }
+    })
+  }, TEST_TIMEOUT)
+
+  test('start({ shapes }): shape keys are OUTPUT keys — columns maps them to SQL names, like a query() shape', async () => {
+    await withConn(async (c) => {
+      await c.query(`create table ${K}_k(id int4 primary key, big_int_col int8)`)
+      await c.query(`create publication ${K}_kpub for table ${K}_k`)
+      try {
+        const repl = await replication(TEST_CONFIG)
+        try {
+          const slot = await repl.createSlot(`${K}_kslot`, { temporary: true })
+          await c.query(`insert into ${K}_k values (1, 42)`)
+          await c.query(`update ${K}_k set big_int_col = 43 where id = 1`)
+          const events = await collectUntil(
+            repl.start({
+              slot: slot.slot, publications: [`${K}_kpub`],
+              shapes: [{ table: `${K}_k`, columns: { bigIntCol: 'big_int_col' }, shape: { id: 'int4', bigIntCol: 'int8:number' } }],
+            }),
+            (es) => es.filter((e) => e.kind === 'commit').length >= 2)
+          const ins = events.find((e) => e.kind === 'insert') as Extract<ReplicationEvent, { kind: 'insert' }>
+          expect(ins.new).toEqual({ id: 1, bigIntCol: 42 }) // the query()-shape row, not { big_int_col }
+          const upd = events.find((e) => e.kind === 'update') as Extract<ReplicationEvent, { kind: 'update' }>
+          expect(upd.new).toEqual({ id: 1, bigIntCol: 43 })
+        } finally { repl.end() }
+
+        // a columns entry whose key isn't in the shape is a typo: fails on the first pull
+        const r2 = await replication(TEST_CONFIG)
+        try {
+          const s2 = await r2.createSlot(`${K}_kslot2`, { temporary: true })
+          await expect(
+            r2.start({ slot: s2.slot, publications: [`${K}_kpub`], shapes: [{ table: `${K}_k`, columns: { nope: 'id' }, shape: { id: 'int4' } }] }).next(),
+          ).rejects.toThrow(/columns maps "nope" but the shape has no such key/)
+          // a mapped column missing from the live relation names BOTH the key and the SQL name
+          await c.query(`update ${K}_k set big_int_col = 44 where id = 1`)
+          await expect(
+            collectUntil(
+              r2.start({ slot: s2.slot, publications: [`${K}_kpub`], shapes: [{ table: `${K}_k`, columns: { bigIntCol: 'wrong_col' }, shape: { bigIntCol: 'int8' } }] }),
+              (es) => es.some((e) => e.kind === 'commit')),
+          ).rejects.toThrow(/declares column "bigIntCol" \(-> "wrong_col"\) but the relation has: id, big_int_col/)
+        } finally { r2.end() }
+
+        // output-key collision / two keys on one column: loud at relation arrival (fresh conn each — the throw poisons the stream)
+        const bad: Array<[TableShape, RegExp]> = [
+          [{ table: `${K}_k`, columns: { big_int_col: 'id' }, shape: { big_int_col: 'int4' } }, /output key "big_int_col" collides/],
+          [{ table: `${K}_k`, columns: { a: 'id', b: 'id' }, shape: { a: 'int4', b: 'int4:string' } }, /"a" and "b" both map to column "id"/],
+        ]
+        for (let i = 0; i < bad.length; i++) {
+          const r = await replication(TEST_CONFIG)
+          try {
+            const s = await r.createSlot(`${K}_kslot_e${i}`, { temporary: true })
+            await c.query(`update ${K}_k set big_int_col = big_int_col + 1 where id = 1`)
+            await expect(
+              collectUntil(
+                r.start({ slot: s.slot, publications: [`${K}_kpub`], shapes: [bad[i]![0]] }),
+                (es) => es.some((e) => e.kind === 'commit')),
+            ).rejects.toThrow(bad[i]![1])
+          } finally { r.end() }
+        }
+      } finally {
+        await c.query(`drop publication ${K}_kpub`)
+        await c.query(`drop table ${K}_k`)
       }
     })
   }, TEST_TIMEOUT)

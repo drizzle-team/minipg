@@ -33,7 +33,7 @@
 // we read in that computed order and reassemble into your declared order. The protocol does
 // NOT expose a JSON column's inner types — only the OID (json=114 / jsonb=3802) — which is
 // why `type` is declared here.
-import type { TypeSpec, ShapeOf, ShapeSpec } from './spec.ts' // type-only (erased): typed value union + generic mapped form
+import type { TypeSpec, ShapeOf, ShapeSpec, ShapeEntries } from './spec.ts' // type-only (erased): typed value union + generic mapped form
 import { isCustomMarker, type CustomMarker } from './registry.ts'
 
 export interface JsonMarker {
@@ -41,22 +41,53 @@ export interface JsonMarker {
   readonly type: 'json' | 'jsonb'
   readonly spec: JsonSpec
 }
+/** The ordered ENTRIES form of a spec: [key, value] tuples. Every spec-taking API accepts it
+ *  alongside the object literal. It exists because an array cannot lose declaration order —
+ *  JS enumerates integer-string object keys ('0', '2024') FIRST in numeric order, so a column
+ *  named like one is only declarable this way (the object form throws on such keys). */
+export type SpecEntries<V> = ReadonlyArray<readonly [string, V]>
 /** A nested JSON shape: field name -> TypeSpec (PG alias, optionally `:number`/`:string`; `'pg[]'`
  *  for a JSON array of scalars), a nested Json()/Jsonb()/JsonArray, or a Transform(type, fn)
- *  applied to the decoded field value. */
-export type JsonSpec = Record<string, TypeSpec | JsonMarker | TransformMarker>
+ *  applied to the decoded field value. Object form or ordered [key, value] entries. */
+export type JsonSpec = Record<string, TypeSpec | JsonMarker | TransformMarker> | SpecEntries<TypeSpec | JsonMarker | TransformMarker>
 /** A json field's base type, unwrapping Transform(type, fn) to `type` (the fn is applied after decode). */
 const jsonBase = (f: TypeSpec | JsonMarker | TransformMarker): TypeSpec | JsonMarker => (isTransformMarker(f) ? f.type : f)
 
+// canonical array-index strings (ECMA integer indices: no leading zeros, < 2^32-1)
+const INDEX_KEY = /^(0|[1-9][0-9]*)$/
+/** Spec entries in DECLARED order — the ONE way every consumer iterates a spec. Entries arrays
+ *  pass through (order is theirs; duplicate keys throw); object literals go through
+ *  Object.entries with a guard: an integer-string key was ALREADY moved to the front by JS
+ *  before minipg could see the object, so positional matching can't be trusted -> throw. */
+export function specEntries<V>(s: Record<string, V> | SpecEntries<V>): SpecEntries<V> {
+  if (Array.isArray(s)) {
+    const seen = new Set<string>()
+    for (const [k] of s as SpecEntries<V>) {
+      if (seen.has(k)) throw new Error(`minipg: duplicate shape key ${JSON.stringify(k)} in entries form`)
+      seen.add(k)
+    }
+    return s as SpecEntries<V>
+  }
+  const es = Object.entries(s as Record<string, V>)
+  for (const [k] of es) {
+    if (INDEX_KEY.test(k) && +k < 4294967295) {
+      throw new Error(`minipg: shape key ${JSON.stringify(k)} is an integer string — JS enumerates integer keys first (in numeric order), so its written position in an object literal is already lost; use the entries form [[${JSON.stringify(k)}, …], …] or alias the column`)
+    }
+  }
+  return es
+}
+
 // Generic over the field names (ShapeOf<K>) so nested json field values autocomplete, same as Shape().
+// Every constructor also takes the ordered entries form (see SpecEntries).
+type JsonSpecInput<K extends string> = ShapeOf<K> | SpecEntries<TypeSpec | JsonMarker | TransformMarker>
 /** Declare a `json` column that is a single object of a known shape (keys in declared order). */
-export function Json<K extends string>(spec: ShapeOf<K>): JsonMarker { return { __json: 'object', type: 'json', spec: spec as JsonSpec } }
+export function Json<K extends string>(spec: JsonSpecInput<K>): JsonMarker { return { __json: 'object', type: 'json', spec: spec as JsonSpec } }
 /** Declare a `json` column that is an array of objects of a known shape (json_agg). */
-export function JsonArray<K extends string>(spec: ShapeOf<K>): JsonMarker { return { __json: 'array', type: 'json', spec: spec as JsonSpec } }
+export function JsonArray<K extends string>(spec: JsonSpecInput<K>): JsonMarker { return { __json: 'array', type: 'json', spec: spec as JsonSpec } }
 /** Declare a `jsonb` column that is a single object (keys read in jsonb's sorted order). */
-export function Jsonb<K extends string>(spec: ShapeOf<K>): JsonMarker { return { __json: 'object', type: 'jsonb', spec: spec as JsonSpec } }
+export function Jsonb<K extends string>(spec: JsonSpecInput<K>): JsonMarker { return { __json: 'object', type: 'jsonb', spec: spec as JsonSpec } }
 /** Declare a `jsonb` column that is an array of objects of a known shape (jsonb_agg). */
-export function JsonbArray<K extends string>(spec: ShapeOf<K>): JsonMarker { return { __json: 'array', type: 'jsonb', spec: spec as JsonSpec } }
+export function JsonbArray<K extends string>(spec: JsonSpecInput<K>): JsonMarker { return { __json: 'array', type: 'jsonb', spec: spec as JsonSpec } }
 export function isJsonMarker(x: unknown): x is JsonMarker {
   return typeof x === 'object' && x !== null && typeof (x as { __json?: unknown }).__json === 'string'
 }
@@ -70,10 +101,10 @@ export function isJsonMarker(x: unknown): x is JsonMarker {
  *  `Collect` ALWAYS returns an object — a LEFT-JOIN miss (all fields NULL) yields an object with null fields,
  *  not null. Use `CollectNullable` when you want the whole group to become `null` on a miss. */
 export interface CollectMarker { readonly __collect: true; readonly nullable: boolean; readonly spec: ShapeSpec }
-export function Collect<K extends string>(spec: ShapeOf<K>): CollectMarker { return { __collect: true, nullable: false, spec: spec as ShapeSpec } }
+export function Collect<K extends string>(spec: ShapeOf<K> | ShapeEntries): CollectMarker { return { __collect: true, nullable: false, spec: spec as ShapeSpec } }
 /** Like Collect(), but the whole group decodes to `null` on a LEFT-JOIN miss: when any REQUIRED field is NULL,
  *  or — when every field is Nullable() — when ALL fields are NULL. */
-export function CollectNullable<K extends string>(spec: ShapeOf<K>): CollectMarker { return { __collect: true, nullable: true, spec: spec as ShapeSpec } }
+export function CollectNullable<K extends string>(spec: ShapeOf<K> | ShapeEntries): CollectMarker { return { __collect: true, nullable: true, spec: spec as ShapeSpec } }
 export const isCollectMarker = (x: unknown): x is CollectMarker => typeof x === 'object' && x !== null && (x as { __collect?: unknown }).__collect === true
 
 /** A per-column DECODE-TIME transform: the cell decodes per `type`, then `fn(decoded)` runs during assembly.
@@ -165,7 +196,7 @@ const arrayCore = (pg: string): string => { let c = pg; while (c.endsWith('[]'))
  *  (a precision type left as string). A `:number` override opts out — Number is JSON.parse-safe.
  *  Array fields ('bigint[]') are judged by their ELEMENT type. */
 export function specHasPrecision(spec: JsonSpec): boolean {
-  for (const raw of Object.values(spec)) {
+  for (const [, raw] of specEntries(spec)) {
     const v = jsonBase(raw) // Transform doesn't force the scanner; its base type decides
     if (isJsonMarker(v)) { if (specHasPrecision(v.spec)) return true; continue }
     const { pg, js } = splitType(v)
@@ -179,7 +210,7 @@ export function specHasPrecision(spec: JsonSpec): boolean {
 /** Reject Json() field specs that would silently mis-decode: arrays of arbitrary-JSON elements
  *  ('json[]'/'jsonb[]'/'unknown[]') have no scalar element read. Called at shape-build time. */
 export function validateJsonSpec(spec: JsonSpec): void {
-  for (const [key, raw] of Object.entries(spec)) {
+  for (const [key, raw] of specEntries(spec)) {
     const v = jsonBase(raw)
     if (isCustomMarker(v)) throw new Error(`minipg: Json() field ${JSON.stringify(key)}: defineType() markers aren't supported inside a json shape yet — decode the field as 'unknown'/text and parse with Transform()`)
     if (isJsonMarker(v)) { validateJsonSpec(v.spec); continue }
@@ -192,7 +223,7 @@ export function validateJsonSpec(spec: JsonSpec): void {
 
 /** True if the shape has any Transform field (anywhere) — the decoded value must be visited by its fn. */
 export function specHasTransform(spec: JsonSpec): boolean {
-  for (const v of Object.values(spec)) {
+  for (const [, v] of specEntries(spec)) {
     if (isTransformMarker(v)) return true
     if (isJsonMarker(v) && specHasTransform(v.spec)) return true
   }
@@ -203,7 +234,7 @@ export function specHasTransform(spec: JsonSpec): boolean {
  *  :ms/:date temporal (ISO string -> Date/number) or an int8/bigint (number/string -> BigInt), scalar
  *  or array element. Only shapes that answer true need the post-parse walk below. */
 export function specNeedsWalk(spec: JsonSpec): boolean {
-  for (const raw of Object.values(spec)) {
+  for (const [, raw] of specEntries(spec)) {
     if (isTransformMarker(raw)) return true // the interpreted walk applies the transform fn after JSON.parse
     if (isJsonMarker(raw)) { if (specNeedsWalk(raw.spec)) return true; continue }
     const { pg, js } = splitType(raw)
@@ -254,7 +285,7 @@ export function buildJsonWalk(marker: JsonMarker): (v: unknown) => unknown {
     return null
   }
   const fns: Array<[string, (x: unknown) => unknown]> = []
-  for (const [key, raw] of Object.entries(marker.spec)) {
+  for (const [key, raw] of specEntries(marker.spec)) {
     const field = isTransformMarker(raw) ? raw.type : raw // Transform: fixup the base type, then apply the fn
     const xf = isTransformMarker(raw) ? (raw.fn as (x: unknown) => unknown) : null
     let base: ((x: unknown) => unknown) | null = null
@@ -277,7 +308,7 @@ export function buildJsonWalk(marker: JsonMarker): (v: unknown) => unknown {
  *  JSON.parse). Recurses into nested json that has transforms; null passes through (fn never sees null). */
 export function buildJsonTransformWalk(marker: JsonMarker): (v: unknown) => unknown {
   const fns: Array<[string, (x: unknown) => unknown]> = []
-  for (const [key, raw] of Object.entries(marker.spec)) {
+  for (const [key, raw] of specEntries(marker.spec)) {
     if (isTransformMarker(raw)) fns.push([key, raw.fn as (x: unknown) => unknown])
     else if (isJsonMarker(raw) && specHasTransform(raw.spec)) fns.push([key, buildJsonTransformWalk(raw)])
   }
@@ -292,7 +323,7 @@ export function buildJsonTransformWalk(marker: JsonMarker): (v: unknown) => unkn
 
 // The order fields appear ON THE WIRE: declared order for json; (length, then bytewise on
 // UTF-8) for jsonb. Returns declared-indices in wire order. Stable for equal keys.
-function wireOrder(entries: [string, unknown][], type: 'json' | 'jsonb'): number[] { // only the keys matter
+function wireOrder(entries: ReadonlyArray<readonly [string, unknown]>, type: 'json' | 'jsonb'): number[] { // only the keys matter
   const idx = entries.map((_, i) => i)
   if (type === 'json') return idx
   return idx.sort((a, b) => {
@@ -399,7 +430,7 @@ function inlineMarker(marker: JsonMarker, target: string, ctx: { n: number }): s
 // monomorphic literal. Fields read in WIRE order; the literal is emitted in DECLARED order.
 function inlineObject(spec: JsonSpec, type: 'json' | 'jsonb', target: string, ctx: { n: number }): string {
   const id = ctx.n++
-  const entries = Object.entries(spec)
+  const entries = specEntries(spec)
   const order = wireOrder(entries, type)
   const vs = entries.map((_, i) => `_o${id}_${i}`)
   // computed key for __proto__ so it becomes an own property, not the object's prototype

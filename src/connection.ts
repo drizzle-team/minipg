@@ -10,7 +10,7 @@ import type { ConnectConfig, Decoder, Field, QueryDebug, QueryOptions, QueryResu
 import { INSTANT_OIDS, BINARY_FAST, type CodegenCol } from './decode.ts'
 import { buildMapperFactory, isEvalAvailable, type RowMapper, type RowMapperFactory } from './mapper.ts'
 import { resolveUrl } from './url.ts'
-import { shapeCols, resolveParamTypes, paramTypeOid, type ShapeSpec, type ShapeOf, type ParamType, type PgType } from './spec.ts'
+import { shapeCols, resolveParamTypes, paramTypeOid, type ShapeSpec, type ShapeOf, type ShapeEntries, type ParamType, type PgType } from './spec.ts'
 import type { ShapeMapper } from './shape.ts'
 import type { Plugin, QueryInfo, QueryMetrics } from './plugin.ts'
 import { Cursor, type CursorOptions } from './cursor.ts'
@@ -1003,7 +1003,7 @@ export class Connection {
   // ---- public query API ----
   // a shape (without an explicit non-object mode) decodes to objects — matches the runtime default.
   // generic over the shape's column names so editors autocomplete each value to the known type list.
-  query<K extends string>(sql: string | readonly string[], params: unknown[], opts: { shape: ShapeOf<K> | ShapeMapper; mode?: 'object'; name?: string; metrics?: boolean | 'ms' | 'us'; debug?: boolean; timeout?: number; signal?: AbortSignal }): Promise<QueryResult<Record<string, unknown>>>
+  query<K extends string>(sql: string | readonly string[], params: unknown[], opts: { shape: ShapeOf<K> | ShapeEntries | ShapeMapper; mode?: 'object'; name?: string; metrics?: boolean | 'ms' | 'us'; debug?: boolean; timeout?: number; signal?: AbortSignal }): Promise<QueryResult<Record<string, unknown>>>
   query(sql: string | readonly string[], params?: unknown[], opts?: { name?: string; snapshot?: string; params?: readonly ParamType[]; mode?: 'array'; metrics?: boolean | 'ms' | 'us'; debug?: boolean; timeout?: number; signal?: AbortSignal; trace?: boolean; shape?: ShapeSpec | ShapeMapper; binary?: boolean }): Promise<QueryResult<unknown[]>>
   query(sql: string | readonly string[], params: unknown[], opts: { name?: string; snapshot?: string; params?: readonly ParamType[]; mode: 'object'; metrics?: boolean | 'ms' | 'us'; debug?: boolean; timeout?: number; signal?: AbortSignal; trace?: boolean; shape?: ShapeSpec | ShapeMapper; binary?: boolean }): Promise<QueryResult<Record<string, unknown>>>
   query(sql: string | readonly string[], params: unknown[], opts: { name?: string; snapshot?: string; params?: readonly ParamType[]; mode: 'buffer'; metrics?: boolean | 'ms' | 'us'; debug?: boolean; timeout?: number; signal?: AbortSignal; trace?: boolean; binary?: boolean }): Promise<QueryResult<(Buffer | null)[]>>
