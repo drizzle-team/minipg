@@ -1,4 +1,4 @@
-// minipg for the httpostgres gateway — `import { httpPool } from 'minipg/http'`.
+// minipg for the httpostgres gateway — `import { client } from 'minipg/http'`.
 //
 // Speaks the gateway protocol (httpostgres PROTOCOL.md): POST /query with a JSON request, and the
 // RESPONSE BODY IS the Postgres wire stream — {T, D, C, E, I} frames byte-for-byte as the backend
@@ -90,7 +90,7 @@ interface RawResult { fields: Field[] | null; rows: Buffer[]; command: string | 
 
 const firstCstr = (b: Buffer): string => { const z = b.indexOf(0); return b.toString('utf8', 0, z < 0 ? b.length : z) }
 
-export class HttpPool {
+export class HttpClient {
   private cfg: HttpConfig
   private fetchImpl: typeof fetch
   private decoders: Map<number, Decoder>
@@ -281,8 +281,8 @@ function parseDataRowCells(b: Buffer): (Buffer | null)[] {
   return out
 }
 
-/** Create a gateway client. HTTP is connectionless — there is no pool to manage; the name mirrors
- *  the other entries' createPool ergonomics. */
-export function httpPool(config: HttpConfig): HttpPool { return new HttpPool(config) }
+/** Create a gateway client. HTTP is connectionless — there is no pool to manage, so the factory
+ *  is just `client()`. */
+export function client(config: HttpConfig): HttpClient { return new HttpClient(config) }
 export { PgError }
 export type { QueryResult, ResultMode, Decoder }

@@ -2,7 +2,7 @@
 // audience. The trap is module-EVAL-time Buffer touches (decode.ts feature probes, encode.ts
 // COPY_SIG): bundlers reorder imports, so the polyfill may install AFTER those modules evaluate.
 // The fix is guards, making import order irrelevant. This test deletes Buffer in a subprocess,
-// imports the entry, and runs a full httpPool decode over REAL captured backend frames.
+// imports the entry, and runs a full client decode over REAL captured backend frames.
 import { test, expect, describe } from 'bun:test'
 import { testConnect, TEST_TIMEOUT } from '../helpers/db.ts'
 
@@ -17,10 +17,10 @@ describe('minipg/http without a global Buffer', () => {
 
     const script = `
       delete globalThis.Buffer // simulate Vercel Edge / browser: no Buffer before the entry loads
-      const { httpPool } = await import(${JSON.stringify(import.meta.dir + '/../../src/http.ts')})
+      const { client } = await import(${JSON.stringify(import.meta.dir + '/../../src/http.ts')})
       if (typeof globalThis.Buffer !== 'function') throw new Error('polyfill did not install')
       const bytes = Uint8Array.fromBase64(${JSON.stringify(body.toString('base64'))})
-      const db = httpPool({
+      const db = client({
         url: 'https://gw.example/query', token: 'k',
         fetch: async () => new Response(bytes, { status: 200, headers: { 'Content-Type': 'application/vnd.minipg.pgwire' } }),
       })
