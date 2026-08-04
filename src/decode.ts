@@ -781,14 +781,6 @@ export function replBinaryFor(oid: number, map: Map<number, Decoder>): CellDecod
   try { return pickBinary(oid) } catch { return null }
 }
 
-/** True when this oid's BINARY decode yields the IDENTICAL JS value as text mode — the gate for
- *  auto-enabling binary replication. float4 (binary = exact f32 vs text = canonical shortest) and
- *  arrays (JS array vs raw '{…}' literal) are binary-capable but value-DIVERGENT -> false. */
-export function replBinaryMatchesText(oid: number, map: Map<number, Decoder>): boolean {
-  if (oid === 700 || ELEM_OID[oid] !== undefined) return false
-  return replBinaryFor(oid, map) !== null
-}
-
 // ---- Binary tuples for SHAPED replication columns (`start({ shapes })`) ------------------------
 // Same contract as replBinaryFor, but honoring the column's DECLARED js target: null whenever
 // binary bytes cannot produce the value the declaration promises (e.g. 'timestamptz:string' is

@@ -92,3 +92,30 @@ d('minipg/neon-http over the Neon SQL-over-HTTP endpoint', () => {
     expect(String(cell)).toBe('1')
   })
 })
+
+// Offline (no NEON_HTTP_URL needed): the guard throws BEFORE any fetch. The stub fetch throws a
+// sentinel, so a rejection with 'reached-fetch' PROVES a statement passed the guard.
+describe('stateless transaction-control guard', () => {
+  const stub = (async () => { throw new Error('reached-fetch') }) as unknown as typeof fetch
+  const client = () => connect({ host: 'ep.example.invalid', fetch: stub })
+
+  test('query() rejects tx-control SQL loudly; savepoint/rollback-to/lookalikes pass the guard', async () => {
+    const db = await client()
+    for (const sql of ['begin', '  BEGIN;', 'Start  Transaction', 'commit', 'END', 'rollback', 'abort', "prepare transaction 'x'"]) {
+      const err = await db.query(sql).then(() => null, (e: unknown) => e as Error)
+      expect(err?.message).toMatch(/does NOTHING over stateless HTTP/)
+    }
+    for (const sql of ['savepoint sp1', 'rollback to savepoint sp1', 'select 1', 'select commitfee from t', 'ending_balance()']) {
+      const err = await db.query(sql).then(() => null, (e: unknown) => e as Error)
+      expect(err?.message).toBe('reached-fetch') // passed the guard, hit the (stub) network
+    }
+  })
+
+  test('transaction([...]) rejects a nested tx-control item but allows savepoints (the batch IS one tx)', async () => {
+    const db = await client()
+    const err = await db.transaction([{ sql: 'select 1' }, { sql: 'commit' }]).then(() => null, (e: unknown) => e as Error)
+    expect(err?.message).toMatch(/silently break its atomicity/)
+    const ok = await db.transaction([{ sql: 'savepoint s' }, { sql: 'rollback to savepoint s' }]).then(() => null, (e: unknown) => e as Error)
+    expect(ok?.message).toBe('reached-fetch')
+  })
+})

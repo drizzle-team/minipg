@@ -136,6 +136,13 @@ export type AuroraTxFn<T> = (tx: AuroraClient) => T | Promise<T>
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms))
 
+// Leading transaction-control keyword. Data API transactions are REAL but threaded via
+// transactionId (begin(fn)) — textual BEGIN/COMMIT either silently auto-commit per statement
+// (outside begin()) or desync the threaded tx (inside), so both throw. NOT listed on purpose:
+// SAVEPOINT / RELEASE / ROLLBACK TO (legit inside a threaded tx — runTx's own nesting uses them;
+// a loud server error outside one) and SET TRANSACTION (tx-scoped, runTx issues it itself).
+const TX_SQL = /^\s*(begin|start\s+transaction|commit|end|rollback(?!\s+to\b)|abort|prepare\s+transaction)\b/i
+
 export class AuroraClient {
   private readonly resourceArn: string
   private readonly secretArn: string
@@ -239,6 +246,8 @@ export class AuroraClient {
   query(sql: string, params: unknown[], opts: { mode: 'buffer'; timeout?: number; signal?: AbortSignal }): Promise<QueryResult<(Buffer | null)[]>>
   query(sql: string, params: unknown[], opts: { mode: 'raw'; timeout?: number; signal?: AbortSignal }): Promise<QueryResult<Buffer>>
   async query(sql: string, params: unknown[] = [], opts: AuroraQueryOptions = {}): Promise<QueryResult<never>> {
+    const tx = TX_SQL.exec(sql)
+    if (tx) throw new Error(`minipg/aurora: "${tx[1]!.toUpperCase()}" bypasses the Data API's transaction threading — outside begin() each statement auto-commits (a textual BEGIN silently does nothing), and inside begin() it would desync the threaded transactionId; use begin(fn)/transaction(fn)`)
     const body = {
       ...this.base(), sql,
       ...(params.length ? { parameters: toParameters(params) } : {}),
@@ -252,6 +261,8 @@ export class AuroraClient {
   /** Bulk-execute ONE statement over many parameter sets (BatchExecuteStatement). For INSERT/UPDATE/DELETE —
    *  it returns no result rows. Each set is a params array (raw values and/or `bind()`), like `query`. */
   async batch(sql: string, paramSets: unknown[][], opts: { signal?: AbortSignal } = {}): Promise<{ updateResults: Array<{ generatedFields: unknown[] }> }> {
+    const tx = TX_SQL.exec(sql)
+    if (tx) throw new Error(`minipg/aurora: "${tx[1]!.toUpperCase()}" bypasses the Data API's transaction threading — use begin(fn)/transaction(fn)`)
     const body = { ...this.base(), sql, parameterSets: paramSets.map(toParameters), ...(this.txId ? { transactionId: this.txId } : {}) }
     return this.call('BatchExecute', body, opts.signal)
   }

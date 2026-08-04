@@ -42,3 +42,16 @@ it('binary flow (queryTyped) + a larger stream survive the workerd transport', a
     await db.end()
   }
 })
+
+it('a url-only config dials the URL host/port, not localhost:5432 (cf-transport regression)', async () => {
+  // pre-fix, cfSocket read the RAW config (host undefined -> localhost:5432) and only the
+  // startup message saw the parsed url — right user, wrong server. 54329 != the 5432 default,
+  // so this connect only succeeds if the url actually reached the dialer.
+  const db = await connect('postgres://postgres:postgres@127.0.0.1:54329/testdb')
+  try {
+    const r = await db.query('select current_database() as db', [], { mode: 'object' })
+    expect(r.rows[0]).toEqual({ db: 'testdb' })
+  } finally {
+    await db.end()
+  }
+})

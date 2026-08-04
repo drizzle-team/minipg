@@ -1,7 +1,7 @@
 // replication(): logical replication over the real auth/transport stack (TCP + SCRAM here).
 // Requires the local cluster with wal_level=logical (test/setup-pg.sh cluster, reconfigured).
 import { test, expect, describe } from 'bun:test'
-import { replication, connect, defineType, Jsonb, Collect, Transform, type ReplicationEvent, type TableShape } from '../../src/index.ts'
+import { replication, connect, defineType, Jsonb, Collect, Transform, ReplicationStreamEnded, type ReplicationEvent, type TableShape } from '../../src/index.ts'
 import { TEST_CONFIG, withConn, testPool, TEST_TIMEOUT } from '../helpers/db.ts'
 
 const K = `repl_${process.pid}`
@@ -170,7 +170,7 @@ describe('replication()', () => {
           const slot = await repl.createSlot(`${K}_dslot`, { temporary: true })
           await c.query(`insert into ${K}_d values (9007199254740993, '2026-01-02T03:04:05.678Z', 10.50, array[1,2,3])`)
           const events = await collectUntil(
-            repl.start({ slot: slot.slot, publications: [`${K}_dpub`] }),
+            repl.start({ slot: slot.slot, publications: [`${K}_dpub`], binary: false }), // pin TEXT: this test is about text-mode defaults
             (es) => es.some((e) => e.kind === 'commit'))
           const ins = events.find((e) => e.kind === 'insert') as Extract<ReplicationEvent, { kind: 'insert' }>
           expect(ins.new.id).toBe(9007199254740993n)                     // BigInt, exact (was a string before)
@@ -186,10 +186,10 @@ describe('replication()', () => {
     })
   }, TEST_TIMEOUT)
 
-  test("binary 'auto' (default): engages on value-safe tables, stays text when float4/arrays present", async () => {
+  test("binary 'auto' (default): engages when every column is binary-decodable, stays text otherwise", async () => {
     await withConn(async (c) => {
-      await c.query(`create table ${K}_a1(id int8 primary key, price numeric, name text)`)          // all value-safe
-      await c.query(`create table ${K}_a2(id int8 primary key, ns int4[])`)                          // array -> divergent
+      await c.query(`create table ${K}_a1(id int8 primary key, price numeric, name text, ns int4[])`) // all decodable (arrays included)
+      await c.query(`create table ${K}_a2(id int8 primary key, dur interval)`)                        // interval: no binary decoder
       await c.query(`create publication ${K}_a1pub for table ${K}_a1`)
       await c.query(`create publication ${K}_a2pub for table ${K}_a2`)
       try {
@@ -197,20 +197,46 @@ describe('replication()', () => {
           const repl = await replication(TEST_CONFIG)
           try {
             const slot = await repl.createSlot(`${tbl}_slot`, { temporary: true })
-            await c.query(tbl.endsWith('a1') ? `insert into ${tbl} values (1, 10.50, 'x')` : `insert into ${tbl} values (1, array[1,2])`)
+            await c.query(tbl.endsWith('a1') ? `insert into ${tbl} values (1, 10.50, 'x', array[1,2])` : `insert into ${tbl} values (1, interval '1 day')`)
             const events = await collectUntil(
               repl.start({ slot: slot.slot, publications: [pub] }), // binary unset -> 'auto'
               (es) => es.some((e) => e.kind === 'commit'))
             expect(repl.binaryTuples).toBe(expectBinary)
             const ins = events.find((e) => e.kind === 'insert') as Extract<ReplicationEvent, { kind: 'insert' }>
-            expect(ins.new.id).toBe(1n) // identical values either way — that's the auto contract
-            if (!expectBinary) expect(ins.new.ns).toBe('{1,2}') // text mode kept the raw literal
-            else expect(ins.new.price).toBe('10.50')
+            expect(ins.new.id).toBe(1n)
+            if (expectBinary) { expect(ins.new.price).toBe('10.50'); expect(ins.new.ns).toEqual([1, 2]) } // binary: real JS array
+            else expect(ins.new.dur).toBe('1 day') // undecodable column -> whole stream text, interval as PG text
           } finally { repl.end() }
         }
       } finally {
         await c.query(`drop publication ${K}_a1pub`); await c.query(`drop publication ${K}_a2pub`)
         await c.query(`drop table ${K}_a1, ${K}_a2`)
+      }
+    })
+  }, TEST_TIMEOUT)
+
+  test("binary 'auto' + shapes: a text-only shape target keeps the stream on text (negotiation matches decode)", async () => {
+    await withConn(async (c) => {
+      await c.query(`create table ${K}_a3(id int8 primary key, at timestamptz)`) // every column binary-decodable by default
+      await c.query(`create publication ${K}_a3pub for table ${K}_a3`)
+      try {
+        const repl = await replication(TEST_CONFIG)
+        try {
+          const slot = await repl.createSlot(`${K}_a3slot`, { temporary: true })
+          await c.query(`insert into ${K}_a3 values (1, '2024-01-02T03:04:05Z')`)
+          const events = await collectUntil(
+            repl.start({
+              slot: slot.slot, publications: [`${K}_a3pub`],
+              shapes: [{ table: `${K}_a3`, shape: { at: 'timestamptz:string' } }], // binary can't produce PG's text
+            }),
+            (es) => es.some((e) => e.kind === 'commit'))
+          expect(repl.binaryTuples).toBe(false) // the shaped target flipped auto to text — no decode-time crash possible
+          const ins = events.find((e) => e.kind === 'insert') as Extract<ReplicationEvent, { kind: 'insert' }>
+          expect(ins.new.at).toMatch(/^2024-01-02 /) // decoded as the declared exact PG text
+        } finally { repl.end() }
+      } finally {
+        await c.query(`drop publication ${K}_a3pub`)
+        await c.query(`drop table ${K}_a3`)
       }
     })
   }, TEST_TIMEOUT)
@@ -327,6 +353,91 @@ describe('replication()', () => {
       } finally {
         await c.query(`drop publication ${K}_epub`)
         await c.query(`drop table ${K}_e`)
+      }
+    })
+  }, TEST_TIMEOUT)
+
+  test("ack() is forgiving: a commit's lsn counts as its endLsn", async () => {
+    await withConn(async (c) => {
+      await c.query(`create table ${K}_f(id int4 primary key)`)
+      await c.query(`create publication ${K}_fpub for table ${K}_f`)
+      try {
+        const repl = await replication(TEST_CONFIG)
+        try {
+          const slot = await repl.createSlot(`${K}_fslot`, { temporary: true })
+          await c.query(`insert into ${K}_f values (1)`)
+          const events = await collectUntil(
+            repl.start({ slot: slot.slot, publications: [`${K}_fpub`] }),
+            (es) => es.some((e) => e.kind === 'commit'))
+          const commit = events.find((e) => e.kind === 'commit') as Extract<ReplicationEvent, { kind: 'commit' }>
+          repl.ack(commit.lsn) // the natural-looking WRONG field
+          expect(repl.flushedLsn).toBe(commit.endLsn) // normalized — the idle-keepalive gate opens anyway
+        } finally { repl.end() }
+      } finally {
+        await c.query(`drop publication ${K}_fpub`)
+        await c.query(`drop table ${K}_f`)
+      }
+    })
+  }, TEST_TIMEOUT)
+
+  test('server CopyDone surfaces as a ReplicationStreamEnded THROW, never a silent clean end', async () => {
+    await withConn(async (c) => {
+      await c.query(`create table ${K}_cd(id int4 primary key)`)
+      await c.query(`create publication ${K}_cdpub for table ${K}_cd`)
+      try {
+        const repl = await replication(TEST_CONFIG)
+        try {
+          const slot = await repl.createSlot(`${K}_cdslot`, { temporary: true })
+          await c.query(`insert into ${K}_cd values (1)`)
+          const gen = repl.start({ slot: slot.slot, publications: [`${K}_cdpub`] })
+          for (;;) { const r = await gen.next(); if (r.done || (r.value as ReplicationEvent).kind === 'commit') break } // stream live
+          // inject a server CopyDone (+ the ReadyForQuery that ends the handshake), as onData would
+          const priv = repl as unknown as { q: { type: string; body: Buffer }[]; wake: (() => void) | null }
+          priv.q.push({ type: 'c', body: Buffer.alloc(0) }, { type: 'Z', body: Buffer.from('I') })
+          const w = priv.wake; priv.wake = null; w?.()
+          const err = await gen.next().then(() => null, (e: unknown) => e)
+          expect(err).toBeInstanceOf(ReplicationStreamEnded)
+          expect((err as ReplicationStreamEnded).reason).toBe('copy-done')
+        } finally { repl.end() }
+      } finally {
+        await c.query(`drop publication ${K}_cdpub`)
+        await c.query(`drop table ${K}_cd`)
+      }
+    })
+  }, TEST_TIMEOUT)
+
+  test('end() and AbortSignal deterministically finish a parked start() iterator', async () => {
+    await withConn(async (c) => {
+      await c.query(`create table ${K}_e2(id int4 primary key)`)
+      await c.query(`create publication ${K}_e2pub for table ${K}_e2`)
+      const finishes = (p: Promise<IteratorResult<ReplicationEvent>>, what: string) =>
+        Promise.race([p, new Promise<never>((_, rej) => setTimeout(() => rej(new Error(`${what} did not finish the iterator`)), 2000))])
+      try {
+        // end(): the parked next() finishes NOW, not when the (here: 60s) status timer would fire
+        const r1 = await replication(TEST_CONFIG)
+        try {
+          const s1 = await r1.createSlot(`${K}_e2slot1`, { temporary: true })
+          const gen = r1.start({ slot: s1.slot, publications: [`${K}_e2pub`], statusIntervalMs: 60_000 })
+          const pending = gen.next() // no traffic -> parks awaiting messages
+          await new Promise((r) => setTimeout(r, 100))
+          r1.end()
+          expect((await finishes(pending, 'end()')).done).toBe(true)
+        } finally { r1.end() }
+
+        // AbortSignal: same clean finish + connection close
+        const r2 = await replication(TEST_CONFIG)
+        try {
+          const s2 = await r2.createSlot(`${K}_e2slot2`, { temporary: true })
+          const ac = new AbortController()
+          const gen2 = r2.start({ slot: s2.slot, publications: [`${K}_e2pub`], statusIntervalMs: 60_000, signal: ac.signal })
+          const pending2 = gen2.next()
+          await new Promise((r) => setTimeout(r, 100))
+          ac.abort()
+          expect((await finishes(pending2, 'abort')).done).toBe(true)
+        } finally { r2.end() }
+      } finally {
+        await c.query(`drop publication ${K}_e2pub`)
+        await c.query(`drop table ${K}_e2`)
       }
     })
   }, TEST_TIMEOUT)

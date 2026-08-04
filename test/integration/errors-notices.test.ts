@@ -489,3 +489,17 @@ describe('parseErrorFields / PgError unit', () => {
 describe('stack-trace quality (roadmap)', () => {
   test.todo('error includes a stack frame at the application call site (not implemented)', () => {})
 })
+
+describe('query() arg ergonomics', () => {
+  test('query(sql, opts) arg-shifts a known-options object; a params mistake gets a pointed TypeError', async () => {
+    const conn = await testConnect()
+    try {
+      // all keys are known QueryOptions -> treated as the options argument
+      const r = await conn.query('select 1 as x', { mode: 'object' } as never)
+      expect(r.rows[0] as unknown).toEqual({ x: 1 })
+      // an unknown-key object is NOT options -> the params error says the fix
+      const err = await caught(() => conn.query('select $1', { id: 5 } as never))
+      expect((err as Error).message).toMatch(/params must be an array — pass options as the THIRD argument/)
+    } finally { conn.end() }
+  })
+})

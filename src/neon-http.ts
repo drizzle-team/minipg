@@ -147,6 +147,13 @@ function numField(buf: Buffer, key: string, from: number): number | null {
   const s = buf.toString('latin1', j, e); return s === 'null' ? null : Number(s)
 }
 
+// Leading transaction-control keyword (BEGIN/COMMIT/…). Session state doesn't survive a stateless
+// HTTP request, so these must throw LOUDLY instead of silently giving zero atomicity. SAVEPOINT /
+// RELEASE / ROLLBACK TO are not listed: inside transaction([...]) they're legit (the batch IS one
+// tx), and standalone the server already errors loudly ("can only be used in transaction blocks").
+// Best-effort lexical check (a leading comment evades it), same spirit as the fn-guard below.
+const TX_SQL = /^\s*(begin|start\s+transaction|commit|end|rollback(?!\s+to\b)|abort|prepare\s+transaction)\b/i
+
 export class NeonHttpClient {
   private endpoint: string
   private connString: string
@@ -282,6 +289,8 @@ export class NeonHttpClient {
   async query(sql: string | readonly string[], params: unknown[] = [], opts: NeonHttpQueryOptions = {}): Promise<QueryResult<never>> {
     const mode: ResultMode = opts.mode ?? (opts.shape ? 'object' : 'array')
     const query = typeof sql === 'string' ? sql : joinChunks(sql)
+    const tx = TX_SQL.exec(query)
+    if (tx) throw new Error(`minipg/neon-http: "${tx[1]!.toUpperCase()}" does NOTHING over stateless HTTP — every query() runs in its OWN session, so hand-rolled BEGIN…COMMIT gives zero atomicity with no error; use transaction([...]) for an atomic batch, or minipg/neon-ws for interactive transactions`)
     const res = await this.post({ query, params: params.map(encodeParam) }, await this.headers(), this.signalFor(opts))
     return this.decodeSingleRaw(Buffer.from(await res.arrayBuffer()), mode, opts.shape)
   }
@@ -291,6 +300,7 @@ export class NeonHttpClient {
    *  the interactive `begin(fn)` form is not available (use minipg/neon-ws for that). */
   async transaction(queries: NeonTxQuery[], opts: NeonTxOptions = {}): Promise<QueryResult[]> {
     if (typeof queries === 'function') throw new Error('minipg/neon-http: interactive transaction(fn) is not available over stateless HTTP — pass an ARRAY of queries for an atomic batch, or use minipg/neon-ws for interactive transactions')
+    for (const q of queries) { const tx = TX_SQL.exec(q.sql); if (tx) throw new Error(`minipg/neon-http: "${tx[1]!.toUpperCase()}" inside transaction([...]) — the batch is ALREADY wrapped in BEGIN…COMMIT server-side; a nested one would silently break its atomicity`) }
     const headers = await this.headers()
     if (opts.isolation) headers['Neon-Batch-Isolation-Level'] = ISO_HEADER[opts.isolation]
     if (opts.readOnly != null) headers['Neon-Batch-Read-Only'] = String(opts.readOnly)

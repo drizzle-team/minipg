@@ -11,6 +11,9 @@ import { INSTANT_OIDS, BINARY_FAST, type CodegenCol } from './decode.ts'
 import { buildMapperFactory, isEvalAvailable, type RowMapper, type RowMapperFactory } from './mapper.ts'
 import { resolveUrl } from './url.ts'
 import { shapeCols, resolveParamTypes, paramTypeOid, type ShapeSpec, type ShapeOf, type ShapeEntries, type ParamType, type PgType } from './spec.ts'
+
+// QueryOptions keys, for the query(sql, opts) arg-shift — an unknown key means "not an options object"
+const OPTION_KEYS = new Set(['name', 'snapshot', 'mode', 'params', 'shape', 'binary', 'metrics', 'debug', 'timeout', 'signal', 'trace'])
 import type { ShapeMapper } from './shape.ts'
 import type { Plugin, QueryInfo, QueryMetrics } from './plugin.ts'
 import { Cursor, type CursorOptions } from './cursor.ts'
@@ -757,7 +760,7 @@ export class Connection {
     try {
       if (t.copySource) { writeQuery(w, t.sql) } // COPY: simple 'Q' (cleanest copy state machine); the 'G' handler pumps the source
       else { // ---- everything below is the extended-protocol serialization ----
-      if (!Array.isArray(t.params)) throw new TypeError('params must be an array')
+      if (!Array.isArray(t.params)) throw new TypeError('minipg: params must be an array — pass options as the THIRD argument: query(sql, [], opts)')
       const name = t.name ?? ''
       let reuse = false
       let entry: PreparedEntry | undefined
@@ -1009,6 +1012,12 @@ export class Connection {
   query(sql: string | readonly string[], params: unknown[], opts: { name?: string; snapshot?: string; params?: readonly ParamType[]; mode: 'buffer'; metrics?: boolean | 'ms' | 'us'; debug?: boolean; timeout?: number; signal?: AbortSignal; trace?: boolean; binary?: boolean }): Promise<QueryResult<(Buffer | null)[]>>
   query(sql: string | readonly string[], params: unknown[], opts: { name?: string; snapshot?: string; params?: readonly ParamType[]; mode: 'raw'; metrics?: boolean | 'ms' | 'us'; debug?: boolean; timeout?: number; signal?: AbortSignal; trace?: boolean; binary?: boolean }): Promise<QueryResult<Buffer>>
   query(sql: string | readonly string[], params: unknown[] = [], opts: QueryOptions = {}): Promise<QueryResult<never>> {
+    // query(sql, opts) arg-shift for untyped callers: a non-array second argument whose keys are
+    // all KNOWN options (and no third argument) is an options object, not a params mistake.
+    if (params && !Array.isArray(params) && typeof params === 'object' && Object.keys(opts).length === 0) {
+      const keys = Object.keys(params)
+      if (keys.length > 0 && keys.every((k) => OPTION_KEYS.has(k))) { opts = params as QueryOptions; params = [] }
+    }
     if (opts.snapshot) {
       // snapshot-pinned one-shot: BEGIN + SET SNAPSHOT + query + COMMIT fired back-to-back so
       // they PIPELINE (one round trip, contiguous in the dispatch queue). A failed query

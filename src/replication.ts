@@ -16,7 +16,7 @@ import { PgError, parseErrorFields } from './errors.ts'
 import { getDefaultTransport, type NormalizedConfig } from './connection.ts'
 import { resolveUrl } from './url.ts'
 import { buildDecoders } from './decode.ts'
-import { pickDecoder, replBinaryFor, replBinaryForCol, replBinaryMatchesText, type CellDecoder, type CodegenCol } from './decode.ts'
+import { pickDecoder, replBinaryFor, replBinaryForCol, type CellDecoder, type CodegenCol } from './decode.ts'
 import { shapeCols, type TypeSpec } from './spec.ts'
 import type { JsonMarker, TransformMarker, SpecEntries } from './json.ts'
 import type { CustomMarker } from './registry.ts'
@@ -32,11 +32,29 @@ const toLsn = (v: string | bigint): bigint => (typeof v === 'bigint' ? v : lsnFr
 // ---- event model ----
 export interface ReplicationRelation { schema: string; table: string; replicaIdentity: 'd' | 'n' | 'f' | 'i'; columns: { name: string; oid: number; key: boolean }[] }
 export type Row = Record<string, unknown>
+// LSN taxonomy: begin.finalLsn === commit.lsn (the commit RECORD's own position) < commit.endLsn
+// (the first position AFTER the record). ACK endLsn — see ack().
 export type ReplicationEvent =
-  | { kind: 'begin'; xid: number; commitTime: Date; finalLsn: string }
-  | { kind: 'commit'; lsn: string; endLsn: string; commitTime: Date }
+  | {
+      kind: 'begin'; xid: number; commitTime: Date
+      /** The tx's commit-record LSN — identical to the matching commit event's `lsn`. */
+      finalLsn: string
+    }
+  | {
+      kind: 'commit'
+      /** The commit record's OWN position (=== begin.finalLsn). Not the ack target. */
+      lsn: string
+      /** First LSN AFTER the commit record — `repl.ack(e.endLsn)` acknowledges this tx.
+       *  (ack() normalizes a value inside [lsn, endLsn) of the LAST delivered commit, so acking
+       *  `lsn` by mistake can't silently gate the idle-keepalive advance.) */
+      endLsn: string
+      commitTime: Date
+    }
   | { kind: 'insert'; schema: string; table: string; new: Row }
-  | { kind: 'update'; schema: string; table: string; new: Row; old: Row | null; oldKind: 'key' | 'full' | null; unchanged: string[] }
+  // update's old tuple is discriminated on oldKind: 'key'/'full' ALWAYS carries a Row (REPLICA
+  // IDENTITY key columns / full old row), null means no old tuple was on the wire (IDENTITY DEFAULT).
+  | ({ kind: 'update'; schema: string; table: string; new: Row; unchanged: string[] }
+      & ({ oldKind: 'key' | 'full'; old: Row } | { oldKind: null; old: null }))
   | { kind: 'delete'; schema: string; table: string; old: Row; oldKind: 'key' | 'full' }
   | { kind: 'truncate'; tables: { schema: string; table: string }[]; cascade: boolean; restartIdentity: boolean }
   | { kind: 'message'; transactional: boolean; prefix: string; content: Buffer; lsn: string }
@@ -82,19 +100,34 @@ export interface StartOptions {
   messages?: boolean
   /** Standby-status heartbeat interval, ms (default 10_000). */
   statusIntervalMs?: number
-  /** BINARY tuple values (PG14+ pgoutput option). Default 'auto': enabled only when the server is
-   *  14+ AND a pre-start catalog probe shows every column of the published tables decodes to the
-   *  IDENTICAL JS value in binary and text — so auto can never change what your consumer sees.
-   *  (float4 and array columns are binary-capable but value-divergent — float4 binary is the exact
-   *  f32, arrays become real JS arrays instead of raw '{…}' text — so their presence keeps auto on
-   *  text.) `true` forces binary: fixed-width decode, exact numeric strings, JS arrays; a type with
-   *  no binary decoder (e.g. interval) then errors loudly naming table.column. `false` = text.
-   *  Caveat under 'auto'/'true': DDL AFTER the stream starts isn't re-probed — a new column of an
-   *  undecodable type errors on its first binary value. */
+  /** BINARY tuple values (PG14+ pgoutput option). Default 'auto': enabled when the server is 14+
+   *  AND the driver can binary-decode every published column and every shaped target (one
+   *  pre-start catalog probe — a capability check, nothing more). Under binary, arrays decode to
+   *  REAL JS arrays and float4 to the exact stored f32 (text mode: raw '{…}' literals / the
+   *  canonical shortest number). Anything binary can't honor — a type with no binary decoder
+   *  (interval, extension types) or a text-only shape target (':string' temporals, bare float4,
+   *  defineType()/geometry markers) — simply keeps the whole stream on text: auto never crashes.
+   *  `true` forces binary; an undecodable column then errors loudly naming table.column.
+   *  `false` = text. Caveat under 'auto'/'true': DDL AFTER the stream starts isn't re-probed — a
+   *  new column of an undecodable type errors on its first binary value. */
   binary?: boolean | 'auto'
   /** When idle with nothing unacked, advance the flushed LSN to the server's keepalive
    *  position so an idle slot doesn't retain WAL forever (default true). */
   idleAck?: boolean
+  /** Abort = the consumer's own stop: the iterator finishes CLEANLY (no throw) and the
+   *  connection closes — same as calling end() while parked in next(). */
+  signal?: AbortSignal
+}
+
+/** The SERVER ended the replication stream (CopyDone): clean primary shutdown, failover, or a
+ *  pooler closing the copy. The consumer must react (re-start() or reconnect) — the slot keeps
+ *  retaining WAL either way — so this is a THROW, not a clean return: `for await` discards
+ *  generator return values, and a clean end must stay reserved for the consumer's own break /
+ *  end()/signal. The connection has finished the CopyDone handshake and is usable for a
+ *  follow-up start(). */
+export class ReplicationStreamEnded extends Error {
+  readonly reason = 'copy-done' as const
+  constructor() { super('minipg: server ended the replication stream (CopyDone) — start() again or reconnect to resume') }
 }
 
 /** Open a logical-replication connection (walsender). One purpose per connection: this cannot
@@ -121,7 +154,8 @@ export class ReplicationConnection {
   private shaped = new Map<string, { cols: CodegenCol[]; columns?: Record<string, string> }>() // '<schema>\0<table>' -> resolved shape for the active start() stream
   private lastReceived = 0n
   private flushed = 0n
-  private lastDeliveredEnd = 0n // highest commit endLsn handed to the consumer (guards idleAck)
+  private lastDeliveredEnd = 0n   // highest commit endLsn handed to the consumer (guards idleAck)
+  private lastDeliveredStart = 0n // that same commit's lsn — ack() normalizes values inside [start, end)
   private binaryMode = false    // resolved binary decision for the active start() stream
   private serverMajor = 0       // from the server_version ParameterStatus at startup
 
@@ -164,6 +198,7 @@ export class ReplicationConnection {
       this.socket.write(W.startup({ user: this.cfg.user, database: this.cfg.database, application_name: this.cfg.applicationName, replication: 'database' }))
       for (;;) {
         const m = await this.next()
+        if (!m) throw new Error('minipg: replication connection ended during startup')
         if (m.type === 'R') { this.auth(m.body); continue }
         if (m.type === 'E') throw new PgError(parseErrorFields(m.body))
         if (m.type === 'Z') break // ParameterStatus/BackendKeyData skipped by next()
@@ -198,11 +233,15 @@ export class ReplicationConnection {
     let e = z + 1; while (b[e] !== 0) e++
     this.serverMajor = parseInt(b.toString('latin1', z + 1, e), 10) || 0
   }
-  private async next(): Promise<RawMessage> {
+  /** Next protocol message; null once end() was called and the queue is drained — so a parked
+   *  consumer finishes DETERMINISTICALLY instead of waiting for the keepalive timer to trip
+   *  over the dead socket. */
+  private async next(): Promise<RawMessage | null> {
     for (;;) {
       const m = this.q.shift()
       if (m) { if (m.type === 'S') { this.param(m.body); continue } if (m.type === 'K' || m.type === 'N' || m.type === 'A') continue; return m }
       if (this.err) throw this.err
+      if (this.ended) return null
       await new Promise<void>((r) => { this.wake = r })
     }
   }
@@ -221,6 +260,7 @@ export class ReplicationConnection {
     let err: Error | null = null
     for (;;) {
       const m = await this.next()
+      if (!m) throw new Error('minipg: replication connection ended')
       if (m.type === 'T') columns = parseRowDescription(m.body).map((f) => f.name)
       else if (m.type === 'D') rows.push(parseDataRow(m.body).map((c) => (c === null ? null : c.toString('utf8'))))
       else if (m.type === 'E') err = new PgError(parseErrorFields(m.body))
@@ -240,7 +280,10 @@ export class ReplicationConnection {
   /** Create a logical slot (pgoutput). `snapshot: 'export'` returns a snapshot name a NORMAL
    *  connection can pin (`begin isolation level repeatable read; set transaction snapshot '…'`)
    *  for a GAPLESS backfill — valid only until this connection's next command. Uses the legacy
-   *  keyword syntax (works on PG 10-17). */
+   *  keyword syntax (works on PG 10-17). The return type follows the option: 'export' always
+   *  yields a snapshot name; 'nothing'/omitted always yields null. */
+  async createSlot(name: string, opts: { temporary?: boolean; snapshot: 'export' }): Promise<{ slot: string; consistentPoint: string; snapshot: string }>
+  async createSlot(name: string, opts?: { temporary?: boolean; snapshot?: 'nothing' }): Promise<{ slot: string; consistentPoint: string; snapshot: null }>
   async createSlot(name: string, opts: { temporary?: boolean; snapshot?: 'export' | 'nothing' } = {}): Promise<{ slot: string; consistentPoint: string; snapshot: string | null }> {
     const snap = opts.snapshot === 'export' ? 'EXPORT_SNAPSHOT' : 'NOEXPORT_SNAPSHOT'
     const r = await this.command(`CREATE_REPLICATION_SLOT ${name}${opts.temporary ? ' TEMPORARY' : ''} LOGICAL pgoutput ${snap}`)
@@ -252,10 +295,14 @@ export class ReplicationConnection {
     await this.command(`DROP_REPLICATION_SLOT ${name}${opts.wait ? ' WAIT' : ''}`)
   }
 
-  /** Consumer acknowledgement: everything <= lsn is durably processed. Advances the slot's
-   *  confirmed_flush (releases WAL) on the next status message. */
+  /** Consumer acknowledgement: everything <= the value is durably processed — ack a commit's
+   *  `endLsn`. Forgiving: a value inside the LAST delivered commit's record ([lsn, endLsn))
+   *  counts as that commit's endLsn, so the natural mistake of acking `e.lsn` still fully
+   *  acknowledges a sequentially-consumed stream instead of silently gating the idle-keepalive
+   *  advance. Advances the slot's confirmed_flush (releases WAL) on the next status message. */
   ack(lsn: string | bigint): void {
-    const v = toLsn(lsn)
+    let v = toLsn(lsn)
+    if (v >= this.lastDeliveredStart && v < this.lastDeliveredEnd) v = this.lastDeliveredEnd
     if (v > this.flushed) { this.flushed = v; this.sendStatus() }
   }
 
@@ -266,6 +313,8 @@ export class ReplicationConnection {
   get binaryTuples(): boolean { return this.binaryMode }
 
   async *start(opts: StartOptions): AsyncGenerator<ReplicationEvent> {
+    const onAbort = (): void => this.end()
+    if (opts.signal) { if (opts.signal.aborted) return; opts.signal.addEventListener('abort', onAbort, { once: true }) }
     const from = opts.from !== undefined ? toLsn(opts.from) : 0n
     const pubs = opts.publications.map((p) => `"${p.replace(/"/g, '""')}"`).join(',')
     this.shaped.clear()
@@ -289,13 +338,19 @@ export class ReplicationConnection {
         + ' join pg_class c on c.relnamespace = n.oid and c.relname = pt.tablename'
         + ' join pg_attribute a on a.attrelid = c.oid and a.attnum > 0 and not a.attisdropped'
         + ` where pt.pubname in (${lits})`)
-      bin = probe.rows.length > 0 && probe.rows.every((r) => replBinaryMatchesText(Number(r[0]), this.decoders))
+      // capability gate, nothing more: every published column AND every shaped target must have a
+      // binary decoder (shaped 'unknown' cols defer to the relation default the probe already vets).
+      // One undecodable column -> the whole stream stays text (pgoutput binary is stream-wide).
+      bin = probe.rows.length > 0
+        && probe.rows.every((r) => replBinaryFor(Number(r[0]), this.decoders) !== null)
+        && [...this.shaped.values()].every(({ cols }) => cols.every((c) => c.oid === 0 || replBinaryForCol(c, this.decoders) !== null))
     }
     this.binaryMode = bin
     const sql = `START_REPLICATION SLOT ${opts.slot} LOGICAL ${lsnToString(from)} (proto_version '1', publication_names '${pubs}'${opts.messages === false ? '' : ", messages 'true'"}${bin ? ", binary 'true'" : ''})`
     this.frame('Q', Buffer.from(sql + '\0', 'utf8'))
     for (;;) {
       const m = await this.next()
+      if (!m) return // end()/abort during setup — clean finish
       if (m.type === 'W') break
       if (m.type === 'E') throw new PgError(parseErrorFields(m.body))
     }
@@ -304,8 +359,15 @@ export class ReplicationConnection {
     try {
       for (;;) {
         const m = await this.next()
+        if (!m) return // end()/abort — the consumer's own stop: clean finish through the finally
         if (m.type === 'E') throw new PgError(parseErrorFields(m.body))
-        if (m.type === 'c') return // server CopyDone
+        if (m.type === 'c') { // SERVER CopyDone (shutdown/failover): handshake out of copy mode, then THROW — a clean return must stay reserved for the consumer's own stop
+          try {
+            this.frame('c', Buffer.alloc(0))
+            for (;;) { const n = await this.next(); if (!n || n.type === 'Z') break } // CommandComplete etc. skipped
+          } catch { /* connection died mid-handshake — the stream ending is still the story */ }
+          throw new ReplicationStreamEnded()
+        }
         if (m.type !== 'd') continue
         const p = m.body
         if (p[0] === 0x6b) { // 'k' keepalive: walEnd, clock, replyRequested
@@ -321,11 +383,11 @@ export class ReplicationConnection {
         if (walStart > this.lastReceived) this.lastReceived = walStart
         const e = this.decode(p.subarray(25)) // 'w' + 3x int64 header
         if (e) {
-          if (e.kind === 'commit') { const end = lsnFromString(e.endLsn); if (end > this.lastDeliveredEnd) this.lastDeliveredEnd = end }
+          if (e.kind === 'commit') { const end = lsnFromString(e.endLsn); if (end > this.lastDeliveredEnd) { this.lastDeliveredStart = lsnFromString(e.lsn); this.lastDeliveredEnd = end } }
           yield e
         }
       }
-    } finally { clearInterval(status) }
+    } finally { clearInterval(status); opts.signal?.removeEventListener('abort', onAbort) }
   }
 
   private sendStatus(): void {
@@ -391,7 +453,8 @@ export class ReplicationConnection {
         let k = String.fromCharCode(b[off]!); off += 1
         if (k === 'K' || k === 'O') { oldKind = k === 'K' ? 'key' : 'full'; old = tuple(r).row; k = String.fromCharCode(b[off]!); off += 1 }
         const t = tuple(r) // k === 'N'
-        return { kind: 'update', schema: r.info.schema, table: r.info.table, new: t.row, old, oldKind, unchanged: t.unchanged }
+        const base = { kind: 'update' as const, schema: r.info.schema, table: r.info.table, new: t.row, unchanged: t.unchanged }
+        return old ? { ...base, old, oldKind: oldKind as 'key' | 'full' } : { ...base, old: null, oldKind: null }
       }
       case 'D': { const r = rel(b.readInt32BE(off)); off += 4; const k = String.fromCharCode(b[off]!); off += 1; return { kind: 'delete', schema: r.info.schema, table: r.info.table, old: tuple(r).row, oldKind: k === 'K' ? 'key' : 'full' } }
       case 'T': {
@@ -456,5 +519,6 @@ export class ReplicationConnection {
     this.ended = true
     try { this.socket?.write(W.terminate()) } catch { /* */ }
     try { this.socket?.end() } catch { /* */ }
+    const w = this.wake; this.wake = null; w?.() // wake a parked next() so an in-flight start() iterator finishes NOW
   }
 }

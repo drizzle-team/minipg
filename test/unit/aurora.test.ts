@@ -169,3 +169,21 @@ describe('missing config', () => {
   })
 })
 function createSync(c: AuroraConfig) { return new (require('../../src/aurora.ts').AuroraClient)(c) }
+
+describe('transaction-control SQL guard', () => {
+  const stub = (async () => { throw new Error('reached-fetch') }) as unknown as typeof fetch
+
+  test('query()/batch() reject textual tx-control; savepoint & rollback-to pass (threaded-tx legit)', async () => {
+    const db = await connect(CFG(stub))
+    for (const sql of ['begin', 'COMMIT', 'rollback', 'end', 'abort', 'start transaction']) {
+      const err = await db.query(sql).then(() => null, (e: unknown) => e as Error)
+      expect(err?.message).toMatch(/bypasses the Data API's transaction threading/)
+    }
+    for (const sql of ['savepoint sp1', 'rollback to savepoint sp1', 'select 1', 'select commitfee from t']) {
+      const err = await db.query(sql).then(() => null, (e: unknown) => e as Error)
+      expect(err?.message).toBe('reached-fetch') // passed the guard
+    }
+    const berr = await db.batch('commit', [[]]).then(() => null, (e: unknown) => e as Error)
+    expect(berr?.message).toMatch(/bypasses the Data API's transaction threading/)
+  })
+})
