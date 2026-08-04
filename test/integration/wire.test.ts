@@ -9,11 +9,11 @@ import { Parser, parseRowDescription, parseDataRow } from '../../src/protocol.ts
 import { TEST_CONFIG, testConnect, caught, TEST_TIMEOUT } from '../helpers/db.ts'
 
 const K = `wire_${process.pid}`
-const tags = (frames: Uint8Array[]) => frames.map((f) => String.fromCharCode(f[0]!))
-// reassemble the frames and run them through the SAME parser a socket client uses
+// reassemble the runs and parse them with the SAME parser a socket client uses
 function reparse(frames: Uint8Array[]): { type: string; body: Buffer }[] {
   return new Parser().push(Buffer.concat(frames.map((f) => Buffer.from(f))))
 }
+const tags = (frames: Uint8Array[]) => reparse(frames).map((m) => m.type) // entries are RUNS — tag list comes from reparsing
 
 describe("mode:'wire'", () => {
   test('select: [T, D…, C]; reparsed values match mode:object exactly', async () => {
@@ -64,7 +64,8 @@ describe("mode:'wire'", () => {
       expect(tags(again)).toEqual(['D', 'C']) // no T on reuse — the proxy replays its cached T frame
       // text pinned: the reused D payload is byte-identical to the first execution's (int8+date are
       // reuseBinaryOids types — array/object modes WOULD have flipped them to binary here)
-      expect(Buffer.from(again[0]!).equals(Buffer.from(first[1]!))).toBe(true)
+      const dOf = (fr: Uint8Array[]) => Buffer.from(reparse(fr).find((m) => m.type === 'D')!.body)
+      expect(dOf(again).equals(dOf(first))).toBe(true)
     } finally { c.end() }
   }, TEST_TIMEOUT)
 
@@ -152,3 +153,13 @@ describe("mode:'wire'", () => {
     } finally { c.end() }
   }, TEST_TIMEOUT)
 })
+
+test("span coalescing: entry count is independent of row count ('nothing per message, nothing per row')", async () => {
+  const c = await testConnect()
+  try {
+    const frames = await c.query(`select g, 'pad-' || g as p from generate_series(1, 1000) g`, [], { mode: 'wire' })
+    const msgs = reparse(frames)
+    expect(msgs.filter((m) => m.type === 'D').length).toBe(1000)   // one thousand rows…
+    expect(frames.length).toBeLessThan(10)                          // …a handful of contiguous runs (chunk-bounded, never row-bounded)
+  } finally { c.end() }
+}, TEST_TIMEOUT)

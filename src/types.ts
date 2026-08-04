@@ -5,10 +5,11 @@ import type { ShapeSpec, ParamType } from './spec.ts'
 import type { ShapeMapper } from './shape.ts'
 
 /** Row-shape of a query result. */
-/** 'wire' returns the statement's raw backend frames (Uint8Array[]) — the answer to "what did this
+/** 'wire' returns the statement's raw backend messages (Uint8Array[]) — the answer to "what did this
  *  statement return": {T,D,C,E,I} with framing intact, protocol acks (1/2/3/t), the nondeterministic
- *  'n', and connection-level events (Z/S/N/A/K) excluded. Resolves even when the statement FAILED
- *  (the E frame is in the array); only connection-level failures reject. */
+ *  'n', and connection-level events (Z/S/N/A/K) excluded. Entries are CONTIGUOUS RUNS of messages
+ *  (concatenate for the stream) — entry count scales with socket chunks, never with rows. Resolves
+ *  even when the statement FAILED (the E frame is in the array); only connection-level failures reject. */
 export type ResultMode = 'array' | 'object' | 'buffer' | 'raw' | 'wire'
 
 /** Decodes the raw text-format bytes of a single field into a JS value. */

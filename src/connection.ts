@@ -198,7 +198,10 @@ interface Task {
   _rttDone?: boolean // guard so a query contributes at most one RTT sample (its first response byte)
   fields?: Field[]
   mapper?: RowMapper
-  wire?: Buffer[] // mode:'wire' — collected {T,D,C,E,I} frame views (statement-scoped result, undigested)
+  wire?: Buffer[] // mode:'wire' — CONTIGUOUS RUNS of {T,D,C,E,I} frames (concatenation = the statement's stream)
+  _wireBuf?: ArrayBufferLike // open span's underlying buffer; adjacent kept-frames extend [_wireStart,_wireEnd) allocation-free
+  _wireStart?: number
+  _wireEnd?: number
   raw?: RawParams // rawParams() — pre-encoded Bind formats+values, written verbatim (no encode, no binary plan)
   command?: string | null
   rowCount?: number | null
@@ -516,10 +519,18 @@ export class Connection {
   private handle(type: string, body: Buffer): void {
     const wire = this.current?.wire
     if (wire !== undefined && (type === 'T' || type === 'D' || type === 'C' || type === 'E' || type === 'I')) {
-      // Collect the FRAMED view (tag + int32 len + payload). The header is contiguous with `body` in
-      // the parser's buffer (body always sits >= 5 bytes into its ArrayBuffer), so rebuild the frame
-      // as a view — no copy, no Parser change, zero cost for every other mode.
-      wire.push(Buffer.from(body.buffer, body.byteOffset - 5, body.length + 5))
+      // SPAN-COALESCED collection: the frame (tag + int32 len + payload) is contiguous with `body`
+      // in the parser's buffer, so a kept-frame that starts exactly where the open span ends just
+      // extends it — ZERO allocation per message. A view materializes only when the run breaks (an
+      // excluded frame in between, a new socket chunk) or at settle: entries scale with chunks, not
+      // rows ("nothing per message, nothing per row").
+      const t = this.current!
+      const start = body.byteOffset - 5, end = body.byteOffset + body.length
+      if (t._wireBuf === body.buffer && t._wireStart !== undefined && start === t._wireEnd) t._wireEnd = end
+      else {
+        if (t._wireBuf !== undefined) wire.push(Buffer.from(t._wireBuf, t._wireStart!, t._wireEnd! - t._wireStart!))
+        t._wireBuf = body.buffer; t._wireStart = start; t._wireEnd = end
+      }
     }
     switch (type) {
       case 'R': return this.auth(body)
@@ -948,7 +959,10 @@ export class Connection {
     if (!t.settled) { // a timed-out/aborted task was already settled by the caller
       // wire: a backend ErrorResponse is DATA (the E frame is in the array) — resolve. Anything that is
       // NOT a PgError has no frame on the wire (client-side failure) and falls through to the reject.
-      if (t.wire && (!t.error || t.error instanceof PgError)) { this.fireEnd(t, t.error); t.resolve?.(t.wire as never) }
+      if (t.wire && (!t.error || t.error instanceof PgError)) {
+        if (t._wireBuf !== undefined) { t.wire.push(Buffer.from(t._wireBuf, t._wireStart!, t._wireEnd! - t._wireStart!)); t._wireBuf = undefined } // close the open span
+        this.fireEnd(t, t.error); t.resolve?.(t.wire as never)
+      }
       else if (t.error) { if (t.debug) (t.error as PgError & { debug?: QueryDebug }).debug = this.buildDebug(t); this.fireEnd(t, t.error); this.rejectTask(t, t.error) }
       else if (t.stream) { this.fireEnd(t); t.streamEnd?.({ command: t.command, rowCount: t.rowCount }) }
       else {
@@ -1029,12 +1043,13 @@ export class Connection {
   // generic over the shape's column names so editors autocomplete each value to the known type list.
   query<K extends string>(sql: string, params: unknown[], opts: { shape: ShapeOf<K> | ShapeEntries | ShapeMapper; mode?: 'object'; name?: string; metrics?: boolean | 'ms' | 'us'; debug?: boolean; timeout?: number; signal?: AbortSignal }): Promise<QueryResult<Record<string, unknown>>>
   query(sql: string, params?: unknown[] | RawParams, opts?: { name?: string; snapshot?: string; params?: readonly ParamType[]; mode?: 'array'; metrics?: boolean | 'ms' | 'us'; debug?: boolean; timeout?: number; signal?: AbortSignal; trace?: boolean; shape?: ShapeSpec | ShapeMapper; binary?: boolean }): Promise<QueryResult<unknown[]>>
-  query(sql: string, params: unknown[], opts: { name?: string; snapshot?: string; params?: readonly ParamType[]; mode: 'object'; metrics?: boolean | 'ms' | 'us'; debug?: boolean; timeout?: number; signal?: AbortSignal; trace?: boolean; shape?: ShapeSpec | ShapeMapper; binary?: boolean }): Promise<QueryResult<Record<string, unknown>>>
-  // 'wire': the statement's raw backend frames ({T,D,C,E,I}, framing intact). RESOLVES even when the
-  // statement failed — the E frame is data; only connection-level failures reject.
+  query(sql: string, params: unknown[] | RawParams, opts: { name?: string; snapshot?: string; params?: readonly ParamType[]; mode: 'object'; metrics?: boolean | 'ms' | 'us'; debug?: boolean; timeout?: number; signal?: AbortSignal; trace?: boolean; shape?: ShapeSpec | ShapeMapper; binary?: boolean }): Promise<QueryResult<Record<string, unknown>>>
+  // 'wire': the statement's raw backend messages ({T,D,C,E,I}, framing intact) as CONTIGUOUS RUNS —
+  // concatenate the entries to get the byte stream; entry count scales with socket chunks, not rows.
+  // RESOLVES even when the statement failed (the E frame is data); only connection-level failures reject.
   query(sql: string, params: unknown[] | RawParams, opts: { name?: string; params?: readonly ParamType[]; mode: 'wire'; metrics?: boolean | 'ms' | 'us'; timeout?: number; signal?: AbortSignal; trace?: boolean }): Promise<Uint8Array[]>
-  query(sql: string, params: unknown[], opts: { name?: string; snapshot?: string; params?: readonly ParamType[]; mode: 'buffer'; metrics?: boolean | 'ms' | 'us'; debug?: boolean; timeout?: number; signal?: AbortSignal; trace?: boolean; binary?: boolean }): Promise<QueryResult<(Buffer | null)[]>>
-  query(sql: string, params: unknown[], opts: { name?: string; snapshot?: string; params?: readonly ParamType[]; mode: 'raw'; metrics?: boolean | 'ms' | 'us'; debug?: boolean; timeout?: number; signal?: AbortSignal; trace?: boolean; binary?: boolean }): Promise<QueryResult<Buffer>>
+  query(sql: string, params: unknown[] | RawParams, opts: { name?: string; snapshot?: string; params?: readonly ParamType[]; mode: 'buffer'; metrics?: boolean | 'ms' | 'us'; debug?: boolean; timeout?: number; signal?: AbortSignal; trace?: boolean; binary?: boolean }): Promise<QueryResult<(Buffer | null)[]>>
+  query(sql: string, params: unknown[] | RawParams, opts: { name?: string; snapshot?: string; params?: readonly ParamType[]; mode: 'raw'; metrics?: boolean | 'ms' | 'us'; debug?: boolean; timeout?: number; signal?: AbortSignal; trace?: boolean; binary?: boolean }): Promise<QueryResult<Buffer>>
   // impl return is `any` ONLY to satisfy every overload (QueryResult<T> shapes + wire's Uint8Array[]);
   // all callers go through the typed overloads above.
   // eslint-disable-next-line @typescript-eslint/no-explicit-any

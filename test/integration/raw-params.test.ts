@@ -4,6 +4,7 @@
 // client encodes with the driver's own encoder and the bytes cross unchanged.
 import { test, expect, describe } from 'bun:test'
 import { rawParams } from '../../src/index.ts'
+import { Parser } from '../../src/protocol.ts'
 import { testConnect, caught, TEST_TIMEOUT } from '../helpers/db.ts'
 
 const t = (s: string) => Buffer.from(s, 'utf8')
@@ -37,8 +38,9 @@ describe('rawParams()', () => {
     const c = await testConnect()
     try {
       const frames = await c.query('select $1::text as v', rawParams({ values: [t('gateway-bytes')] }), { mode: 'wire' })
-      expect(frames.map((f) => String.fromCharCode(f[0]!))).toEqual(['T', 'D', 'C'])
-      expect(Buffer.concat(frames.map((f) => Buffer.from(f))).toString('latin1')).toContain('gateway-bytes')
+      const stream = Buffer.concat(frames.map((f) => Buffer.from(f)))
+      expect(new Parser().push(stream).map((m) => m.type)).toEqual(['T', 'D', 'C'])
+      expect(stream.toString('latin1')).toContain('gateway-bytes')
     } finally { c.end() }
   }, TEST_TIMEOUT)
 
