@@ -17,7 +17,7 @@ const msg = (type: string, payload: Buffer = Buffer.alloc(0)) =>
 export const W = {
   startup(params: Record<string, string | undefined>): Buffer {
     const parts: Buffer[] = [i32(PROTOCOL_VERSION)]
-    for (const [k, v] of Object.entries(params)) { if (v == null) continue; parts.push(cstr(k), cstr(v)) }
+    for (const [k, v] of Object.entries(params)) { if (v == null) continue; guardNul(v, `startup parameter ${k}`); parts.push(cstr(k), cstr(v)) }
     parts.push(Buffer.from([0]))
     const payload = Buffer.concat(parts)
     return Buffer.concat([i32(payload.length + 4), payload]) // startup has no type byte
@@ -180,6 +180,25 @@ export function writeBindWith(w: Writer, portal: string, statement: string, para
   for (let i = 0; i < params.length; i++) {
     const f = enc(w, params[i], i)
     if (f !== 0) w.patch16(fmtPos + i * 2, f)
+  }
+  if (Array.isArray(resultFormat)) { w.int16(resultFormat.length); for (const f of resultFormat) w.int16(f) }
+  else { w.int16(1); w.int16(resultFormat) }
+  w.end()
+}
+
+/** Bind with PRE-ENCODED parameters (rawParams()): format codes + value bytes written VERBATIM.
+ *  `formats` uses Bind's own convention — 0 entries = all text, 1 = one code for every parameter,
+ *  else one per parameter. No validation beyond length framing: the caller supplied the bytes and
+ *  owns their correctness, exactly as with mode:'wire' on the way back. */
+export function writeBindRaw(w: Writer, portal: string, statement: string, formats: readonly number[], values: readonly (Uint8Array | null)[], resultFormat: number | number[] = 0): void {
+  if (values.length > 65535) throw new Error(`too many bind parameters: ${values.length} (max 65535)`)
+  w.start('B'); w.cstr(portal); w.cstr(statement)
+  w.int16(formats.length)
+  for (const f of formats) w.int16(f)
+  w.int16(values.length)
+  for (const v of values) {
+    if (v == null) w.int32(-1)
+    else { w.int32(v.byteLength); w.bytes(Buffer.isBuffer(v) ? v : Buffer.from(v.buffer, v.byteOffset, v.byteLength)) }
   }
   if (Array.isArray(resultFormat)) { w.int16(resultFormat.length); for (const f of resultFormat) w.int16(f) }
   else { w.int16(1); w.int16(resultFormat) }

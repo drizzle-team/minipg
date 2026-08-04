@@ -36,7 +36,6 @@ describe('prepare behavior vs real PG (pg_prepared_statements)', () => {
   test('prepare:false ignores { name } — nothing prepared server-side', async () => {
     const c = await connect({ ...CFG, prepare: false }); open.push(c)
     await c.query('select 1 as x', [], { name: 'p_off' })                       // name ignored -> unnamed
-    await c.query(['select ', '::int4 as x'], [7])                              // chunks -> unnamed too
     const r = await c.query('select count(*)::int as n from pg_prepared_statements', [], { mode: 'object' })
     expect((r.rows[0] as { n: number }).n).toBe(0)                              // no named statements at all
   })

@@ -82,12 +82,6 @@ function encodeParam(v: unknown): unknown {
   return v // number | string | boolean
 }
 
-// builder chunks (tagged template / query builder) -> "$1"-parameterized SQL
-function joinChunks(chunks: readonly string[]): string {
-  let s = chunks[0] ?? ''
-  for (let i = 1; i < chunks.length; i++) s += '$' + i + chunks[i]
-  return s
-}
 
 const ISO_HEADER: Record<Isolation, string> = {
   serializable: 'Serializable', 'repeatable read': 'RepeatableRead', 'read committed': 'ReadCommitted', 'read uncommitted': 'ReadUncommitted',
@@ -281,14 +275,14 @@ export class NeonHttpClient {
   }
 
   /** Run one SQL statement over HTTP and return a QueryResult. `sql` may be a string or builder chunks. */
-  query(sql: string | readonly string[], params: unknown[], opts: { shape: ShapeSpec | ShapeMapper; mode?: 'object'; timeout?: number; signal?: AbortSignal }): Promise<QueryResult<Record<string, unknown>>>
-  query(sql: string | readonly string[], params?: unknown[], opts?: { mode?: 'array'; shape?: ShapeSpec | ShapeMapper; timeout?: number; signal?: AbortSignal }): Promise<QueryResult<unknown[]>>
-  query(sql: string | readonly string[], params: unknown[], opts: { mode: 'object'; shape?: ShapeSpec | ShapeMapper; timeout?: number; signal?: AbortSignal }): Promise<QueryResult<Record<string, unknown>>>
-  query(sql: string | readonly string[], params: unknown[], opts: { mode: 'buffer'; timeout?: number; signal?: AbortSignal }): Promise<QueryResult<(Buffer | null)[]>>
-  query(sql: string | readonly string[], params: unknown[], opts: { mode: 'raw'; timeout?: number; signal?: AbortSignal }): Promise<QueryResult<Buffer>>
-  async query(sql: string | readonly string[], params: unknown[] = [], opts: NeonHttpQueryOptions = {}): Promise<QueryResult<never>> {
+  query(sql: string, params: unknown[], opts: { shape: ShapeSpec | ShapeMapper; mode?: 'object'; timeout?: number; signal?: AbortSignal }): Promise<QueryResult<Record<string, unknown>>>
+  query(sql: string, params?: unknown[], opts?: { mode?: 'array'; shape?: ShapeSpec | ShapeMapper; timeout?: number; signal?: AbortSignal }): Promise<QueryResult<unknown[]>>
+  query(sql: string, params: unknown[], opts: { mode: 'object'; shape?: ShapeSpec | ShapeMapper; timeout?: number; signal?: AbortSignal }): Promise<QueryResult<Record<string, unknown>>>
+  query(sql: string, params: unknown[], opts: { mode: 'buffer'; timeout?: number; signal?: AbortSignal }): Promise<QueryResult<(Buffer | null)[]>>
+  query(sql: string, params: unknown[], opts: { mode: 'raw'; timeout?: number; signal?: AbortSignal }): Promise<QueryResult<Buffer>>
+  async query(sql: string, params: unknown[] = [], opts: NeonHttpQueryOptions = {}): Promise<QueryResult<never>> {
     const mode: ResultMode = opts.mode ?? (opts.shape ? 'object' : 'array')
-    const query = typeof sql === 'string' ? sql : joinChunks(sql)
+    const query = sql
     const tx = TX_SQL.exec(query)
     if (tx) throw new Error(`minipg/neon-http: "${tx[1]!.toUpperCase()}" does NOTHING over stateless HTTP — every query() runs in its OWN session, so hand-rolled BEGIN…COMMIT gives zero atomicity with no error; use transaction([...]) for an atomic batch, or minipg/neon-ws for interactive transactions`)
     const res = await this.post({ query, params: params.map(encodeParam) }, await this.headers(), this.signalFor(opts))

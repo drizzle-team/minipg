@@ -382,3 +382,27 @@ export function compileBindEncoder(name: string, oids: readonly number[], result
   return new Function('PREFIX', 'RESULTFMT', 'EXECSYNC', 'enc', 'C', 'PG_EPOCH_MS', 'MS_SAFE', 'I64_MIN', 'I64_MAX', 'NUL_MSG',
     `return (w, v) => { ${src} }\n//# sourceURL=${srcName}`)(PREFIX, RESULTFMT, EXECSYNC, encodeValueInto, C, PG_EPOCH_MS, MS_SAFE, I64_MIN, I64_MAX, NUL_MSG) as BindEncoder
 }
+
+// ---- rawParams(): pre-encoded Bind parameters (the request-side mirror of mode:'wire') --------
+/** Parameter bytes already in Bind form. The driver writes formats + values VERBATIM — it encodes
+ *  nothing, so bytes produced remotely (e.g. by another minipg's encodeValueInto) cross unchanged. */
+export interface RawParams {
+  readonly __rawParams: true
+  /** Bind format codes: [] = all text, one entry = applies to every parameter, else one per parameter. */
+  readonly formats: readonly number[]
+  /** The exact Bind value bytes; null = SQL NULL. */
+  readonly values: readonly (Uint8Array | null)[]
+}
+/** Wrap pre-encoded parameter bytes for query(sql, rawParams({...}), opts). Combine with
+ *  `params: ['text','int8']` to pin the OIDs in Parse, and mode:'wire' for a no-conversion
+ *  gateway path. Only the formats/values length relationship is validated — the caller owns
+ *  the bytes' correctness, exactly as with 'wire' on the way back. */
+export function rawParams(spec: { formats?: readonly number[]; values: readonly (Uint8Array | null)[] }): RawParams {
+  const f = spec.formats ?? []
+  if (f.length !== 0 && f.length !== 1 && f.length !== spec.values.length) {
+    throw new Error(`minipg: rawParams formats must have 0, 1, or values.length (${spec.values.length}) entries — got ${f.length}`)
+  }
+  return { __rawParams: true, formats: f, values: spec.values }
+}
+export const isRawParams = (x: unknown): x is RawParams =>
+  typeof x === 'object' && x !== null && (x as { __rawParams?: unknown }).__rawParams === true

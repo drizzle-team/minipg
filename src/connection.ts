@@ -1,9 +1,9 @@
 // A single PostgreSQL connection: transport (net/tls), auth, and the extended
 // query protocol. One query in flight at a time (queries queue). No LISTEN/NOTIFY.
 import type { Duplex } from 'node:stream'
-import { W, Writer, writeParse, writeDescribe, writeBindWith, writeExecute, writeClose, writeSync, writeQuery, Parser, parseRowDescription, parseDataRow, parseParameterDescription, type ParamsEncoder } from './protocol.ts'
+import { W, Writer, writeParse, writeDescribe, writeBindWith, writeBindRaw, writeExecute, writeClose, writeSync, writeQuery, Parser, parseRowDescription, parseDataRow, parseParameterDescription, type ParamsEncoder } from './protocol.ts'
 import { md5Password, scram, type Scram } from './auth.ts'
-import { encodeValueInto, compileParamPlan, compileBindEncoder, type BindEncoder, copyRowsBinary, copyRowsText, copyBinarySupported } from './encode.ts'
+import { encodeValueInto, compileParamPlan, compileBindEncoder, type BindEncoder, copyRowsBinary, copyRowsText, copyBinarySupported, isRawParams, type RawParams } from './encode.ts'
 import { buildDecoders, decoderFor } from './decode.ts'
 import { PgError, parseErrorFields } from './errors.ts'
 import type { ConnectConfig, Decoder, Field, QueryDebug, QueryOptions, QueryResult, ResultMode, StreamOptions, TxOptions } from './types.ts'
@@ -36,6 +36,8 @@ export interface NormalizedConfig {
   host: string; port: number; user: string; password: string; database: string
   ssl: Exclude<NonNullable<ConnectConfig['ssl']>, 'disable'> // 'disable' normalized to false
   applicationName: string; connectTimeout: number; decoders: Map<number, Decoder>
+  options?: string // startup-packet command-line options ('-c key=val …'); RESET ALL restores these
+  statementTimeout?: number; idleInTransactionSessionTimeout?: number // ms, sent as startup parameters
   prepare: boolean // false -> never use server-side named prepared statements (transaction-pooler safe)
   binaryParams: boolean // upgrade fast-type params to binary on prepared reuse (OIDs from ParameterDescription)
   pipelineDepth: number // max queries in flight on one connection at once (1 = gated / no pipelining)
@@ -196,6 +198,8 @@ interface Task {
   _rttDone?: boolean // guard so a query contributes at most one RTT sample (its first response byte)
   fields?: Field[]
   mapper?: RowMapper
+  wire?: Buffer[] // mode:'wire' — collected {T,D,C,E,I} frame views (statement-scoped result, undigested)
+  raw?: RawParams // rawParams() — pre-encoded Bind formats+values, written verbatim (no encode, no binary plan)
   command?: string | null
   rowCount?: number | null
   error?: Error
@@ -221,12 +225,6 @@ interface Task {
 function defaultUser(): string {
   // env-derived so the core needs no node:os (absent on workerd); Node/Bun always set one of these.
   return process.env.USER || process.env.USERNAME || process.env.LOGNAME || 'postgres'
-}
-// Join builder chunks into a $1/$2/… parameterized SQL string (V8 cons-strings make concat cheap).
-function buildChunkSql(chunks: readonly string[]): string {
-  let s = chunks[0] ?? ''
-  for (let i = 1; i < chunks.length; i++) s += '$' + i + chunks[i]
-  return s
 }
 function readCstrings(buf: Buffer): string[] {
   const out: string[] = []; let i = 0
@@ -328,9 +326,6 @@ export class Connection {
   private mapperCache = new Map<string, RowMapper>() // per-shape row mappers (standard + typed queries)
   private mapperFactory: RowMapperFactory            // interpreted or jit, chosen once from config.decode
   // query-builder fast path: a chunks array (tagged template / builder) has stable identity, so cache
-  // its joined SQL + an auto-assigned prepared-statement name keyed by the array. WeakMap => auto-GC.
-  private chunkCache = new WeakMap<readonly string[], { name: string; sql: string }>()
-  private chunkSeq = 0
   private scramState?: Scram
 
   private connecting = false
@@ -358,6 +353,11 @@ export class Connection {
       ssl: config.ssl && config.ssl !== 'disable' ? config.ssl : false, // 'disable'/falsy -> no TLS
       applicationName: config.applicationName || 'minipg',
       connectTimeout: config.connectTimeout ?? 30000,
+      // NUL-checked HERE so a bad value throws synchronously at connect() — the startup packet is
+      // written inside a socket callback, where a late guardNul throw can't reach the caller's promise.
+      options: ((o) => { if (o?.includes('\0')) throw new Error('minipg: startup parameter options contains NUL byte (0x00)'); return o })(config.options),
+      statementTimeout: config.statementTimeout,
+      idleInTransactionSessionTimeout: config.idleInTransactionSessionTimeout,
       prepare: config.prepare ?? !pooled, // explicit wins; else off behind a pooler
       binaryParams: config.binaryParams ?? true,
       // Pipelining: default on (auto-off behind a transaction pooler, where multiple in-flight implicit
@@ -488,7 +488,12 @@ export class Connection {
   private afterTransport(): void {
     const sock = this.socket!
     sock.on('data', (c: Buffer) => this.onData(c))
-    sock.write(W.startup({ user: this.cfg.user, database: this.cfg.database, application_name: this.cfg.applicationName, client_encoding: 'UTF8' }))
+    sock.write(W.startup({
+      user: this.cfg.user, database: this.cfg.database, application_name: this.cfg.applicationName, client_encoding: 'UTF8',
+      options: this.cfg.options, // '-c key=val …' — server-applied, so RESET ALL restores rather than wipes
+      statement_timeout: this.cfg.statementTimeout != null ? String(Math.floor(this.cfg.statementTimeout)) : undefined,
+      idle_in_transaction_session_timeout: this.cfg.idleInTransactionSessionTimeout != null ? String(Math.floor(this.cfg.idleInTransactionSessionTimeout)) : undefined,
+    }))
   }
 
   private onData(chunk: Buffer | Uint8Array): void {
@@ -509,6 +514,13 @@ export class Connection {
   }
 
   private handle(type: string, body: Buffer): void {
+    const wire = this.current?.wire
+    if (wire !== undefined && (type === 'T' || type === 'D' || type === 'C' || type === 'E' || type === 'I')) {
+      // Collect the FRAMED view (tag + int32 len + payload). The header is contiguous with `body` in
+      // the parser's buffer (body always sits >= 5 bytes into its ArrayBuffer), so rebuild the frame
+      // as a view — no copy, no Parser change, zero cost for every other mode.
+      wire.push(Buffer.from(body.buffer, body.byteOffset - 5, body.length + 5))
+    }
     switch (type) {
       case 'R': return this.auth(body)
       case 'S': { const z = body.indexOf(0); this.serverParams[body.toString('utf8', 0, z)] = body.toString('utf8', z + 1, body.indexOf(0, z + 1)); return }
@@ -525,10 +537,10 @@ export class Connection {
       }
       case 'W': { try { this.socket?.write(Buffer.concat([W.copyFail('CopyBoth is not supported by minipg'), W.sync()])) } catch { /* */ } return }
       case 't': if (this.current) this.current._paramOids = parseParameterDescription(body); return
-      case 'T': if (this.current) { this.current.fields = parseRowDescription(body); if (this.current._typed && this.current._shapeCols && !this.current.mapper) { try { this.assignMapper(this.current, mergeUnknownCols(this.current._shapeCols, this.current.fields)) } catch (e) { this.current.error = e as Error } } else if (!this.current._typed) { const bin = this.current.binary; try { const cols = this.current.fields.map((f) => (bin ? { name: f.name, oid: f.dataTypeOid, format: 'binary' as const } : { name: f.name, oid: f.dataTypeOid })); this.assignMapper(this.current, cols) } catch (e) { this.current.error = e as Error } /* e.g. { binary: true } on a type with no binary decoder */ } if (this.current._cacheName) this.cacheStatement(this.current) } return
+      case 'T': if (this.current) { this.current.fields = parseRowDescription(body); if (this.current.wire) { if (this.current._cacheName) this.cacheStatement(this.current); return } if (this.current._typed && this.current._shapeCols && !this.current.mapper) { try { this.assignMapper(this.current, mergeUnknownCols(this.current._shapeCols, this.current.fields)) } catch (e) { this.current.error = e as Error } } else if (!this.current._typed) { const bin = this.current.binary; try { const cols = this.current.fields.map((f) => (bin ? { name: f.name, oid: f.dataTypeOid, format: 'binary' as const } : { name: f.name, oid: f.dataTypeOid })); this.assignMapper(this.current, cols) } catch (e) { this.current.error = e as Error } /* e.g. { binary: true } on a type with no binary decoder */ } if (this.current._cacheName) this.cacheStatement(this.current) } return
       case 'n': if (this.current) { this.current.fields = []; if (this.current._cacheName) this.cacheStatement(this.current) } return
-      case 'D': return this.dataRow(body)
-      case 'C': if (this.current) { const tag = firstCstr(body); this.current.command = tag.split(' ')[0]; const m = tag.match(/(\d+)\s*$/); this.current.rowCount = m ? parseInt(m[1]!, 10) : null } return
+      case 'D': if (wire !== undefined) return; return this.dataRow(body) // wire: the frame IS the row — nothing to decode
+      case 'C': if (this.current && wire === undefined) { const tag = firstCstr(body); this.current.command = tag.split(' ')[0]; const m = tag.match(/(\d+)\s*$/); this.current.rowCount = m ? parseInt(m[1]!, 10) : null } return
       case 'E': { const err = new PgError(parseErrorFields(body)); if (this.connecting) return this.failAttempt(err); if (this.current) this.current.error = err; return }
       case 'N': return // NoticeResponse — ignored
       case 'A': return // NotificationResponse — ignored (no LISTEN/NOTIFY)
@@ -812,7 +824,7 @@ export class Connection {
       // statement's actual types, so a paramTypes drift across calls can never binary-misencode.
       let enc: ParamsEncoder = encodeValueInto
       let planOids: readonly number[] | undefined // set to the plan's OIDs when `enc` is a binary plan -> JIT-eligible
-      if (this.cfg.binaryParams) {
+      if (this.cfg.binaryParams && !t.raw) { // rawParams: the caller chose the formats — no plan, no upgrade
         if (reuse && entry!.paramOids) {
           if (entry!.plan === undefined) entry!.plan = compileParamPlan(entry!.paramOids)
           if (entry!.plan) { enc = entry!.plan; planOids = entry!.paramOids }
@@ -823,9 +835,12 @@ export class Connection {
         }
       }
       const rf = t.resultFormat ?? 0
-      const jitEnc = (this.jitEncode && planOids !== undefined && t.params.length === planOids.length) ? this.jitFor(enc, name, planOids, rf) : null
-      if (jitEnc) jitEnc(w, t.params) // whole Bind+Execute+Sync from the compiled encoder (one row body, looped for VALUES chunks)
-      else { writeBindWith(w, '', name, t.params, enc, rf); writeExecute(w, '', 0); writeSync(w) }
+      if (t.raw) { writeBindRaw(w, '', name, t.raw.formats, t.raw.values, rf); writeExecute(w, '', 0); writeSync(w) } // pre-encoded: verbatim into Bind
+      else {
+        const jitEnc = (this.jitEncode && planOids !== undefined && t.params.length === planOids.length) ? this.jitFor(enc, name, planOids, rf) : null
+        if (jitEnc) jitEnc(w, t.params) // whole Bind+Execute+Sync from the compiled encoder (one row body, looped for VALUES chunks)
+        else { writeBindWith(w, '', name, t.params, enc, rf); writeExecute(w, '', 0); writeSync(w) }
+      }
       if (parsedName) this.parseInflight.set(parsedName, parseKey(t))
       } // ---- end extended-protocol serialization ----
       if (t.perf) t.perf.sent = w.mark() - mark // bytes this query contributed to the batch
@@ -908,7 +923,10 @@ export class Connection {
         // NOT for _typed (shape/queryTyped): the caller-declared mapper isn't rebuilt from the fresh
         // RowDescription, so a schema change would silently decode with the stale plan — surface instead.
         // NOT inside a (now-aborted) transaction: the retry would only hit 25P02; surface the real 0A000.
-        if (!t.settled && !t.stream && !t._typed && !this.inTransaction && (t._retries ?? 0) < 1) {
+        // NOT for 'wire': errors are DATA there (the E frame resolves in-band); a transparent re-run would
+        // also reorder the response behind later pipeline entries. staleStatements above still self-heals
+        // the statement for its next execution.
+        if (!t.settled && !t.stream && !t._typed && !t.wire && !this.inTransaction && (t._retries ?? 0) < 1) {
           t._retries = (t._retries ?? 0) + 1
             ; (t._retryErrors ??= []).push(code)
           if (t.timer) clearTimeout(t.timer) // old timer cleared here; startTask re-arms a fresh one (else it leaks)
@@ -928,7 +946,10 @@ export class Connection {
     if (t.graceTimer) clearTimeout(t.graceTimer)
     t.signalCleanup?.()
     if (!t.settled) { // a timed-out/aborted task was already settled by the caller
-      if (t.error) { if (t.debug) (t.error as PgError & { debug?: QueryDebug }).debug = this.buildDebug(t); this.fireEnd(t, t.error); this.rejectTask(t, t.error) }
+      // wire: a backend ErrorResponse is DATA (the E frame is in the array) — resolve. Anything that is
+      // NOT a PgError has no frame on the wire (client-side failure) and falls through to the reject.
+      if (t.wire && (!t.error || t.error instanceof PgError)) { this.fireEnd(t, t.error); t.resolve?.(t.wire as never) }
+      else if (t.error) { if (t.debug) (t.error as PgError & { debug?: QueryDebug }).debug = this.buildDebug(t); this.fireEnd(t, t.error); this.rejectTask(t, t.error) }
       else if (t.stream) { this.fireEnd(t); t.streamEnd?.({ command: t.command, rowCount: t.rowCount }) }
       else {
         const m = this.fireEnd(t)
@@ -1006,12 +1027,18 @@ export class Connection {
   // ---- public query API ----
   // a shape (without an explicit non-object mode) decodes to objects — matches the runtime default.
   // generic over the shape's column names so editors autocomplete each value to the known type list.
-  query<K extends string>(sql: string | readonly string[], params: unknown[], opts: { shape: ShapeOf<K> | ShapeEntries | ShapeMapper; mode?: 'object'; name?: string; metrics?: boolean | 'ms' | 'us'; debug?: boolean; timeout?: number; signal?: AbortSignal }): Promise<QueryResult<Record<string, unknown>>>
-  query(sql: string | readonly string[], params?: unknown[], opts?: { name?: string; snapshot?: string; params?: readonly ParamType[]; mode?: 'array'; metrics?: boolean | 'ms' | 'us'; debug?: boolean; timeout?: number; signal?: AbortSignal; trace?: boolean; shape?: ShapeSpec | ShapeMapper; binary?: boolean }): Promise<QueryResult<unknown[]>>
-  query(sql: string | readonly string[], params: unknown[], opts: { name?: string; snapshot?: string; params?: readonly ParamType[]; mode: 'object'; metrics?: boolean | 'ms' | 'us'; debug?: boolean; timeout?: number; signal?: AbortSignal; trace?: boolean; shape?: ShapeSpec | ShapeMapper; binary?: boolean }): Promise<QueryResult<Record<string, unknown>>>
-  query(sql: string | readonly string[], params: unknown[], opts: { name?: string; snapshot?: string; params?: readonly ParamType[]; mode: 'buffer'; metrics?: boolean | 'ms' | 'us'; debug?: boolean; timeout?: number; signal?: AbortSignal; trace?: boolean; binary?: boolean }): Promise<QueryResult<(Buffer | null)[]>>
-  query(sql: string | readonly string[], params: unknown[], opts: { name?: string; snapshot?: string; params?: readonly ParamType[]; mode: 'raw'; metrics?: boolean | 'ms' | 'us'; debug?: boolean; timeout?: number; signal?: AbortSignal; trace?: boolean; binary?: boolean }): Promise<QueryResult<Buffer>>
-  query(sql: string | readonly string[], params: unknown[] = [], opts: QueryOptions = {}): Promise<QueryResult<never>> {
+  query<K extends string>(sql: string, params: unknown[], opts: { shape: ShapeOf<K> | ShapeEntries | ShapeMapper; mode?: 'object'; name?: string; metrics?: boolean | 'ms' | 'us'; debug?: boolean; timeout?: number; signal?: AbortSignal }): Promise<QueryResult<Record<string, unknown>>>
+  query(sql: string, params?: unknown[] | RawParams, opts?: { name?: string; snapshot?: string; params?: readonly ParamType[]; mode?: 'array'; metrics?: boolean | 'ms' | 'us'; debug?: boolean; timeout?: number; signal?: AbortSignal; trace?: boolean; shape?: ShapeSpec | ShapeMapper; binary?: boolean }): Promise<QueryResult<unknown[]>>
+  query(sql: string, params: unknown[], opts: { name?: string; snapshot?: string; params?: readonly ParamType[]; mode: 'object'; metrics?: boolean | 'ms' | 'us'; debug?: boolean; timeout?: number; signal?: AbortSignal; trace?: boolean; shape?: ShapeSpec | ShapeMapper; binary?: boolean }): Promise<QueryResult<Record<string, unknown>>>
+  // 'wire': the statement's raw backend frames ({T,D,C,E,I}, framing intact). RESOLVES even when the
+  // statement failed — the E frame is data; only connection-level failures reject.
+  query(sql: string, params: unknown[] | RawParams, opts: { name?: string; params?: readonly ParamType[]; mode: 'wire'; metrics?: boolean | 'ms' | 'us'; timeout?: number; signal?: AbortSignal; trace?: boolean }): Promise<Uint8Array[]>
+  query(sql: string, params: unknown[], opts: { name?: string; snapshot?: string; params?: readonly ParamType[]; mode: 'buffer'; metrics?: boolean | 'ms' | 'us'; debug?: boolean; timeout?: number; signal?: AbortSignal; trace?: boolean; binary?: boolean }): Promise<QueryResult<(Buffer | null)[]>>
+  query(sql: string, params: unknown[], opts: { name?: string; snapshot?: string; params?: readonly ParamType[]; mode: 'raw'; metrics?: boolean | 'ms' | 'us'; debug?: boolean; timeout?: number; signal?: AbortSignal; trace?: boolean; binary?: boolean }): Promise<QueryResult<Buffer>>
+  // impl return is `any` ONLY to satisfy every overload (QueryResult<T> shapes + wire's Uint8Array[]);
+  // all callers go through the typed overloads above.
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  query(sql: string, params: unknown[] | RawParams = [], opts: QueryOptions = {}): Promise<any> {
     // query(sql, opts) arg-shift for untyped callers: a non-array second argument whose keys are
     // all KNOWN options (and no third argument) is an options object, not a params mistake.
     if (params && !Array.isArray(params) && typeof params === 'object' && Object.keys(opts).length === 0) {
@@ -1027,7 +1054,7 @@ export class Connection {
       const parts = [
         this.query('begin isolation level repeatable read read only'),
         this.query(`set transaction snapshot '${snapshot.replace(/'/g, "''")}'`),
-        this.query(sql as string, params, rest as never) as Promise<QueryResult<never>>,
+        this.query(sql, params, rest as never) as Promise<QueryResult<never>>,
         this.query('commit'),
       ] as const
       return Promise.allSettled(parts).then((r) => {
@@ -1037,18 +1064,20 @@ export class Connection {
     }
     const p = new Promise<QueryResult<never>>((resolve, reject) => {
       if (this.state === 'closed') return reject(new Error('connection is closed'))
-      let text: string, name = opts.name
-      if (typeof sql === 'string') { text = sql } else {
-        // builder chunks: resolve (joined SQL + auto prepared-statement name) by array identity
-        let e = this.chunkCache.get(sql)
-        if (!e) { e = { name: '_c' + (this.chunkSeq++), sql: buildChunkSql(sql) }; this.chunkCache.set(sql, e) }
-        text = e.sql; name = e.name
-      }
+      if (typeof sql !== 'string') return reject(new TypeError('minipg: sql must be a string — the builder-chunks array form was removed; join your fragments into one $1/$2-parameterized string'))
+      const text = sql
+      let name = opts.name
       if (!this.cfg.prepare) name = undefined // pooler-safe: never a server-side named prepared statement
       const mode = opts.mode ?? (opts.shape ? 'object' : 'array') // a shape implies named columns -> object
-      if (opts.params && params.length !== opts.params.length) return reject(new Error(`minipg: ${params.length} param value(s) but ${opts.params.length} type(s) declared in params:[…] — they must match one-to-one`))
-      const task: Task = { sql: text, params, name, mode, rows: [], resolve, reject, timeout: opts.timeout, signal: opts.signal, debug: opts.debug, paramTypes: opts.params && resolveParamTypes(opts.params) }
-      if (opts.shape) {
+      let raw: RawParams | undefined
+      if (isRawParams(params)) { raw = params; params = [] } // pre-encoded Bind bytes: nothing to encode
+      const nParams = raw ? raw.values.length : (params as unknown[]).length
+      if (opts.params && nParams !== opts.params.length) return reject(new Error(`minipg: ${nParams} param value(s) but ${opts.params.length} type(s) declared in params:[…] — they must match one-to-one`))
+      const task: Task = { sql: text, params: params as unknown[], raw, name, mode, rows: [], resolve, reject, timeout: opts.timeout, signal: opts.signal, debug: opts.debug, paramTypes: opts.params && resolveParamTypes(opts.params) }
+      if (mode === 'wire') {
+        if (opts.shape || opts.binary) return reject(new Error("minipg: mode:'wire' returns undecoded backend frames — shape/binary decode options don't apply (and binary would make the frames lie about their format)"))
+        task.wire = [] // frames collect in handle(); resultFormat stays TEXT — remote clients decode by the T frame, which always claims text
+      } else if (opts.shape) {
         // declared column shape: decode with the SAME cached jit/interpreted mapper as any query, and
         // request binary wire format for any column marked format:'binary'. (mode is array|object here.)
         const cols = this.resolveCols(typeof opts.shape === 'function' ? (opts.shape.$cols as CodegenCol[]) : shapeCols(opts.shape))

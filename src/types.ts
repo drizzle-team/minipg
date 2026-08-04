@@ -5,7 +5,11 @@ import type { ShapeSpec, ParamType } from './spec.ts'
 import type { ShapeMapper } from './shape.ts'
 
 /** Row-shape of a query result. */
-export type ResultMode = 'array' | 'object' | 'buffer' | 'raw'
+/** 'wire' returns the statement's raw backend frames (Uint8Array[]) — the answer to "what did this
+ *  statement return": {T,D,C,E,I} with framing intact, protocol acks (1/2/3/t), the nondeterministic
+ *  'n', and connection-level events (Z/S/N/A/K) excluded. Resolves even when the statement FAILED
+ *  (the E frame is in the array); only connection-level failures reject. */
+export type ResultMode = 'array' | 'object' | 'buffer' | 'raw' | 'wire'
 
 /** Decodes the raw text-format bytes of a single field into a JS value. */
 export type Decoder = (buf: Buffer) => unknown
@@ -73,6 +77,14 @@ export interface ConnectConfig {
   ssl?: boolean | 'require' | 'verify-ca' | 'verify-full' | 'disable' | tls.ConnectionOptions
   applicationName?: string
   connectTimeout?: number
+  /** Command-line options sent IN THE STARTUP PACKET (e.g. '-c search_path=app -c lock_timeout=2s'),
+   *  like node-postgres' `options`. Server-applied at connection time, so `RESET ALL` RESTORES these
+   *  values instead of wiping them — the fail-safe property session-level set_config lacks. */
+  options?: string
+  /** Per-session statement_timeout in ms, sent as a startup parameter (survives RESET ALL). */
+  statementTimeout?: number
+  /** Per-session idle_in_transaction_session_timeout in ms, sent as a startup parameter. */
+  idleInTransactionSessionTimeout?: number
   /** Connect via a unix-domain socket at this path (e.g. /tmp/.s.PGSQL.5432) instead of
    *  host/port TCP — lower latency / higher throughput on the same machine; SSL is skipped. */
   path?: string

@@ -60,18 +60,12 @@ describe('absence of the sql`` template tag & other DSL surfaces', () => {
     }
   })
 
-  test('a strings-array first arg is the explicit builder-chunks API, not a hidden template tag', async () => {
+  test('a strings-array first arg is REJECTED loudly (builder-chunks form removed)', async () => {
     const c = await testConnect()
     try {
-      // chunks API: (chunks[], valuesArray) interleaves $1/$2…; the SAME array reused auto-prepares.
-      const chunks = ['select ', '::int4 as x']
-      expect(((await c.query(chunks, [1])).rows[0] as unknown[])[0]).toBe(1)
-      expect(((await c.query(chunks, [2])).rows[0] as unknown[])[0]).toBe(2)
-      // but it is NOT a tagged template: used as a tag the values arrive SPREAD (not an array),
-      // so it errors rather than silently interpolating; the connection stays usable.
-      const asTag = c.query as unknown as (...a: unknown[]) => Promise<unknown>
-      const err = await caught(() => asTag(['select ', '::int4 as x'], 1))
-      expect(err).toBeInstanceOf(Error)
+      const asArr = c as unknown as { query: (...a: unknown[]) => Promise<unknown> }
+      const err = await caught(() => asArr.query(['select ', '::int4 as x'], [1]))
+      expect((err as Error).message).toMatch(/sql must be a string — the builder-chunks array form was removed/)
       const ok = await c.query('select 1::int4 as x')
       expect((ok.rows[0] as unknown[])[0]).toBe(1)
     } finally {

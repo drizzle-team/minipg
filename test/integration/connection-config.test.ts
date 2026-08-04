@@ -406,3 +406,33 @@ describe('{ trace }: async wrapper surfaces the caller in the error stack', () =
     } finally { await c.end() }
   })
 })
+
+describe('startup parameters: options + per-session timeouts (R4)', () => {
+  const show = async (c: Connection, guc: string) => ((await c.query(`show ${guc}`, [], { mode: 'object' })).rows[0] as Record<string, string>)[guc]
+
+  test('options / statementTimeout / idleInTransactionSessionTimeout reach the startup packet; RESET ALL restores them', async () => {
+    const c = await connect({ ...TEST_CONFIG, options: '-c search_path=r4test', statementTimeout: 4500, idleInTransactionSessionTimeout: 6000 })
+    try {
+      expect(await show(c, 'search_path')).toBe('r4test')
+      expect(await show(c, 'statement_timeout')).toBe('4500ms')
+      expect(await show(c, 'idle_in_transaction_session_timeout')).toBe('6s')
+      // the fail-safe property: RESET ALL returns to STARTUP-PACKET values, not server defaults
+      await c.query('set statement_timeout = 0')
+      await c.query('reset all')
+      expect(await show(c, 'statement_timeout')).toBe('4500ms')
+      expect(await show(c, 'search_path')).toBe('r4test')
+    } finally { c.end() }
+  })
+
+  test('?options= in a connection string round-trips (percent-encoded)', async () => {
+    const { host, port, user, password, database } = TEST_CONFIG as { host: string; port: number; user: string; password: string; database: string }
+    const url = `postgres://${user}:${password}@${host}:${port}/${database}?options=${encodeURIComponent('-c search_path=r4url')}`
+    const c = await connect(url)
+    try { expect(await show(c, 'search_path')).toBe('r4url') } finally { c.end() }
+  })
+
+  test('a NUL byte in a startup parameter throws before any bytes reach the wire', async () => {
+    const err = await caught(() => connect({ ...TEST_CONFIG, options: '-c search_path=a\0b' }))
+    expect((err as Error).message).toMatch(/startup parameter options contains NUL/)
+  })
+})

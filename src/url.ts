@@ -45,6 +45,7 @@ export function parseConnectionString(url: string): Partial<ConnectConfig> {
   if (db) out.database = decodePart(db, 'database', url)
   const appName = q.get('application_name'); if (appName) out.applicationName = appName
   const ct = q.get('connect_timeout'); if (ct) out.connectTimeout = Number(ct) * 1000 // libpq: seconds -> ms
+  const options = q.get('options'); if (options) out.options = options // '-c key=val …' startup options (URLSearchParams already percent-decoded)
   const sslmode = q.get('sslmode') ?? q.get('ssl')
   if (sslmode) {
     if (sslmode === 'disable') out.ssl = false

@@ -410,14 +410,14 @@ export class PoolQuery implements PromiseLike<QueryResult<never>> {
   execute(): Promise<QueryResult<never>> {
     return (this.promise ??= (async () => {
       const conn = await this.pool.acquire()
-      try { return await (conn.query as Runner)(this.sql, this.params, this.opts) }
+      try { return await (conn.query as unknown as Runner)(this.sql, this.params, this.opts) }
       finally { this.pool.release(conn) }
     })())
   }
 
   /** Run on an ALREADY checked-out connection (pool.batch uses this to pipeline a set on one connection). */
   runOn(conn: Connection): Promise<QueryResult<never>> {
-    return (this.promise ??= (conn.query as Runner)(this.sql, this.params, this.opts))
+    return (this.promise ??= (conn.query as unknown as Runner)(this.sql, this.params, this.opts))
   }
 
   // PromiseLike surface: awaiting (or .then/.catch/.finally) forces execution via the standalone path.
