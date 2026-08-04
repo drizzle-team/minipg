@@ -20,6 +20,7 @@ import { parseDataRow } from './protocol.ts'
 import { PgError } from './errors.ts'
 import { defaultDecoders } from './decode.ts'
 import { resolveUrl } from './url.ts'
+import { encodeJsonParam as encodeParam } from './encode.ts'
 import type { Decoder, ResultMode, QueryResult } from './types.ts'
 
 type JsonBigints = 'number' | 'string' | 'bigint'
@@ -71,16 +72,6 @@ export interface NeonTxQuery {
   shape?: ShapeSpec | ShapeMapper
 }
 
-// ---- param encoding: JS value -> JSON param (mirrors the wire encodeParam, but JSON-shaped) ----
-function encodeParam(v: unknown): unknown {
-  if (v == null) return null
-  if (Buffer.isBuffer(v)) return '\\x' + v.toString('hex') // bytea as hex text
-  if (v instanceof Date) return v.toISOString()
-  if (typeof v === 'bigint') return v.toString()
-  if (typeof v === 'object') return JSON.stringify(v) // arrays + objects sent as JSON text (matches wire driver)
-  if (typeof v === 'string' && v.indexOf('\0') !== -1) throw new Error('parameter contains NUL byte (0x00), which PostgreSQL text values cannot represent')
-  return v // number | string | boolean
-}
 
 
 const ISO_HEADER: Record<Isolation, string> = {

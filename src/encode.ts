@@ -173,7 +173,8 @@ function arrayEnc(elemOid: number): BinEnc {
 export const copyBinarySupported = (oids: readonly number[]): boolean =>
   oids.every((o) => [16, 21, 23, 20, 701, 25, 1043, 1114, 1184].includes(o))
 
-const COPY_SIG = Buffer.from([0x50, 0x47, 0x43, 0x4f, 0x50, 0x59, 0x0a, 0xff, 0x0d, 0x0a, 0x00]) // "PGCOPY\n\xff\r\n\0"
+let _copySig: Buffer | undefined // lazy: module-eval Buffer.from would break Buffer-less runtimes before the polyfill installs
+const COPY_SIG = (): Buffer => (_copySig ??= Buffer.from([0x50, 0x47, 0x43, 0x4f, 0x50, 0x59, 0x0a, 0xff, 0x0d, 0x0a, 0x00])) // "PGCOPY\n\xff\r\n\0"
 type CopyRow = readonly unknown[] | Readonly<Record<string, unknown>>
 const cell = (row: CopyRow, names: readonly string[], c: number): unknown =>
   Array.isArray(row) ? row[c] : (row as Record<string, unknown>)[names[c]!]
@@ -183,7 +184,7 @@ const cell = (row: CopyRow, names: readonly string[], c: number): unknown =>
 export function* copyRowsBinary(oids: readonly number[], names: readonly string[], rows: readonly CopyRow[], chunkBytes = 1 << 18): Generator<Buffer> {
   const encs = oids.map(elemEncoderFor)
   const w = new Writer(chunkBytes + 4096)
-  w.bytes(COPY_SIG); w.int32(0); w.int32(0) // flags, header-extension length
+  w.bytes(COPY_SIG()); w.int32(0); w.int32(0) // flags, header-extension length
   for (let r = 0; r < rows.length; r++) {
     const row = rows[r]!
     w.int16(oids.length)
@@ -406,3 +407,16 @@ export function rawParams(spec: { formats?: readonly number[]; values: readonly 
 }
 export const isRawParams = (x: unknown): x is RawParams =>
   typeof x === 'object' && x !== null && (x as { __rawParams?: unknown }).__rawParams === true
+
+/** JS value -> JSON-transportable text parameter (the HTTP protocols' request encoding — mirrors the
+ *  wire driver's semantics: bytea as \x hex, Date ISO, BigInt decimal string, objects/arrays as JSON
+ *  text). Shared by minipg/neon-http and minipg/http. */
+export function encodeJsonParam(v: unknown): unknown {
+  if (v == null) return null
+  if (v instanceof Uint8Array) return '\\x' + (Buffer.isBuffer(v) ? v : Buffer.from(v.buffer, v.byteOffset, v.byteLength)).toString('hex') // bytea as hex text
+  if (v instanceof Date) return v.toISOString()
+  if (typeof v === 'bigint') return v.toString()
+  if (typeof v === 'object') return JSON.stringify(v) // arrays + objects sent as JSON text (matches wire driver)
+  if (typeof v === 'string' && v.indexOf('\0') !== -1) throw new Error('parameter contains NUL byte (0x00), which PostgreSQL text values cannot represent')
+  return v // number | string | boolean
+}

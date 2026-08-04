@@ -219,8 +219,8 @@ const byteaAt: AtDecoder = (b, o, l) => { const s = b.toString('utf8', o, o + l)
 const DEBUG = !!process.env.MINIPG_CODEGEN_DEBUG
 
 // utf8: the general slice (unicode-safe). latin1: faster, ONLY valid for ASCII-guaranteed bytes.
-const HAS_UTF8_SLICE = typeof (Buffer.prototype as { utf8Slice?: unknown }).utf8Slice === 'function'
-const HAS_LATIN1_SLICE = typeof (Buffer.prototype as { latin1Slice?: unknown }).latin1Slice === 'function'
+const HAS_UTF8_SLICE = typeof Buffer !== 'undefined' && typeof (Buffer.prototype as { utf8Slice?: unknown }).utf8Slice === 'function'
+const HAS_LATIN1_SLICE = typeof Buffer !== 'undefined' && typeof (Buffer.prototype as { latin1Slice?: unknown }).latin1Slice === 'function'
 const str = (from: string, to: string) => (HAS_UTF8_SLICE ? `b.utf8Slice(${from}, ${to})` : `b.toString('utf8', ${from}, ${to})`)
 const lat = (from: string, to: string) => (HAS_LATIN1_SLICE ? `b.latin1Slice(${from}, ${to})` : `b.toString('latin1', ${from}, ${to})`)
 
@@ -588,8 +588,8 @@ export function compileResultSet(cols: CodegenCol[], mode: 'array' | 'object', m
 export type CellDecoder = (b: Buffer, o: number, l: number) => unknown
 
 type Sliceable = Buffer & { utf8Slice(s: number, e: number): string; latin1Slice(s: number, e: number): string }
-const HAS_UTF8 = typeof (Buffer.prototype as Partial<Sliceable>).utf8Slice === 'function'
-const HAS_LAT1 = typeof (Buffer.prototype as Partial<Sliceable>).latin1Slice === 'function'
+const HAS_UTF8 = typeof Buffer !== 'undefined' && typeof (Buffer.prototype as Partial<Sliceable>).utf8Slice === 'function'
+const HAS_LAT1 = typeof Buffer !== 'undefined' && typeof (Buffer.prototype as Partial<Sliceable>).latin1Slice === 'function'
 const utf8 = HAS_UTF8 ? (b: Buffer, o: number, l: number) => (b as Sliceable).utf8Slice(o, o + l) : (b: Buffer, o: number, l: number) => b.toString('utf8', o, o + l)
 const lat1 = HAS_LAT1 ? (b: Buffer, o: number, l: number) => (b as Sliceable).latin1Slice(o, o + l) : (b: Buffer, o: number, l: number) => b.toString('latin1', o, o + l)
 

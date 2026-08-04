@@ -343,8 +343,8 @@ export const JSON_RUNTIME = '  let jb, jp, je; // shaped-JSON cursor: buffer, po
 // so a snippet can be spliced many times into one function body without redeclaration.
 // Buffer.utf8Slice/latin1Slice are the internal fast slicers (faster than toString); fall back where absent.
 type Slicer = { utf8Slice(s: number, e: number): string; latin1Slice(s: number, e: number): string }
-const HAS_U8 = typeof (Buffer.prototype as Partial<Slicer>).utf8Slice === 'function'
-const HAS_L1 = typeof (Buffer.prototype as Partial<Slicer>).latin1Slice === 'function'
+const HAS_U8 = typeof Buffer !== 'undefined' && typeof (Buffer.prototype as Partial<Slicer>).utf8Slice === 'function'
+const HAS_L1 = typeof Buffer !== 'undefined' && typeof (Buffer.prototype as Partial<Slicer>).latin1Slice === 'function'
 const U8 = (s: string, e: string) => (HAS_U8 ? `jb.utf8Slice(${s}, ${e})` : `jb.toString('utf8', ${s}, ${e})`)
 const L1 = (s: string, e: string) => (HAS_L1 ? `jb.latin1Slice(${s}, ${e})` : `jb.toString('latin1', ${s}, ${e})`) // numbers/tokens are ASCII
 const SKIPWS = 'while (jp < je) { const _w = jb[jp]; if (_w === 32 || _w === 9 || _w === 10 || _w === 13) jp++; else break }'

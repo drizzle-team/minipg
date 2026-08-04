@@ -69,8 +69,8 @@ export function defineType<K extends string = never, R extends string = never>(
 
 // the one unavoidable slice, encoding chosen by the def's ascii hint
 type Sliceable = Buffer & { utf8Slice(s: number, e: number): string; latin1Slice(s: number, e: number): string }
-const HAS_U8 = typeof (Buffer.prototype as Partial<Sliceable>).utf8Slice === 'function'
-const HAS_L1 = typeof (Buffer.prototype as Partial<Sliceable>).latin1Slice === 'function'
+const HAS_U8 = typeof Buffer !== 'undefined' && typeof (Buffer.prototype as Partial<Sliceable>).utf8Slice === 'function'
+const HAS_L1 = typeof Buffer !== 'undefined' && typeof (Buffer.prototype as Partial<Sliceable>).latin1Slice === 'function'
 const sliceUtf8 = HAS_U8 ? (b: Buffer, o: number, l: number) => (b as Sliceable).utf8Slice(o, o + l) : (b: Buffer, o: number, l: number) => b.toString('utf8', o, o + l)
 const sliceLat1 = HAS_L1 ? (b: Buffer, o: number, l: number) => (b as Sliceable).latin1Slice(o, o + l) : (b: Buffer, o: number, l: number) => b.toString('latin1', o, o + l)
 

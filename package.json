@@ -1,6 +1,6 @@
 {
   "name": "minipg",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "A minimal, dependency-free PostgreSQL driver for Node, Bun, Deno, and Cloudflare Workers.",
   "type": "module",
   "license": "MIT",
@@ -52,6 +52,10 @@
       "types": "./dist/neon-http.d.ts",
       "import": "./dist/neon-http.js"
     },
+    "./http": {
+      "types": "./dist/http.d.ts",
+      "import": "./dist/http.js"
+    },
     "./geometry": {
       "types": "./dist/geometry.d.ts",
       "import": "./dist/geometry.js"
@@ -63,6 +67,10 @@
     "./telemetry": {
       "types": "./dist/telemetry.d.ts",
       "import": "./dist/telemetry.js"
+    },
+    "./buffer-polyfill": {
+      "types": "./dist/buffer-polyfill.d.ts",
+      "import": "./dist/buffer-polyfill.js"
     }
   },
   "files": [
