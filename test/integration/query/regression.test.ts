@@ -80,10 +80,10 @@ describe('pool', () => {
 })
 
 describe('out-of-scope COPY does not hang', () => {
-  test('COPY TO STDOUT resolves; COPY FROM STDIN rejects (CopyFail, no hang)', async () => {
+  test('COPY TO STDOUT rejects loudly (use copyTo); COPY FROM STDIN rejects (CopyFail); neither hangs', async () => {
     const c = await testConnect()
-    const to = await c.query('copy (select 1) to stdout')
-    expect(Array.isArray(to.rows)).toBe(true)
+    const to = await caught(() => c.query('copy (select 1) to stdout'))
+    expect((to as Error).message).toMatch(/use copyTo\(\)/) // was: resolved while silently discarding the payload
     await c.query('create temp table cpy(i int)')
     const err = await caught(() => c.query('copy cpy from stdin'))
     expect(err).toBeInstanceOf(PgError)

@@ -2,11 +2,11 @@
 // query protocol. One query in flight at a time (queries queue). No LISTEN/NOTIFY.
 import type { Duplex } from 'node:stream'
 import { W, Writer, writeParse, writeDescribe, writeBindWith, writeBindRaw, writeExecute, writeClose, writeSync, writeQuery, Parser, parseRowDescription, parseDataRow, parseParameterDescription, type ParamsEncoder } from './protocol.ts'
-import { md5Password, scram, type Scram } from './auth.ts'
+import { md5Password, scramForChannel, peerCertDer, type Scram } from './auth.ts'
 import { encodeValueInto, compileParamPlan, compileBindEncoder, type BindEncoder, copyRowsBinary, copyRowsText, copyBinarySupported, isRawParams, type RawParams } from './encode.ts'
 import { buildDecoders, decoderFor } from './decode.ts'
 import { PgError, parseErrorFields } from './errors.ts'
-import type { ConnectConfig, Decoder, Field, QueryDebug, QueryOptions, QueryResult, ResultMode, StreamOptions, TxOptions } from './types.ts'
+import type { ConnectConfig, Decoder, Field, MinipgSocket, QueryDebug, QueryOptions, QueryResult, ResultMode, StreamOptions, TxOptions } from './types.ts'
 import { INSTANT_OIDS, BINARY_FAST, type CodegenCol } from './decode.ts'
 import { buildMapperFactory, isEvalAvailable, type RowMapper, type RowMapperFactory } from './mapper.ts'
 import { resolveUrl } from './url.ts'
@@ -38,6 +38,7 @@ export interface NormalizedConfig {
   applicationName: string; connectTimeout: number; decoders: Map<number, Decoder>
   options?: string // startup-packet command-line options ('-c key=val …'); RESET ALL restores these
   statementTimeout?: number; idleInTransactionSessionTimeout?: number // ms, sent as startup parameters
+  channelBinding?: 'disable' | 'prefer' | 'require' // SCRAM channel-binding stance ('prefer' default)
   prepare: boolean // false -> never use server-side named prepared statements (transaction-pooler safe)
   binaryParams: boolean // upgrade fast-type params to binary on prepared reuse (OIDs from ParameterDescription)
   pipelineDepth: number // max queries in flight on one connection at once (1 = gated / no pipelining)
@@ -45,7 +46,7 @@ export interface NormalizedConfig {
   temporal: 'date' | 'string' // default decode for date/timestamp(tz) columns without an explicit target
   reuseBinaryOids: Set<number> // BINARY_FAST minus config.types overrides: cols to upgrade to binary on prepared-statement reuse
   reconnect: { enabled: boolean; base: number; max: number; maxRetries: number | null }
-  socket?: () => Duplex | Promise<Duplex>
+  socket?: () => MinipgSocket | Promise<MinipgSocket> // structural (node Duplex satisfies it); internals treat it as Duplex, guarding optional methods
   path?: string
   plugins: Plugin[]
 }
@@ -219,6 +220,8 @@ interface Task {
   settled?: boolean // caller already resolved/rejected (by timeout/abort) — don't settle again
   signalCleanup?: () => void
   onRow?: (row: unknown) => void
+  copyOut?: boolean // copyTo(): COPY … TO STDOUT — simple 'Q', solo-gated via stream, payload via onCopyData
+  onCopyData?: (chunk: Buffer) => void // per-'d' CopyData payload (a parser view — relayed, never decoded)
   streamEnd?: (summary: { command?: string | null; rowCount?: number | null }) => void
   streamError?: (e: Error) => void
   resolve?: (r: QueryResult<never>) => void
@@ -343,6 +346,10 @@ export class Connection {
 
   constructor(config: ConnectConfig = {}) {
     config = resolveUrl(config) // fold a `url` connection string into defaults (explicit fields still win)
+    if (config.channelBinding === 'require') { // satisfiable ONLY on the node TLS transport — fail the impossible combos at construction
+      if (!config.ssl || config.ssl === 'disable') throw new Error('minipg: channel_binding=require needs TLS — the binding is a property of the TLS channel; enable ssl or use channel_binding=prefer')
+      if (config.socket) throw new Error('minipg: channel_binding=require — a custom socket transport cannot expose the server certificate (node TLS only); use channel_binding=prefer')
+    }
     const user = config.user || process.env.PGUSER || defaultUser()
     const host = config.host || process.env.PGHOST || 'localhost'
     const port = config.port || Number(process.env.PGPORT) || 5432
@@ -361,6 +368,7 @@ export class Connection {
       options: ((o) => { if (o?.includes('\0')) throw new Error('minipg: startup parameter options contains NUL byte (0x00)'); return o })(config.options),
       statementTimeout: config.statementTimeout,
       idleInTransactionSessionTimeout: config.idleInTransactionSessionTimeout,
+      channelBinding: config.channelBinding,
       prepare: config.prepare ?? !pooled, // explicit wins; else off behind a pooler
       binaryParams: config.binaryParams ?? true,
       // Pipelining: default on (auto-off behind a transaction pooler, where multiple in-flight implicit
@@ -470,7 +478,8 @@ export class Connection {
       const ac = new AbortController(); this.connectAbort = ac // failAttempt() aborts -> transport destroys its pending socket
       const factory = this.cfg.socket ?? (defaultTransport ? () => defaultTransport!(this.cfg, ac.signal) : null)
       if (!factory) return this.failAttempt(Object.assign(new Error('no transport: import from minipg/node (net/tls) or pass config.socket'), { fatal: true }))
-      Promise.resolve(factory()).then((sock) => {
+      Promise.resolve(factory()).then((s) => {
+        const sock = s as unknown as Duplex // structural MinipgSocket -> internal Duplex view (optional methods guarded at use)
         if (!this.connecting) { try { sock.destroy() } catch { /* superseded/aborted while connecting */ } return }
         this.socket = sock
         this.writeBackedUp = false // fresh socket: clear any stale write-backpressure gate from a prior connection
@@ -547,6 +556,13 @@ export class Connection {
         return
       }
       case 'W': { try { this.socket?.write(Buffer.concat([W.copyFail('CopyBoth is not supported by minipg'), W.sync()])) } catch { /* */ } return }
+      case 'H': { // CopyOutResponse: copyTo() relays the payload; a plain query would silently DISCARD it
+        const t = this.current
+        if (t && !t.copyOut && !t.error) t.error = new Error('minipg: this statement is COPY … TO STDOUT — use copyTo() (a plain query() cannot return the copy payload and would silently discard it)')
+        return
+      }
+      case 'd': { const t = this.current; if (t?.onCopyData && !t.cancelled && !t.error && !t.settled) t.onCopyData(body); return } // CopyData: raw relay
+      case 'c': return // server CopyDone — CommandComplete ('COPY n') + ReadyForQuery follow
       case 't': if (this.current) this.current._paramOids = parseParameterDescription(body); return
       case 'T': if (this.current) { this.current.fields = parseRowDescription(body); if (this.current.wire) { if (this.current._cacheName) this.cacheStatement(this.current); return } if (this.current._typed && this.current._shapeCols && !this.current.mapper) { try { this.assignMapper(this.current, mergeUnknownCols(this.current._shapeCols, this.current.fields)) } catch (e) { this.current.error = e as Error } } else if (!this.current._typed) { const bin = this.current.binary; try { const cols = this.current.fields.map((f) => (bin ? { name: f.name, oid: f.dataTypeOid, format: 'binary' as const } : { name: f.name, oid: f.dataTypeOid })); this.assignMapper(this.current, cols) } catch (e) { this.current.error = e as Error } /* e.g. { binary: true } on a type with no binary decoder */ } if (this.current._cacheName) this.cacheStatement(this.current) } return
       case 'n': if (this.current) { this.current.fields = []; if (this.current._cacheName) this.cacheStatement(this.current) } return
@@ -573,10 +589,11 @@ export class Connection {
       case 0: this.pong(); return // AuthenticationOk — records the md5/cleartext password leg (SCRAM already recorded at 12)
       case 3: this.markPing(); sock.write(W.password(this.cfg.password)); return // cleartext
       case 5: this.markPing(); sock.write(W.password(md5Password(this.cfg.user, this.cfg.password, body.subarray(4, 8)))); return // md5
-      case 10: { // SASL
+      case 10: { // SASL: bind to the TLS channel when the transport exposes the cert AND the server offers -PLUS
         const mechs = readCstrings(body.subarray(4))
         if (!mechs.includes('SCRAM-SHA-256')) return this.failAttempt(Object.assign(new Error('unsupported SASL mechanisms: ' + mechs.join(', ')), { fatal: true }))
-        this.scramState = scram(this.cfg.password)
+        try { this.scramState = scramForChannel(this.cfg.password, mechs, this.cfg.channelBinding ?? 'prefer', peerCertDer(this.socket)) }
+        catch (e) { return this.failAttempt(Object.assign(e as Error, { fatal: true })) }
         this.markPing(); sock.write(W.saslInitial(this.scramState.mechanism, this.scramState.clientFirst)); return
       }
       case 11: this.pong(); this.markPing(); sock.write(W.saslResponse(this.scramState!.continue(body.subarray(4).toString('utf8')))); return // SASLContinue: record client-first→server-first, send client-final
@@ -781,7 +798,7 @@ export class Connection {
     const mark = w.mark()
     let parsedName: string | undefined // this task wrote a NAMED Parse (recorded in parseInflight only once the whole task serialized)
     try {
-      if (t.copySource) { writeQuery(w, t.sql) } // COPY: simple 'Q' (cleanest copy state machine); the 'G' handler pumps the source
+      if (t.copySource || t.copyOut) { writeQuery(w, t.sql) } // COPY: simple 'Q' (cleanest copy state machine); 'G' pumps the source, 'd' feeds copyTo
       else { // ---- everything below is the extended-protocol serialization ----
       if (!Array.isArray(t.params)) throw new TypeError('minipg: params must be an array — pass options as the THIRD argument: query(sql, [], opts)')
       const name = t.name ?? ''
@@ -1492,6 +1509,66 @@ export class Connection {
       },
       return(): Promise<IteratorResult<Row>> { t.cancelled = true; if (paused) { paused = false; try { self.socket?.resume() } catch { /* */ } } return Promise.resolve({ value: undefined, done: true }) },
     }
+  }
+
+  /** COPY … TO STDOUT as a RAW byte relay — the sending half of a direct copy pipe:
+   *
+   *      await target.copyFrom('copy t from stdin (format binary)',
+   *                            source.copyTo('copy t to stdout (format binary)'))
+   *
+   *  Chunks are opaque bytes with NO row/boundary alignment guarantee (copyFrom is equally
+   *  boundary-agnostic); nothing is decoded, so memory stays bounded regardless of table size.
+   *  Buffered bytes above `highWaterMark` (default 512KB) pause the socket where the transport
+   *  supports pause/resume (node does); `result` resolves with the final 'COPY n' tag. Runs SOLO
+   *  on the connection like copyFrom — pool users should check a connection out. break/return()
+   *  DETACHES: remaining frames are dropped as they arrive (no buffering) while the server finishes
+   *  the copy and the connection survives; timeout/signal do a HARD cancel instead (CancelRequest
+   *  where the transport registers one, else the grace-timer teardown). COPY accepts no $n params —
+   *  any dynamic values must be inlined with care. */
+  copyTo(sql: string, opts: { timeout?: number; signal?: AbortSignal; highWaterMark?: number } = {}): AsyncIterableIterator<Uint8Array> & { result: Promise<{ command: string | null; rowCount: number | null }> } {
+    const self = this
+    let chunks: Buffer[] = []
+    let buffered = 0
+    let waiting: { resolve: (r: IteratorResult<Uint8Array>) => void; reject: (e: Error) => void } | null = null
+    let done = false, err: Error | null = null, paused = false
+    const HWM = opts.highWaterMark ?? 512 * 1024 // BYTES buffered before pausing the socket
+    let resolveResult!: (v: { command: string | null; rowCount: number | null }) => void, rejectResult!: (e: Error) => void
+    const result = new Promise<{ command: string | null; rowCount: number | null }>((res, rej) => { resolveResult = res; rejectResult = rej })
+    result.catch(() => { /* branch, not a swallow: errors also surface via the iterator — this stops the mirror becoming an unhandled rejection */ })
+    const resume = (): void => { if (paused) { paused = false; try { (self.socket as unknown as { resume?: () => void } | null)?.resume?.() } catch { /* */ } } }
+    // every next() drains ALL buffered frames as one coalesced yield — text COPY sends one 'd' PER ROW,
+    // so a yield-per-frame iterator would pay an await per row
+    const drain = (): Uint8Array => { const v = chunks.length === 1 ? chunks[0]! : Buffer.concat(chunks); chunks = []; buffered = 0; resume(); return v }
+    const t: Task = {
+      sql, params: [], mode: 'array', rows: [], stream: true, copyOut: true, timeout: opts.timeout, signal: opts.signal,
+      onCopyData(chunk) {
+        if (waiting) { const w = waiting; waiting = null; w.resolve({ value: chunk, done: false }); return } // direct handoff — no buffering, no copy
+        chunks.push(chunk); buffered += chunk.length
+        if (buffered > HWM && !paused && self.socket) { paused = true; try { (self.socket as unknown as { pause?: () => void }).pause?.() } catch { /* */ } }
+      },
+      streamEnd(s) {
+        done = true; resolveResult({ command: s.command ?? null, rowCount: s.rowCount ?? null })
+        if (waiting) { const w = waiting; waiting = null; w.resolve({ value: undefined as never, done: true }) } // waiting implies no buffered chunks
+      },
+      streamError(e) { err = e; rejectResult(e); if (waiting) { const w = waiting; waiting = null; w.reject(e) } },
+    }
+    if (this.state === 'closed') { err = new Error('connection is closed'); rejectResult(err) }
+    else if (!this.armSignal(t)) { this.queue.push(t); this.processQueue() }
+    const it = {
+      [Symbol.asyncIterator]() { return it },
+      next(): Promise<IteratorResult<Uint8Array>> {
+        if (chunks.length) return Promise.resolve({ value: drain(), done: false })
+        if (err) return Promise.reject(err)
+        if (done) return Promise.resolve({ value: undefined as never, done: true })
+        return new Promise<IteratorResult<Uint8Array>>((resolve, reject) => { waiting = { resolve, reject } })
+      },
+      return(): Promise<IteratorResult<Uint8Array>> {
+        t.cancelled = true; chunks = []; buffered = 0; resume(); done = true // detach: later 'd' frames are dropped in handle()
+        return Promise.resolve({ value: undefined as never, done: true })
+      },
+      result,
+    }
+    return it
   }
 
   async end(): Promise<void> {

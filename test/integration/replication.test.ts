@@ -549,3 +549,70 @@ describe('replication()', () => {
 
 // keep the import used even if helpers change
 void connect
+
+  test('config.options reaches the replication startup packet (wal_sender_timeout lever)', async () => {
+    const repl = await replication({ ...TEST_CONFIG, options: '-c wal_sender_timeout=54321' })
+    try {
+      const r = await repl.command('show wal_sender_timeout')
+      expect(r.rows[0]![0]).toBe('54321ms') // server-applied at startup; RESET ALL would restore it
+    } finally { repl.end() }
+  }, TEST_TIMEOUT)
+
+  test('onReady fires when START_REPLICATION is accepted, before any event', async () => {
+    await withConn(async (c) => {
+      await c.query(`create table ${K}_r2(id int4 primary key)`)
+      await c.query(`create publication ${K}_r2pub for table ${K}_r2`)
+      try {
+        const repl = await replication(TEST_CONFIG)
+        try {
+          const slot = await repl.createSlot(`${K}_r2slot`, { temporary: true })
+          await c.query(`insert into ${K}_r2 values (1)`)
+          const order: string[] = []
+          const events = await collectUntil(
+            repl.start({ slot: slot.slot, publications: [`${K}_r2pub`], onReady: () => order.push('ready') }),
+            (es) => { if (es.length === 1) order.push('first-event'); return es.some((e) => e.kind === 'commit') })
+          expect(order).toEqual(['ready', 'first-event']) // established BEFORE anything yields
+          expect(events.length).toBeGreaterThan(0)
+        } finally { repl.end() }
+      } finally {
+        await c.query(`drop publication ${K}_r2pub`)
+        await c.query(`drop table ${K}_r2`)
+      }
+    })
+  }, TEST_TIMEOUT)
+
+  test('TOAST fill: with REPLICA IDENTITY FULL, unchanged columns are filled into new (and still listed)', async () => {
+    await withConn(async (c) => {
+      await c.query(`create table ${K}_t2(id int4 primary key, fat text, n int4)`)
+      await c.query(`alter table ${K}_t2 replica identity full`)
+      await c.query(`create publication ${K}_t2pub for table ${K}_t2`)
+      try {
+        const repl = await replication(TEST_CONFIG)
+        try {
+          const slot = await repl.createSlot(`${K}_t2slot`, { temporary: true })
+          // incompressible-enough payload so it TOASTs out-of-line (>2KB post-compression)
+          await c.query(`insert into ${K}_t2 select 1, string_agg(md5(random()::text), ''), 0 from generate_series(1, 2000)`)
+          await c.query(`update ${K}_t2 set n = 7 where id = 1`) // fat untouched -> pgoutput omits it ('u')
+          const events = await collectUntil(
+            repl.start({ slot: slot.slot, publications: [`${K}_t2pub`] }),
+            (es) => es.filter((e) => e.kind === 'commit').length >= 2)
+          const upd = events.find((e) => e.kind === 'update') as Extract<ReplicationEvent, { kind: 'update' }>
+          expect(upd.oldKind).toBe('full')
+          expect(upd.unchanged).toEqual(['fat'])                       // still listed: filled ≠ retransmitted
+          expect(typeof upd.new.fat).toBe('string')                    // FILLED from the old tuple
+          expect((upd.new.fat as string).length).toBe(64000)           // the whole 2000×32-char value
+          expect(upd.new.fat).toBe(upd.old!.fat)                       // lossless by definition of "unchanged"
+          expect(upd.new.n).toBe(7)
+        } finally { repl.end() }
+      } finally {
+        await c.query(`drop publication ${K}_t2pub`)
+        await c.query(`drop table ${K}_t2`)
+      }
+    })
+  }, TEST_TIMEOUT)
+
+  test('channel_binding=require throws loudly on replication connections too', async () => {
+    const { host, port, user, password, database } = TEST_CONFIG as { host: string; port: number; user: string; password: string; database: string }
+    const url = `postgres://${user}:${password}@${host}:${port}/${database}?channel_binding=require`
+    await expect(replication(url)).rejects.toThrow(/channel_binding=require needs TLS/)
+  }, TEST_TIMEOUT)

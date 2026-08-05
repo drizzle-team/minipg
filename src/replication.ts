@@ -11,7 +11,7 @@
 //   for await (const e of repl.start({ slot: slot.slot, publications: ['pub'] })) { … repl.ack(e.endLsn) }
 import type { Duplex } from 'node:stream'
 import { W, Parser, parseRowDescription, parseDataRow, type RawMessage } from './protocol.ts'
-import { md5Password, scram, type Scram } from './auth.ts'
+import { md5Password, scramForChannel, parseSaslMechanisms, peerCertDer, type Scram } from './auth.ts'
 import { PgError, parseErrorFields } from './errors.ts'
 import { getDefaultTransport, type NormalizedConfig } from './connection.ts'
 import { resolveUrl } from './url.ts'
@@ -53,6 +53,9 @@ export type ReplicationEvent =
   | { kind: 'insert'; schema: string; table: string; new: Row }
   // update's old tuple is discriminated on oldKind: 'key'/'full' ALWAYS carries a Row (REPLICA
   // IDENTITY key columns / full old row), null means no old tuple was on the wire (IDENTITY DEFAULT).
+  // `unchanged`: unmodified TOASTed columns pgoutput did not resend. With REPLICA IDENTITY FULL the
+  // driver fills them into `new` from the old tuple (and still lists them here); otherwise they are
+  // ABSENT from `new` — not null (null would collide with SQL NULL) — and genuinely unrecoverable.
   | ({ kind: 'update'; schema: string; table: string; new: Row; unchanged: string[] }
       & ({ oldKind: 'key' | 'full'; old: Row } | { oldKind: null; old: null }))
   | { kind: 'delete'; schema: string; table: string; old: Row; oldKind: 'key' | 'full' }
@@ -61,7 +64,7 @@ export type ReplicationEvent =
   | { kind: 'relation'; relation: ReplicationRelation } // schema (re-)announced — fires again on DDL changes
 
 export type ReplicationConfig = Pick<ConnectConfig,
-  'url' | 'host' | 'port' | 'user' | 'password' | 'database' | 'ssl' | 'path' | 'socket' | 'applicationName' | 'connectTimeout' | 'types' | 'jsonBigints'>
+  'url' | 'host' | 'port' | 'user' | 'password' | 'database' | 'ssl' | 'path' | 'socket' | 'applicationName' | 'connectTimeout' | 'types' | 'jsonBigints' | 'options' | 'channelBinding'>
 
 /** One table's declared decode shape for `start({ shapes })`. An ARRAY of these (not a keyed
  *  object) so schema/table names containing dots or quotes never need escaping. */
@@ -87,7 +90,9 @@ export interface StartOptions {
   /** Per-table decode shapes, matched by (schema, table) when the relation is announced.
    *  Declared columns decode exactly like the same spec in a query() shape, and — like a
    *  query() shape — the row is keyed by the SHAPE keys (`columns` maps a key to its SQL
-   *  column when they differ; `unchanged` uses the same keys). Undeclared columns and
+   *  column when they differ; `unchanged` uses the same keys — those columns were NOT resent
+   *  (unmodified TOAST): absent from `new` unless REPLICA IDENTITY FULL let the driver fill
+   *  them from `old`). Undeclared columns and
    *  unlisted tables keep the default catalog decoding (int8 -> BigInt, temporal -> Date)
    *  under their SQL names. 'unknown' defers a column to its live relation oid. NEVER
    *  silent: a declared column the live relation doesn't have, two keys mapping to one
@@ -117,6 +122,11 @@ export interface StartOptions {
   /** Abort = the consumer's own stop: the iterator finishes CLEANLY (no throw) and the
    *  connection closes — same as calling end() while parked in next(). */
   signal?: AbortSignal
+  /** Called ONCE when the server accepts START_REPLICATION (CopyBothResponse) — the moment the slot
+   *  shows active in pg_stat_activity. start() is lazy (nothing runs before the first next()), so
+   *  this is the observable "streaming established" hook; a slot-already-active PgError fires before
+   *  it, and a throw from the callback fails the stream's current next(). */
+  onReady?: () => void
 }
 
 /** The SERVER ended the replication stream (CopyDone): clean primary shutdown, failover, or a
@@ -161,6 +171,10 @@ export class ReplicationConnection {
 
   constructor(config: ReplicationConfig = {}) {
     const rc = resolveUrl(config)
+    if (rc.channelBinding === 'require') { // satisfiable ONLY on the node TLS transport
+      if (!rc.ssl || rc.ssl === 'disable') throw new Error('minipg: channel_binding=require needs TLS — the binding is a property of the TLS channel; enable ssl or use channel_binding=prefer')
+      if (rc.socket) throw new Error('minipg: channel_binding=require — a custom socket transport cannot expose the server certificate (node TLS only); use channel_binding=prefer')
+    }
     const user = rc.user || process.env.PGUSER || process.env.USER || process.env.USERNAME || 'postgres'
     this.decoders = buildDecoders(rc.types, rc.jsonBigints)
     this.cfg = {
@@ -172,6 +186,10 @@ export class ReplicationConnection {
       ssl: rc.ssl && rc.ssl !== 'disable' ? rc.ssl : false,
       applicationName: rc.applicationName || 'minipg-replication',
       connectTimeout: rc.connectTimeout ?? 30000,
+      // startup-packet GUCs — e.g. '-c wal_sender_timeout=10s' bounds a stranded walsender when the
+      // consumer dies without end() (serverless eviction); NUL-checked here so it throws at construction
+      options: ((o) => { if (o?.includes('\0')) throw new Error('minipg: startup parameter options contains NUL byte (0x00)'); return o })(rc.options),
+      channelBinding: rc.channelBinding,
       path: rc.path,
       socket: rc.socket,
       // unused by the transport, present to satisfy NormalizedConfig:
@@ -190,12 +208,12 @@ export class ReplicationConnection {
     const ac = new AbortController()
     const timer = setTimeout(() => { ac.abort(); this.fail(new Error(`replication connect timed out after ${this.cfg.connectTimeout}ms`)) }, this.cfg.connectTimeout)
     try {
-      this.socket = this.cfg.socket ? await this.cfg.socket() : await transport!(this.cfg, ac.signal)
+      this.socket = this.cfg.socket ? (await this.cfg.socket()) as unknown as Duplex : await transport!(this.cfg, ac.signal)
       this.socket.on('data', (d: Buffer) => this.onData(d))
       this.socket.on('error', (e: Error) => this.fail(e))
       this.socket.on('close', () => { if (!this.ended) this.fail(this.err ?? new Error('replication connection closed unexpectedly')) })
       // THE one special startup parameter: replication=database selects the logical walsender
-      this.socket.write(W.startup({ user: this.cfg.user, database: this.cfg.database, application_name: this.cfg.applicationName, replication: 'database' }))
+      this.socket.write(W.startup({ user: this.cfg.user, database: this.cfg.database, application_name: this.cfg.applicationName, replication: 'database', options: this.cfg.options }))
       for (;;) {
         const m = await this.next()
         if (!m) throw new Error('minipg: replication connection ended during startup')
@@ -213,7 +231,10 @@ export class ReplicationConnection {
       case 0: return
       case 3: sock.write(W.password(this.cfg.password)); return
       case 5: sock.write(W.password(md5Password(this.cfg.user, this.cfg.password, body.subarray(4, 8)))); return
-      case 10: { this.scramState = scram(this.cfg.password); sock.write(W.saslInitial(this.scramState.mechanism, this.scramState.clientFirst)); return }
+      case 10: { // SASL: channel-bind when the TLS transport exposes the cert and the server offers -PLUS
+        this.scramState = scramForChannel(this.cfg.password, parseSaslMechanisms(body), this.cfg.channelBinding ?? 'prefer', peerCertDer(this.socket))
+        sock.write(W.saslInitial(this.scramState.mechanism, this.scramState.clientFirst)); return
+      }
       case 11: sock.write(W.saslResponse(this.scramState!.continue(body.subarray(4).toString('utf8')))); return
       case 12: this.scramState!.final(body.subarray(4).toString('utf8')); return
       default: throw new Error('unsupported authentication request: ' + code)
@@ -354,6 +375,10 @@ export class ReplicationConnection {
       if (m.type === 'W') break
       if (m.type === 'E') throw new PgError(parseErrorFields(m.body))
     }
+    // START_REPLICATION accepted (CopyBothResponse): the slot is active server-side NOW. This is the
+    // "streaming established" moment start()'s laziness otherwise hides — a slot-conflict PgError above
+    // fires BEFORE this, and a throw from the callback fails this next() like any stream error.
+    opts.onReady?.()
     const idleAck = opts.idleAck !== false
     const status = setInterval(() => this.sendStatus(), opts.statusIntervalMs ?? 10_000)
     try {
@@ -453,6 +478,11 @@ export class ReplicationConnection {
         let k = String.fromCharCode(b[off]!); off += 1
         if (k === 'K' || k === 'O') { oldKind = k === 'K' ? 'key' : 'full'; old = tuple(r).row; k = String.fromCharCode(b[off]!); off += 1 }
         const t = tuple(r) // k === 'N'
+        // TOAST fill: an unmodified TOASTed value is omitted from the new tuple ('u'), but with
+        // REPLICA IDENTITY FULL the very same value is in the old tuple — copy it over (lossless by
+        // definition of "unchanged"). `unchanged` KEEPS listing the filled columns, so consumers can
+        // still tell retransmitted from filled.
+        if (old && oldKind === 'full') for (const name of t.unchanged) if (name in old) t.row[name] = old[name]
         const base = { kind: 'update' as const, schema: r.info.schema, table: r.info.table, new: t.row, unchanged: t.unchanged }
         return old ? { ...base, old, oldKind: oldKind as 'key' | 'full' } : { ...base, old: null, oldKind: null }
       }

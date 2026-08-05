@@ -30,6 +30,11 @@ export function tlsOptions(ssl: TlsSsl, host: string): tls.ConnectionOptions {
  *  On `signal` abort (connect deadline / failed attempt) it destroys the socket so a stalled handshake
  *  can't leak an open connection (the caller can't reach it — it isn't assigned until this resolves). */
 export function nodeTransport(cfg: NormalizedConfig, signal: AbortSignal): Promise<Duplex> {
+  // Bundlers can smuggle this module onto workerd via unenv stubs of node:net/node:tls that fail in
+  // confusing ways at connect time — replace that with the answer the user actually needs.
+  if (typeof navigator !== 'undefined' && navigator.userAgent === 'Cloudflare-Workers') {
+    return Promise.reject(new Error("minipg: the node TCP transport cannot run on Cloudflare Workers — import from 'minipg/cf' (cloudflare:sockets) instead of the root entry"))
+  }
   return new Promise<Duplex>((resolve, reject) => {
     const sock = cfg.path ? net.connect({ path: cfg.path }) : net.connect({ host: cfg.host, port: cfg.port })
     let tlsSock: tls.TLSSocket | undefined

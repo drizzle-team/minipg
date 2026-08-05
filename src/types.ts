@@ -1,5 +1,24 @@
 import type * as tls from 'node:tls'
-import type { Duplex } from 'node:stream'
+/** The STRUCTURAL surface minipg needs from a custom `socket` — node's Duplex satisfies it, so a
+ *  node stream passes unchanged; other runtimes implement it directly (no `as unknown as` casts).
+ *  Required: the event trio + write + end (all a replication connection touches). Optional methods
+ *  unlock specific features and degrade loudly, not silently, when absent: `once`/`off` — COPY FROM
+ *  drain backpressure; `pause`/`resume` — cursor/stream/copyTo memory bounds (without them the
+ *  socket keeps pushing and buffers grow unboundedly); `destroy` — hard teardown on cancel. */
+export interface MinipgSocket {
+  on(event: 'data', listener: (chunk: Buffer | Uint8Array) => void): unknown
+  on(event: 'error', listener: (err: Error) => void): unknown
+  on(event: 'close', listener: () => void): unknown
+  write(data: Uint8Array): boolean | void
+  end(cb?: () => void): unknown
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any -- structural boundary: node's typed-overload once/off must remain assignable
+  once?(event: string, listener: (...args: any[]) => void): unknown
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  off?(event: string, listener: (...args: any[]) => void): unknown
+  pause?(): unknown
+  resume?(): unknown
+  destroy?(err?: Error): unknown
+}
 import type { Plugin, QueryMetrics } from './plugin.ts'
 import type { ShapeSpec, ParamType } from './spec.ts'
 import type { ShapeMapper } from './shape.ts'
@@ -86,6 +105,14 @@ export interface ConnectConfig {
   statementTimeout?: number
   /** Per-session idle_in_transaction_session_timeout in ms, sent as a startup parameter. */
   idleInTransactionSessionTimeout?: number
+  /** SCRAM channel-binding stance (URL `?channel_binding=`), libpq semantics. On the node TLS
+   *  transport minipg speaks SCRAM-SHA-256-PLUS with RFC 5929 tls-server-end-point — under
+   *  'prefer' (default) binding engages automatically whenever the server offers -PLUS over TLS,
+   *  and when it can't bind it sends the honest gs2 'y' flag (downgrade tripwire). 'require'
+   *  fails LOUDLY when binding can't happen: no TLS, a custom/cf socket (the server certificate
+   *  isn't reachable there), an unsupported cert signature algorithm, or a server without -PLUS.
+   *  Never silently unbound. */
+  channelBinding?: 'disable' | 'prefer' | 'require'
   /** Connect via a unix-domain socket at this path (e.g. /tmp/.s.PGSQL.5432) instead of
    *  host/port TCP — lower latency / higher throughput on the same machine; SSL is skipped. */
   path?: string
@@ -135,8 +162,10 @@ export interface ConnectConfig {
    *  tunes backoff (baseMs/maxMs) and maxRetries (null/omitted = retry forever). */
   reconnect?: boolean | { baseMs?: number; maxMs?: number; maxRetries?: number }
   /** Custom transport: return an already-connected duplex stream (bypasses net.connect
-   *  and SSL). Enables unix sockets, alternative runtimes, and in-process testing. */
-  socket?: () => Duplex | Promise<Duplex>
+   *  and SSL). Enables unix sockets, alternative runtimes, and in-process testing.
+   *  Structurally typed (see MinipgSocket) — node's Duplex satisfies it, and non-node
+   *  runtimes implement the small surface directly instead of casting. */
+  socket?: () => MinipgSocket | Promise<MinipgSocket>
   /** Telemetry/observability plugins (e.g. otel()/sentry() from 'minipg/telemetry'). They subscribe
    *  to query + connection lifecycle hooks; enabling any plugin turns on per-query timing capture. */
   plugins?: Plugin[]

@@ -55,3 +55,14 @@ it('a url-only config dials the URL host/port, not localhost:5432 (cf-transport 
     await db.end()
   }
 })
+
+it('sslmode=require does the Postgres STARTTLS dance (reaches TLS; self-signed cert then fails verification)', async () => {
+  // The local cluster has ssl=on with a SELF-SIGNED cert. Pre-fix (implicit TLS) this died before
+  // any TLS with a protocol error; post-fix the SSLRequest exchange succeeds and the failure moves
+  // to the TLS handshake itself (workerd trusts no self-signed cert) — proving STARTTLS negotiated.
+  let err: Error | null = null
+  try { await connect({ ...CFG, ssl: 'require', connectTimeout: 8000 }) } catch (e) { err = e as Error }
+  expect(err).not.toBeNull()
+  expect(err!.message).toMatch(/TLS handshake failed/)
+  expect(err!.message).not.toMatch(/startup|SSLRequest reply/i)
+}, 15000)

@@ -35,6 +35,6 @@ export { Json, JsonArray, Jsonb, JsonbArray, Collect, CollectNullable, Transform
 export type { JsonSpec, SpecEntries, JsonMarker, JsTarget, CollectMarker, TransformMarker, NullableMarker } from './json.ts'
 export type {
   ConnectConfig, PoolConfig, QueryOptions, StreamOptions, TxOptions,
-  QueryResult, ResultMode, Decoder, Field,
+  QueryResult, ResultMode, Decoder, Field, MinipgSocket,
 } from './types.ts'
 export type { TxFn } from './connection.ts'

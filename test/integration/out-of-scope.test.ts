@@ -34,7 +34,7 @@ describe('absence of the sql`` template tag & other DSL surfaces', () => {
     const c = await testConnect()
     try {
       const inst = c as unknown as Record<string, unknown>
-      for (const absent of ['sql', 'listen', 'notify', 'subscribe', 'copyTo', 'fetch']) {
+      for (const absent of ['sql', 'listen', 'notify', 'subscribe', 'fetch']) { // copyTo exists now (raw COPY TO relay)
         expect(inst[absent]).toBeUndefined()
       }
       // the supported surface is plain query/stream/end (+ copyFrom/copyMany since the COPY feature)
@@ -141,16 +141,14 @@ describe('LISTEN / NOTIFY async messages are ignored without breaking the connec
 })
 
 describe('COPY is unsupported — clean settle, never hangs the connection', () => {
-  test('COPY TO STDOUT of several rows resolves with command COPY and empty rows', async () => {
+  test('plain query COPY TO STDOUT rejects LOUDLY (was: silent payload discard) and never desyncs', async () => {
     const c = await testConnect()
     try {
-      // server sends 'H' CopyOutResponse, 'd' CopyData x3, 'c' CopyDone, 'C', 'Z'.
-      // handle() swallows H/d/c in the default branch and settles on C/Z.
-      const r = await c.query('copy (select * from generate_series(1,3)) to stdout')
-      expect(Array.isArray(r.rows)).toBe(true)
-      expect(r.rows.length).toBe(0) // CopyData frames are not surfaced as rows
-      expect(r.command).toBe('COPY')
-      // connection back to ready -> next query succeeds (no desync from swallowed frames)
+      // server sends 'H' CopyOutResponse, 'd' CopyData x3, 'c' CopyDone, 'C', 'Z'. The 'H' handler
+      // marks the task errored — resolving with empty rows would silently discard the payload.
+      const err = await caught(() => c.query('copy (select * from generate_series(1,3)) to stdout'))
+      expect((err as Error).message).toMatch(/use copyTo\(\)/)
+      // connection back to ready -> next query succeeds (frames drained, no desync)
       expect(c.state).toBe('ready')
       const ok = await c.query('select 1::int4 as x')
       expect((ok.rows[0] as unknown[])[0]).toBe(1)
@@ -178,11 +176,11 @@ describe('COPY is unsupported — clean settle, never hangs the connection', () 
     }
   }, 10000)
 
-  test('pool.query COPY TO STDOUT does not desync the pool', async () => {
+  test('pool.query COPY TO STDOUT rejects loudly and does not desync the pool', async () => {
     const pool = testPool({ max: 1 })
     try {
-      const r = await pool.query('copy (select 1) to stdout')
-      expect(Array.isArray(r.rows)).toBe(true)
+      const err = await caught(() => pool.query('copy (select 1) to stdout'))
+      expect((err as Error).message).toMatch(/use copyTo\(\)/)
       // borrowed connection released cleanly -> next pooled query works
       const ok = await pool.query('select 1::int4 as x')
       expect((ok.rows[0] as unknown as unknown[])[0]).toBe(1)

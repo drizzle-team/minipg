@@ -436,3 +436,20 @@ describe('startup parameters: options + per-session timeouts (R4)', () => {
     expect((err as Error).message).toMatch(/startup parameter options contains NUL/)
   })
 })
+
+describe('channel_binding (SCRAM without channel binding)', () => {
+  const base = () => {
+    const { host, port, user, password, database } = TEST_CONFIG as { host: string; port: number; user: string; password: string; database: string }
+    return `postgres://${user}:${password}@${host}:${port}/${database}`
+  }
+  test('require over PLAIN TCP throws loudly (binding needs TLS); prefer/disable connect as today', async () => {
+    const err = await caught(() => connect(`${base()}?channel_binding=require`))
+    expect((err as Error).message).toMatch(/channel_binding=require needs TLS/)
+    const c = await connect(`${base()}?channel_binding=prefer`)
+    try { expect((await c.query('select 1 as ok', [], { mode: 'object' })).rows[0]).toEqual({ ok: 1 }) } finally { c.end() }
+  })
+  test('an unknown channel_binding value fails URL parsing like libpq', async () => {
+    const err = await caught(() => connect(`${base()}?channel_binding=maybe`))
+    expect((err as Error).message).toMatch(/invalid channel_binding value "maybe"/)
+  })
+})

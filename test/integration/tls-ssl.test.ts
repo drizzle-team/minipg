@@ -395,3 +395,60 @@ describe('roadmap: SSL features not yet implemented', () => {
   test.todo('SCRAM-SHA-256-PLUS channel binding over TLS', () => {})
   test.todo('wrong-CA rejection requires openssl to mint an unrelated CA', () => {})
 })
+
+describe('SCRAM channel binding (SCRAM-SHA-256-PLUS, tls-server-end-point)', () => {
+  test('channel_binding=require over TLS connects — Postgres itself verifies the binding bytes', async () => {
+    // The strongest possible check: the server recomputes tls-server-end-point from ITS cert and
+    // validates our c= inside the signed SCRAM exchange. Wrong hash/encoding => auth failure.
+    const c = await testConnect({ ssl: true, channelBinding: 'require' })
+    try { expect((await c.query('select 1 as ok', [], { mode: 'object' })).rows[0]).toEqual({ ok: 1 }) } finally { await c.end() }
+  }, 10000)
+
+  test("default 'prefer' binds automatically over TLS; 'disable' still connects plain", async () => {
+    const bound = await testConnect({ ssl: true })
+    try { expect((await bound.query('select 2 as ok', [], { mode: 'object' })).rows[0]).toEqual({ ok: 2 }) } finally { await bound.end() }
+    const plain = await testConnect({ ssl: true, channelBinding: 'disable' })
+    try { expect((await plain.query('select 3 as ok', [], { mode: 'object' })).rows[0]).toEqual({ ok: 3 }) } finally { await plain.end() }
+  }, 10000)
+
+  test('require + custom socket transport throws at construction (cert unreachable there)', async () => {
+    const err = await caught(() => connect({ ssl: true, channelBinding: 'require', socket: () => { throw new Error('never dialed') } }))
+    expect((err as Error).message).toMatch(/custom socket transport cannot expose the server certificate/)
+  })
+
+  test('replication() binds too: require over TLS on the walsender', async () => {
+    const { replication } = await import('../../src/index.ts')
+    const { TEST_CONFIG } = await import('../helpers/db.ts')
+    const repl = await replication({ ...(TEST_CONFIG as object), ssl: true, channelBinding: 'require' })
+    try {
+      const sys = await repl.identify()
+      expect(sys.dbname).toBe('testdb')
+    } finally { repl.end() }
+  }, 10000)
+
+  test('tls-server-end-point: the ASN.1 walk finds the cert signature hash; SCRAM encodes the binding', async () => {
+    const { tlsServerEndPoint, parseSaslMechanisms, scram } = await import('../../src/auth.ts')
+    // the cluster cert is sha256WithRSAEncryption (openssl req default) -> hash = sha256(DER)
+    const der = Buffer.from(SERVER_CA.replace(/-----(BEGIN|END) CERTIFICATE-----|\s/g, ''), 'base64')
+    const cb = tlsServerEndPoint(der)
+    expect(cb).not.toBeNull()
+    expect(cb!.length).toBe(32)
+    const { createHash } = await import('node:crypto')
+    expect(cb!.equals(createHash('sha256').update(der).digest())).toBe(true)
+
+    expect(parseSaslMechanisms(Buffer.concat([Buffer.from([0, 0, 0, 10]), Buffer.from('SCRAM-SHA-256\0SCRAM-SHA-256-PLUS\0\0')])))
+      .toEqual(['SCRAM-SHA-256', 'SCRAM-SHA-256-PLUS'])
+
+    // -PLUS state machine: gs2 header + c= carry the binding; 'y' flag encodes capable-but-unoffered
+    const plus = scram('pw', { cbData: Buffer.from('CBCB') })
+    expect(plus.mechanism).toBe('SCRAM-SHA-256-PLUS')
+    expect(plus.clientFirst.startsWith('p=tls-server-end-point,,n=*,r=')).toBe(true)
+    const nonce = plus.clientFirst.split('r=')[1]!
+    const final = plus.continue(`r=${nonce}SRV,s=${Buffer.from('salt').toString('base64')},i=4096`)
+    expect(final.split(',')[0]).toBe('c=' + Buffer.concat([Buffer.from('p=tls-server-end-point,,'), Buffer.from('CBCB')]).toString('base64'))
+    const y = scram('pw', { gs2: 'y' })
+    expect(y.clientFirst.startsWith('y,,')).toBe(true)
+    const yNonce = y.clientFirst.split('r=')[1]!
+    expect(y.continue(`r=${yNonce}SRV,s=${Buffer.from('salt').toString('base64')},i=4096`).split(',')[0]).toBe('c=eSws') // base64('y,,')
+  })
+})

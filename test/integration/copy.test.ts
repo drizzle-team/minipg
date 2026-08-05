@@ -1,7 +1,7 @@
 // COPY FROM STDIN: copyFrom (raw source, simple protocol, solo gating) and copyMany
 // (binary/text row encoding). Requires `bun run test:setup`.
 import { test, expect, describe } from 'bun:test'
-import { withConn, testPool, caught, PgError, TEST_TIMEOUT } from '../helpers/db.ts'
+import { withConn, testPool, testConnect, caught, PgError, TEST_TIMEOUT } from '../helpers/db.ts'
 
 const K = `cp_${process.pid}`
 const COLS = { id: 'int8', name: 'text', qty: 'int4', price: 'float8', ok: 'bool', at: 'timestamptz' } as const
@@ -172,5 +172,68 @@ describe('copyMany', () => {
       await pool.execute(`drop table if exists ${K}_p`)
       await pool.end()
     }
+  }, TEST_TIMEOUT)
+})
+
+describe('copyTo — COPY … TO STDOUT raw byte relay', () => {
+  test('text copy: chunks concat to the exact payload; result carries the COPY tag', async () => {
+    const c = await testConnect()
+    try {
+      await c.query('create temp table cto_t(a int4, b text)')
+      await c.query(`insert into cto_t select g, 'v' || g from generate_series(1, 1000) g`)
+      const it = c.copyTo('copy cto_t to stdout')
+      const parts: Uint8Array[] = []
+      for await (const chunk of it) parts.push(chunk)
+      const text = Buffer.concat(parts.map((p) => Buffer.from(p))).toString('utf8')
+      const lines = text.split('\n').filter((l) => l.length)
+      expect(lines.length).toBe(1000)
+      expect(lines[0]).toBe('1\tv1')
+      expect(lines[999]).toBe('1000\tv1000')
+      expect(await it.result).toEqual({ command: 'COPY', rowCount: 1000 })
+      expect((await c.query('select 7::int4 as x', [], { mode: 'object' })).rows[0]).toEqual({ x: 7 }) // connection reusable
+    } finally { c.end() }
+  }, TEST_TIMEOUT)
+
+  test('direct pipe: source.copyTo (FORMAT binary) feeds target.copyFrom — zero decode, content-equal', async () => {
+    const src = await testConnect()
+    const dst = await testConnect()
+    try {
+      await src.query('create table cto_src(a int4, b text, c numeric)')
+      await src.query(`insert into cto_src select g, md5(g::text), g * 1.5 from generate_series(1, 2000) g`)
+      await dst.query('create table cto_dst(a int4, b text, c numeric)')
+      const r = await dst.copyFrom('copy cto_dst from stdin (format binary)', src.copyTo('copy cto_src to stdout (format binary)'))
+      expect(r.rowCount).toBe(2000)
+      const [check] = (await dst.query('select count(*)::int4 as n, sum(a)::int4 as s, md5(string_agg(b, \'\' order by a)) as h from cto_dst', [], { mode: 'object' })).rows
+      const [orig] = (await src.query('select count(*)::int4 as n, sum(a)::int4 as s, md5(string_agg(b, \'\' order by a)) as h from cto_src', [], { mode: 'object' })).rows
+      expect(check).toEqual(orig)
+    } finally {
+      await src.query('drop table if exists cto_src').catch(() => {})
+      await dst.query('drop table if exists cto_dst').catch(() => {})
+      src.end(); dst.end()
+    }
+  }, TEST_TIMEOUT)
+
+  test('mid-copy server error rejects the iterator (and .result) with the PgError', async () => {
+    const c = await testConnect()
+    try {
+      const it = c.copyTo('copy (select 1 / (g - 900) from generate_series(1, 1000) g) to stdout')
+      let err: Error | null = null
+      try { for await (const _ of it) void _ } catch (e) { err = e as Error }
+      expect(err).toBeInstanceOf(PgError)
+      expect((err as PgError).code).toBe('22012') // division by zero, mid-stream
+      await expect(it.result).rejects.toThrow()
+      expect((await c.query('select 1::int4 as x')).rows.length).toBe(1) // connection survives
+    } finally { c.end() }
+  }, TEST_TIMEOUT)
+
+  test('break detaches without buffering: frames drop, the copy finishes, the connection survives', async () => {
+    const c = await testConnect()
+    try {
+      const it = c.copyTo('copy (select g, repeat(md5(g::text), 10) from generate_series(1, 20000) g) to stdout')
+      let first: Uint8Array | null = null
+      for await (const chunk of it) { first = chunk; break } // detach immediately
+      expect(first).not.toBeNull()
+      expect((await c.query('select 42::int4 as x', [], { mode: 'object' })).rows[0]).toEqual({ x: 42 }) // queued behind the draining copy, then runs
+    } finally { c.end() }
   }, TEST_TIMEOUT)
 })
