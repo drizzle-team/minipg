@@ -37,6 +37,8 @@ export type Row = Record<string, unknown>
 export type ReplicationEvent =
   | {
       kind: 'begin'; xid: number; commitTime: Date
+      /** Same instant as commitTime, as epoch microseconds — carries pgoutput's full precision where Date floors to milliseconds. */
+      commitTimeUs: number
       /** The tx's commit-record LSN — identical to the matching commit event's `lsn`. */
       finalLsn: string
     }
@@ -49,6 +51,8 @@ export type ReplicationEvent =
        *  `lsn` by mistake can't silently gate the idle-keepalive advance.) */
       endLsn: string
       commitTime: Date
+      /** Same instant as commitTime, as epoch microseconds — carries pgoutput's full precision where Date floors to milliseconds. */
+      commitTimeUs: number
     }
   | { kind: 'insert'; schema: string; table: string; new: Row }
   // update's old tuple is discriminated on oldKind: 'key'/'full' ALWAYS carries a Row (REPLICA
@@ -432,6 +436,7 @@ export class ReplicationConnection {
     let off = 1
     const cstr = (): string => { let e = off; while (b[e] !== 0) e++; const s = b.toString('utf8', off, e); off = e + 1; return s }
     const ts = (us: bigint): Date => new Date(Number((us + PG_EPOCH_US) / 1000n))
+    const tsUs = (us: bigint): number => Number(us + PG_EPOCH_US)
     const tuple = (rel: RelEntry): { row: Row; unchanged: string[] } => {
       const n = b.readInt16BE(off); off += 2
       const row: Row = {}
@@ -458,8 +463,8 @@ export class ReplicationConnection {
     }
     const rel = (id: number): RelEntry => this.relations.get(id) ?? { info: { schema: '?', table: `?${id}`, replicaIdentity: 'd', columns: [] }, names: [], decoders: [], bin: null }
     switch (tag) {
-      case 'B': return { kind: 'begin', finalLsn: lsnToString(b.readBigUInt64BE(1)), commitTime: ts(b.readBigUInt64BE(9) ), xid: b.readInt32BE(17) }
-      case 'C': return { kind: 'commit', lsn: lsnToString(b.readBigUInt64BE(2)), endLsn: lsnToString(b.readBigUInt64BE(10)), commitTime: ts(b.readBigUInt64BE(18)) }
+      case 'B': return { kind: 'begin', finalLsn: lsnToString(b.readBigUInt64BE(1)), commitTime: ts(b.readBigUInt64BE(9) ), commitTimeUs: tsUs(b.readBigUInt64BE(9)), xid: b.readInt32BE(17) }
+      case 'C': return { kind: 'commit', lsn: lsnToString(b.readBigUInt64BE(2)), endLsn: lsnToString(b.readBigUInt64BE(10)), commitTime: ts(b.readBigUInt64BE(18)), commitTimeUs: tsUs(b.readBigUInt64BE(18)) }
       case 'R': {
         const id = b.readInt32BE(off); off += 4
         const schema = cstr(), table = cstr()
