@@ -20,6 +20,10 @@ const ALLOW_ROOT = new Set(['package.json', 'LICENSE', 'README.md'])
 const badRoot = entries.filter((p) => !p.startsWith('dist/') && !ALLOW_ROOT.has(p))
 const maps = entries.filter((p) => p.endsWith('.map'))
 
+const REQUIRED = ['package.json', 'LICENSE', 'README.md']
+const missing = REQUIRED.filter((r) => !entries.includes(r))
+const hasDist = entries.some((p) => p.startsWith('dist/'))
+
 // dist/runtime.d.ts has no .js sibling by design (ambient declarations) — iterate .js only.
 const orphans = entries
   .filter((p) => p.startsWith('dist/') && p.endsWith('.js'))
@@ -29,6 +33,8 @@ const problems = [
   ...badRoot.map((p) => `unexpected root/path entry: ${p}`),
   ...maps.map((p) => `source map shipped: ${p}`),
   ...orphans.map((p) => `orphaned dist file, no matching src: ${p}`),
+  ...missing.map((r) => `missing required entry: ${r}`),
+  ...(hasDist ? [] : ['tarball contains no dist/ files']),
 ]
 
 if (problems.length > 0) {
