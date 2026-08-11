@@ -127,6 +127,7 @@
     "db:studio": "drizzle-kit studio"
   },
   "devDependencies": {
+    "@arethetypeswrong/cli": "^0.18.5",
     "@cloudflare/vitest-pool-workers": "^0.5.2",
     "@mitata/counters": "^0.0.8",
     "@types/bun": "latest",
@@ -139,6 +140,7 @@
     "pg": "^8.22.0",
     "postgres": "^3.4.9",
     "prettier": "^3.9.1",
+    "publint": "^0.3.23",
     "tsdown": "^0.22.3",
     "vitest": "~2.1.9",
     "wrangler": "^3.90.0"
