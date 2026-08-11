@@ -24,10 +24,17 @@ const REQUIRED = ['package.json', 'LICENSE', 'README.md']
 const missing = REQUIRED.filter((r) => !entries.includes(r))
 const hasDist = entries.some((p) => p.startsWith('dist/'))
 
-// dist/runtime.d.ts has no .js sibling by design (ambient declarations) — iterate .js only.
+// Each dist/X.js needs src/X.ts; each dist/X.d.ts needs src/X.ts or src/X.d.ts
+// (dist/runtime.d.ts is an ambient declaration with no .js sibling, covered by the latter).
 const orphans = entries
-  .filter((p) => p.startsWith('dist/') && p.endsWith('.js'))
-  .filter((p) => !fs.existsSync(p.replace(/^dist\//, 'src/').replace(/\.js$/, '.ts')))
+  .filter((p) => p.startsWith('dist/') && (p.endsWith('.js') || p.endsWith('.d.ts')))
+  .filter((p) => {
+    if (p.endsWith('.d.ts')) {
+      const base = p.replace(/^dist\//, 'src/')
+      return !fs.existsSync(base.replace(/\.d\.ts$/, '.ts')) && !fs.existsSync(base)
+    }
+    return !fs.existsSync(p.replace(/^dist\//, 'src/').replace(/\.js$/, '.ts'))
+  })
 
 const problems = [
   ...badRoot.map((p) => `unexpected root/path entry: ${p}`),
