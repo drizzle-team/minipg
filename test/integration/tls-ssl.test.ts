@@ -4,7 +4,7 @@
 // handshake (+ pg_stat_ssl), tls.connect option merging (via a spy that calls
 // through), self-signed / custom-CA verification, malformed cert material, and
 // the N / unexpected-byte / timeout negotiation paths via a stub TCP server.
-import { test, expect, describe, beforeAll, spyOn } from 'bun:test'
+import { test, expect, describe, spyOn } from 'bun:test'
 import net from 'node:net'
 import tls from 'node:tls'
 import fs from 'node:fs'
@@ -25,9 +25,8 @@ const SERVER_CA = readServerCa()
 
 // An UNRELATED self-signed CA generated at runtime, used to prove a cert that is
 // NOT signed by the supplied CA is rejected. Generated lazily; if openssl is
-// unavailable the dependent test is skipped (todo).
-let altCa = ''
-beforeAll(() => {
+// unavailable the dependent test is skipped.
+const altCa: string = (() => {
   try {
     const scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'minipg-tls-'))
     const key = `${scratch}/alt-ca.key`
@@ -35,9 +34,9 @@ beforeAll(() => {
     execFileSync('openssl', ['req', '-x509', '-newkey', 'rsa:2048', '-nodes',
       '-keyout', key, '-out', crt, '-days', '2', '-subj', '/CN=not-the-server'],
       { stdio: 'ignore' })
-    altCa = fs.readFileSync(crt, 'utf8')
-  } catch { altCa = '' }
-})
+    return fs.readFileSync(crt, 'utf8')
+  } catch { return '' }
+})()
 
 // Stub TCP server that reads the 8-byte SSLRequest then runs `onRequest(sock)`.
 function makeStub(onRequest: (sock: net.Socket) => void): Promise<{ port: number; close: () => void }> {
@@ -263,8 +262,7 @@ describe('self-signed cert + rejectUnauthorized', () => {
     expect((err as Error).message).toMatch(/self[- ]signed|unable to verify|certificate|Hostname/i)
   })
 
-  test('a cert NOT signed by the supplied CA is rejected (wrong/unrelated CA)', async () => {
-    if (!altCa) { return } // openssl unavailable — see todo below
+  test.skipIf(!altCa)('a cert NOT signed by the supplied CA is rejected (wrong/unrelated CA)', async () => {
     const err = await caught(() => testConnect({ ssl: { ca: altCa, rejectUnauthorized: true, servername: 'localhost' } }))
     expect(err).toBeInstanceOf(Error)
     expect((err as Error).message).toMatch(/self[- ]signed|unable to verify|certificate/i)
@@ -393,7 +391,6 @@ describe('roadmap: SSL features not yet implemented', () => {
   test.todo('sslrootcert=system loads OS trust roots for verify-full', () => {})
   test.todo('fused S + ServerHello in one TCP segment (once-data only reads buf[0])', () => {})
   test.todo('SCRAM-SHA-256-PLUS channel binding over TLS', () => {})
-  test.todo('wrong-CA rejection requires openssl to mint an unrelated CA', () => {})
 })
 
 describe('SCRAM channel binding (SCRAM-SHA-256-PLUS, tls-server-end-point)', () => {
