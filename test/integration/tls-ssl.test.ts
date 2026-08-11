@@ -8,17 +8,16 @@ import { test, expect, describe, beforeAll, spyOn } from 'bun:test'
 import net from 'node:net'
 import tls from 'node:tls'
 import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
 import { execFileSync } from 'node:child_process'
 import { connect, Connection, PgError } from '../../src/index.ts'
 import { W } from '../../src/protocol.ts'
-import { testConnect, caught } from '../helpers/db.ts'
-
-const PROJECT = '/Users/alexblokh/Development/nodepg-postgresjs'
-const SCRATCH = '/private/tmp/claude-501/-Users-alexblokh-Development-nodepg-postgresjs/c5406bc1-bbcb-4383-9b90-cf83de942bf0/scratchpad'
+import { testConnect, caught, SERVER_CA_PATH } from '../helpers/db.ts'
 
 // The server's own self-signed cert acts as its own CA (Issuer === Subject === CN=localhost).
 function readServerCa(): string {
-  const raw = fs.readFileSync(`${PROJECT}/test/.pgdata/server.crt`, 'utf8')
+  const raw = fs.readFileSync(SERVER_CA_PATH, 'utf8')
   const m = raw.match(/-----BEGIN CERTIFICATE-----[\s\S]*?-----END CERTIFICATE-----/)
   return m ? m[0] : raw
 }
@@ -30,8 +29,9 @@ const SERVER_CA = readServerCa()
 let altCa = ''
 beforeAll(() => {
   try {
-    const key = `${SCRATCH}/alt-ca.key`
-    const crt = `${SCRATCH}/alt-ca.crt`
+    const scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'minipg-tls-'))
+    const key = `${scratch}/alt-ca.key`
+    const crt = `${scratch}/alt-ca.crt`
     execFileSync('openssl', ['req', '-x509', '-newkey', 'rsa:2048', '-nodes',
       '-keyout', key, '-out', crt, '-days', '2', '-subj', '/CN=not-the-server'],
       { stdio: 'ignore' })

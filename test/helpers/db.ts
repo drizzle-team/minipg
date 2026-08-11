@@ -4,6 +4,8 @@
 // ONE merged driver; MINIPG_VARIANT selects the decode strategy (jit default, or interpreted), which
 // testConnect/testPool inject as `decode`. So the query/decode suite runs against BOTH mappers of the
 // same driver — `bun run test:query` (jit) and MINIPG_VARIANT=interpreted (interpreted catalog).
+import { dirname, join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import * as nodeDriver from '../../src/index.ts'
 import * as neonWsDriver from '../../src/neon-ws.ts'
 import type { ConnectConfig, PoolConfig } from '../../src/index.ts'
@@ -43,6 +45,11 @@ export const TEST_CONFIG: ConnectConfig = REMOTE_URL
       password: process.env.PGTEST_PASSWORD ?? 'postgres',
       database: process.env.PGTEST_DB ?? 'testdb',
     }
+
+// bun test can be invoked from any directory, so the cert fixture path must derive from the
+// module rather than the CWD or a hardcoded literal — matches how test/setup-pg.sh resolves
+// PGDATA. Shared here so tls-ssl.test.ts and security.test.ts can't drift with two copies.
+export const SERVER_CA_PATH = join(dirname(fileURLToPath(import.meta.url)), '..', '.pgdata', 'server.crt')
 
 export const testConnect = (o: Partial<ConnectConfig> = {}) => connect({ ...TEST_CONFIG, decode: VARIANT, ...o })
 export const testPool = (o: Partial<PoolConfig> = {}) => createPool({ ...TEST_CONFIG, decode: VARIANT, ...o })
