@@ -92,8 +92,9 @@
     "node": ">=18"
   },
   "scripts": {
-    "build": "tsdown",
-    "prepublishOnly": "bun run typecheck && bun run build",
+    "build": "bun node_modules/.bin/tsdown",
+    "prepublishOnly": "bun run typecheck && bun run build && bun run verify:publish",
+    "verify:publish": "node scripts/verify-publish.mjs",
     "typecheck": "tsc --noEmit",
     "test": "bun test test/unit test/integration",
     "test:unit": "bun test test/unit",
