@@ -33,7 +33,8 @@ for (const s of subpaths) {
     await import(\`\${PKG}\${s}\`)
     if (expectedFail[s]) { console.error(\`unexpectedly resolved: \${PKG}\${s}\`); failed = true }
   } catch (e) {
-    if (e.code !== expectedFail[s]) { console.error(\`\${PKG}\${s}: \${e.code} \${e.message}\`); failed = true }
+    const expected = expectedFail[s]
+    if (!expected || e.code !== expected) { console.error(\`\${PKG}\${s}: \${e.code ?? e.name} \${e.message}\`); failed = true }
   }
 }
 process.exit(failed ? 1 : 0)
