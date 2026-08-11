@@ -15,12 +15,15 @@ if (!tgz) {
 }
 
 const PKG = '@drizzle-team/minipg'
-const subpaths = ['', '/core', '/node', '/deno', '/cf', '/replication', '/neon-ws',
-  '/neon-http', '/http', '/geometry', '/aurora', '/telemetry', '/buffer-polyfill']
 
 const scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'minipg-smoke-'))
 execFileSync('npm', ['init', '-y'], { cwd: scratch, stdio: 'ignore' })
 execFileSync('npm', ['i', path.resolve(tgz)], { cwd: scratch, stdio: 'ignore' })
+
+// Derived from the installed tarball's own manifest, not hand-mirrored from package.json,
+// so a new export added upstream is smoke-tested automatically.
+const manifest = JSON.parse(fs.readFileSync(path.join(scratch, 'node_modules', PKG, 'package.json'), 'utf8'))
+const subpaths = Object.keys(manifest.exports).map((k) => k.replace(/^\./, ''))
 
 // src/cf.ts statically imports cloudflare:sockets, which Node cannot resolve.
 const probe = `
