@@ -1,6 +1,6 @@
 {
   "name": "@drizzle-team/minipg",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "description": "A minimal, dependency-free PostgreSQL driver for Node, Bun, Deno, and Cloudflare Workers.",
   "type": "module",
   "license": "MIT",
