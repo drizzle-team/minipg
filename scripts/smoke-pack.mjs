@@ -17,6 +17,7 @@ if (!tgz) {
 const PKG = '@drizzle-team/minipg'
 
 const scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'minipg-smoke-'))
+process.on('exit', () => fs.rmSync(scratch, { recursive: true, force: true }))
 execFileSync('npm', ['init', '-y'], { cwd: scratch, stdio: 'ignore' })
 execFileSync('npm', ['i', path.resolve(tgz)], { cwd: scratch, stdio: 'ignore' })
 

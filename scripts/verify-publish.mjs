@@ -9,6 +9,7 @@ import os from 'node:os'
 import path from 'node:path'
 
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'minipg-verify-'))
+process.on('exit', () => fs.rmSync(tmp, { recursive: true, force: true }))
 execFileSync('npm', ['pack', '--pack-destination', tmp], { stdio: 'inherit' })
 // scoped names flatten: @drizzle-team/minipg -> drizzle-team-minipg-<version>.tgz
 const tgz = path.join(tmp, fs.readdirSync(tmp).find((f) => f.endsWith('.tgz')))
