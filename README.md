@@ -24,13 +24,14 @@ bun add @drizzle-team/minipg
 
 ## Usage
 
-The example below queries a local cluster. Provision one first:
+The example below queries a local cluster. From a checkout of this repo, provision one with:
 
 ```bash
 bun run test:setup
 ```
 
 That starts Postgres on `127.0.0.1:54329` with a `testdb` database and a seeded table `t`.
+Any other Postgres works too — point the config below at it.
 
 ```js
 import { connect } from '@drizzle-team/minipg'

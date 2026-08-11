@@ -3,7 +3,7 @@
   "configVersion": 1,
   "workspaces": {
     "": {
-      "name": "nodepg-postgresjs",
+      "name": "@drizzle-team/minipg",
       "devDependencies": {
         "@arethetypeswrong/cli": "^0.18.5",
         "@cloudflare/vitest-pool-workers": "^0.5.2",
