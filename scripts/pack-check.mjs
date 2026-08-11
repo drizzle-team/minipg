@@ -1,0 +1,38 @@
+// Validates the file listing of a packed npm tarball for @drizzle-team/minipg.
+// Runs under node against the tarball's actual bytes, not a second pack.
+//   node scripts/pack-check.mjs <path-to-tgz>
+import { execFileSync } from 'node:child_process'
+import fs from 'node:fs'
+
+const tgz = process.argv[2]
+if (!tgz) {
+  console.error('usage: node scripts/pack-check.mjs <tgz>')
+  process.exit(2)
+}
+
+const entries = execFileSync('tar', ['-tzf', tgz], { encoding: 'utf8' })
+  .split('\n')
+  .filter(Boolean)
+  .map((p) => p.replace(/^package\//, ''))
+  .filter((p) => !p.endsWith('/'))
+
+const ALLOW_ROOT = new Set(['package.json', 'LICENSE', 'README.md'])
+const badRoot = entries.filter((p) => !p.startsWith('dist/') && !ALLOW_ROOT.has(p))
+const maps = entries.filter((p) => p.endsWith('.map'))
+
+// dist/runtime.d.ts has no .js sibling by design (ambient declarations) — iterate .js only.
+const orphans = entries
+  .filter((p) => p.startsWith('dist/') && p.endsWith('.js'))
+  .filter((p) => !fs.existsSync(p.replace(/^dist\//, 'src/').replace(/\.js$/, '.ts')))
+
+const problems = [
+  ...badRoot.map((p) => `unexpected root/path entry: ${p}`),
+  ...maps.map((p) => `source map shipped: ${p}`),
+  ...orphans.map((p) => `orphaned dist file, no matching src: ${p}`),
+]
+
+if (problems.length > 0) {
+  for (const p of problems) console.error(p)
+  process.exit(1)
+}
+process.exit(0)
