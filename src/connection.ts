@@ -7,7 +7,7 @@ import { encodeValueInto, compileParamPlan, compileBindEncoder, type BindEncoder
 import { buildDecoders, decoderFor } from './decode.ts'
 import { PgError, parseErrorFields } from './errors.ts'
 import type { ConnectConfig, Decoder, Field, MinipgSocket, QueryDebug, QueryOptions, QueryResult, ResultMode, StreamOptions, TxOptions } from './types.ts'
-import { INSTANT_OIDS, BINARY_FAST, type CodegenCol } from './decode.ts'
+import { INSTANT_OIDS, BINARY_FAST, tagArrayCol, type CodegenCol } from './decode.ts'
 import { buildMapperFactory, isEvalAvailable, type RowMapper, type RowMapperFactory } from './mapper.ts'
 import { resolveUrl } from './url.ts'
 import { shapeCols, resolveParamTypes, paramTypeOid, type ShapeSpec, type ShapeOf, type ShapeEntries, type ParamType, type PgType } from './spec.ts'
@@ -618,12 +618,16 @@ export class Connection {
   // Build (cached) the row mapper for a shape. array/object only; buffer/raw fall through to makeRow.
   // Serves BOTH the standard path (cols from RowDescription fields) and queryTyped (cols from caller).
   // Normalize a shape/typed column plan against connection config before building the mapper AND choosing
-  // result formats (callers use this for both, so they agree). temporal:'string' forces date/timestamp(tz)
+  // result formats (callers use this for both, so they agree). Built-in array OIDs are bound to the array
+  // decoder here, so a PLAIN query yields JS arrays like a shaped one does (tagArrayCol).
+  // temporal:'string' forces date/timestamp(tz)
   // columns with no explicit target to the exact-string TEXT decode — dropping any binary upgrade, since
   // binary can't yield the PG text (lossless for µs/BC/infinity that a JS Date can't represent).
   private resolveCols(cols: CodegenCol[]): CodegenCol[] {
-    if (this.cfg.temporal !== 'string') return cols
-    return cols.map((c) => {
+    const tsString = this.cfg.temporal === 'string'
+    return cols.map((c0) => {
+      const c = tagArrayCol(c0) // wire array OID -> decode '{…}' to a JS array (no-op on already-tagged shape cols)
+      if (!tsString) return c
       if (!c.js && !c.json && INSTANT_OIDS.has(c.oid)) return { ...c, js: 'string', format: 'text' }
       if (c.array && !c.array.js && INSTANT_OIDS.has(c.array.elem)) return { ...c, array: { ...c.array, js: 'string' } } // temporal[] elements follow the global too
       return c

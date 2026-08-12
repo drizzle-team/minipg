@@ -177,7 +177,7 @@ describe('replication()', () => {
           expect(ins.new.at).toBeInstanceOf(Date)
           expect((ins.new.at as Date).getTime()).toBe(Date.UTC(2026, 0, 2, 3, 4, 5, 678))
           expect(ins.new.price).toBe('10.50')                            // exact string, like query()
-          expect(ins.new.tags).toBe('{1,2,3}')                           // text mode: raw literal, like a plain query
+          expect(ins.new.tags).toEqual([1, 2, 3])                        // text mode parses '{1,2,3}', like a plain query (and like the binary path)
         } finally { repl.end() }
       } finally {
         await c.query(`drop publication ${K}_dpub`)

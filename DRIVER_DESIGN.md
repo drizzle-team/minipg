@@ -72,6 +72,7 @@ Driven directly by the issue clusters. In `array`/`object` modes:
 - **`int8`/bigint → string, `numeric` → string** (the most-reported silent-corruption footgun — no `2^53` loss).
 - `int2`/`int4`/`oid`/`float4`/`float8` → number; `bool` → boolean; `json`/`jsonb` → parsed; `bytea` → `Buffer`.
 - **timestamps/date/time → string** (tz/Date conversion is lossy; left to the caller).
+- **built-in array types → JS array**, elements decoded by the rules above (`int8[]` → `BigInt[]`, `numeric[]` → exact strings). Arrays of per-database element types (`enum[]`, `domain[]`, composite) keep the raw `{…}` literal — the wire OID can't identify the element; declare a `shape`.
 - everything else → UTF-8 string.
 
 Override per-OID:
@@ -148,5 +149,5 @@ Next, in priority order:
 2. **Transactions helper** — `pool.connect()` already gives a dedicated client; add `begin/commit/rollback` sugar + pooled session-state reset on release.
 3. **Binary result format** — opt-in per query for the hot types (the type-matrix test the gap analysis recommends).
 4. **TLS verify modes** — explicit `verify-ca` / `verify-full` semantics.
-5. **More type decoders** — arrays, uuid, timestamptz→Date opt-in (all overridable today).
+5. **More type decoders** — uuid, timestamptz→Date opt-in (all overridable today). *Arrays: done — built-in array OIDs bind the array decoder in every driver's column plan (`tagArrayCol`); per-database element types (`enum[]`, `domain[]`, composite arrays) still need a declared shape.*
 6. **The "all-common-types round-trip matrix"** smoke test from the gap analysis.
