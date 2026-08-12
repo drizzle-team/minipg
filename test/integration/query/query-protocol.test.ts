@@ -425,10 +425,10 @@ describe('large / boundary query text', () => {
       const placeholders = Array.from({ length: n }, (_, i) => `$${i + 1}`).join(',')
       const params = Array.from({ length: n }, (_, i) => i + 1)
       const r = await c.query(`select array[${placeholders}]::int[] as a`, params)
-      const arr = (r.rows[0] as unknown[])[0] as unknown
-      // int[] decodes to a string by default; assert it carries first & last values
-      expect(String(arr)).toContain('{1,')
-      expect(String(arr)).toContain(`,${n}}`)
+      const arr = (r.rows[0] as unknown[])[0] as number[]
+      // int[] decodes to a JS array; assert every bound param landed in order
+      expect(Array.isArray(arr)).toBe(true)
+      expect(arr).toEqual(params)
     })
   })
 

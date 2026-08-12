@@ -53,3 +53,10 @@ await db.end()
 `n8` (bigint) comes back as a native JS `BigInt`, and `amount` (numeric) comes back as a
 string, since both types can exceed the range a JS number can represent without losing
 precision.
+
+Built-in array columns (`int4[]`, `text[]`, `jsonb[]`, `timestamptz[]`, …) decode to JS
+arrays, with each element following the scalar rules above — so `int8[]` yields `BigInt`s
+and `numeric[]` yields exact strings. Arrays whose element type has a per-database OID
+(`enum[]`, `domain[]`, composite arrays) can't be recognised from the wire OID alone and
+still arrive as the raw `{…}` literal; declare a `shape` for those. To opt back out for a
+given type, override its array OID in `types` (e.g. `types: { 1007: (b) => b.toString() }`).
