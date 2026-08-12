@@ -20,11 +20,9 @@
         "prettier": "^3.9.1",
         "publint": "^0.3.23",
         "tsdown": "^0.22.3",
+        "typescript": "^5",
         "vitest": "~2.1.9",
         "wrangler": "^3.90.0",
-      },
-      "peerDependencies": {
-        "typescript": "^5",
       },
     },
   },
