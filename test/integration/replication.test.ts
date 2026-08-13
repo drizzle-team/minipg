@@ -1,7 +1,7 @@
 // replication(): logical replication over the real auth/transport stack (TCP + SCRAM here).
 // Requires the local cluster with wal_level=logical (test/setup-pg.sh cluster, reconfigured).
 import { test, expect, describe } from 'bun:test'
-import { replication, connect, defineType, Jsonb, Collect, Transform, ReplicationStreamEnded, ReplicationBusy, PublicationMissing, PublicationEmpty, PgError, type ReplicationEvent, type ReplicationWarning, type TableShape } from '../../src/index.ts'
+import { replication, connect, defineType, Jsonb, Collect, Transform, ReplicationStreamEnded, ReplicationBusy, ReplicationReceiveTimeout, PublicationMissing, PublicationEmpty, PgError, type ReplicationEvent, type ReplicationWarning, type TableShape } from '../../src/index.ts'
 import { TEST_CONFIG, withConn, testPool, TEST_TIMEOUT } from '../helpers/db.ts'
 
 const K = `repl_${process.pid}`
@@ -556,11 +556,19 @@ describe('replication()', () => {
           const slot = await repl.createSlot(`${K}_idleslot`, { temporary: true })
           const ac = new AbortController()
           setTimeout(() => ac.abort(), 6500)
-          const events = await collectUntil(
-            repl.start({ slot: slot.slot, publications: [`${K}_idlepub`], statusIntervalMs: 30_000, receiveTimeoutMs: 5000, signal: ac.signal }),
-            () => false,
-          )
-          expect(events.length).toBe(0)
+          // PG 14 does not skip empty transactions, so a concurrent transaction anywhere in the
+          // database puts a begin/commit pair on this slot — count timeouts, not events.
+          let timedOut = false
+          try {
+            await collectUntil(
+              repl.start({ slot: slot.slot, publications: [`${K}_idlepub`], statusIntervalMs: 30_000, receiveTimeoutMs: 5000, signal: ac.signal }),
+              () => false,
+            )
+          } catch (e) {
+            if (e instanceof ReplicationReceiveTimeout) timedOut = true
+            else throw e
+          }
+          expect(timedOut).toBe(false)
         } finally { repl.end() }
       } finally {
         await c.query(`drop publication ${K}_idlepub`)
