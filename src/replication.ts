@@ -549,7 +549,7 @@ export class ReplicationConnection {
         // instead of its own results (identify() right after a slot-conflict start() otherwise
         // sees an empty reply)
         if (m.type === 'E') { setupErr = new PgError(parseErrorFields(m.body)); continue }
-        if (m.type === 'Z') { if (setupErr) throw setupErr; break }
+        if (m.type === 'Z') { throw setupErr ?? new Error('minipg: START_REPLICATION returned no CopyBothResponse') }
       }
       // START_REPLICATION accepted (CopyBothResponse): the slot is active server-side NOW. This is the
       // "streaming established" moment start()'s laziness otherwise hides — a slot-conflict PgError above
