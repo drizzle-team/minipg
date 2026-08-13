@@ -202,12 +202,12 @@ export class InvalidSlotName extends Error {
 }
 const checkSlot = (s: string): string => { if (!SLOT_NAME.test(s)) throw new InvalidSlotName(s); return s }
 
-/** command() was called while a start() stream is active. Both would drain the same message
- *  queue, so a command sent mid-stream would eat CopyData frames the stream is waiting on.
+/** command() or a second start() was called while a start() stream is active. Both would drain the
+ *  same message queue, so either one would eat CopyData frames the live stream is waiting on.
  *  Finish the stream (break/return the iterator) or end() the connection, then retry. */
 export class ReplicationBusy extends Error {
   readonly reason = 'streaming' as const
-  constructor() { super('minipg: command() called while a start() stream is active — finish the stream (break/return the iterator) or end() the connection first') }
+  constructor() { super('minipg: a start() stream is already active on this connection — finish the stream (break/return the iterator) or end() the connection before another start() or command()') }
 }
 
 /** A named publication in start()'s publications list does not exist right now — caught by an
@@ -470,6 +470,9 @@ export class ReplicationConnection {
   get binaryTuples(): boolean { return this.binaryMode }
 
   async *start(opts: StartOptions): AsyncGenerator<ReplicationEvent> {
+    // before ANY state mutation: shaped/relations/maxQueue below belong to the live stream, and
+    // clearing them mid-flight desyncs its decode long before a probe round trip could reject
+    if (this.streaming) throw new ReplicationBusy()
     checkSlot(opts.slot) // lazy by construction: an async generator's body runs on the first next(), so nothing is sent before this
     const mqb = opts.maxQueueBytes ?? 64 * 1024 * 1024
     this.maxQueue = Number.isFinite(mqb) && mqb > 0 ? mqb : mqb === Infinity ? Infinity : 64 * 1024 * 1024
