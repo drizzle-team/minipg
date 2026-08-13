@@ -26,8 +26,6 @@ const copyBoth = () => frame('W', Buffer.from([0, 0, 0]))
 const xlogData = (payload: Buffer) => frame('d', Buffer.concat([Buffer.from('w', 'latin1'), i64zero, i64zero, i64zero, payload]))
 const keepalive = (reply = 0) => frame('d', Buffer.concat([Buffer.from('k', 'latin1'), i64zero, i64zero, Buffer.from([reply])]))
 const pgBegin = () => xlogData(Buffer.concat([Buffer.from('B', 'latin1'), i64zero, i64zero, i32(1)]))
-// unused by this plan's tests — kept for 02-02 (backpressure) and 02-03 (publication probe) to extend
-void keepalive; void pgBegin
 
 /** An in-process fake walsender: authenticates unconditionally, then answers each simple-protocol
  *  'Q' via onQuery (default: START_REPLICATION -> CopyBothResponse, else -> ReadyForQuery). */
@@ -173,4 +171,44 @@ test('keepAlive: a socket lacking setKeepAlive never throws connect()', async ()
   const backend = fakeBackend()
   const repl = await replication(cfg({ socket: backend.socket, keepAlive: true }))
   repl.end()
+})
+
+test('backpressure: pauses the socket at the ceiling, resumes at half, no timeout or heartbeat loss while paused', async () => {
+  const backend = fakeBackend({
+    onQuery: (sql) => (sql.startsWith('START_REPLICATION') ? [copyBoth(), pgBegin()] : [ready()]),
+  })
+  const repl = await replication(cfg({ socket: backend.socket }))
+  try {
+    const pauseCalls: number[] = []
+    const resumeCalls: number[] = []
+    // wrap, don't replace: Duplex.pause()/resume() also drive the stream's own flowing state — a
+    // pure spy that skips the real implementation would starve the 'data' listener entirely.
+    // Wrapped only after connect() so the listener attachment's own implicit resume() (unrelated
+    // to our backpressure logic) isn't counted as a call.
+    const origPause = backend.dx.pause.bind(backend.dx)
+    const origResume = backend.dx.resume.bind(backend.dx)
+    ;(backend.dx as unknown as { pause: () => void }).pause = () => { pauseCalls.push(pauseCalls.length); origPause() }
+    ;(backend.dx as unknown as { resume: () => void }).resume = () => { resumeCalls.push(resumeCalls.length); origResume() }
+    const gen = repl.start({ slot: 'repl_1_ok', publications: ['pub'], maxQueueBytes: 512, statusIntervalMs: 50, receiveTimeoutMs: 200 })
+    const r1 = await gen.next() // event 1 — takes it, then stalls (no pending next())
+    expect(r1.done).toBe(false)
+    expect(r1.value.kind).toBe('begin')
+    expect(pauseCalls.length).toBe(0)
+
+    // fake floods keepalives (no yield) well past the ceiling while the generator is suspended at
+    // the yield — frames accumulate in the queue with nobody pulling
+    for (let i = 0; i < 60; i++) backend.dx.push(keepalive(0))
+    await Bun.sleep(50)
+    expect(pauseCalls.length).toBeGreaterThan(0)
+    expect(resumeCalls.length).toBe(0)
+
+    await Bun.sleep(600) // paused stall — receiveTimeoutMs: 200 must not fire; the status heartbeat must keep writing
+    expect(backend.sent.some((b) => b[0] === 0x72)).toBe(true) // 'r' standby-status frame recorded during the pause
+
+    backend.dx.push(pgBegin()) // event 2 — queued behind the flooded keepalives
+    const r2 = await gen.next() // drains the keepalives internally (no yield), resumes below half, then yields event 2
+    expect(r2.done).toBe(false)
+    expect(r2.value.kind).toBe('begin') // arrival order preserved: begin, begin
+    expect(resumeCalls.length).toBeGreaterThan(0)
+  } finally { repl.end() }
 })

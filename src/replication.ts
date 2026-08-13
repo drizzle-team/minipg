@@ -126,6 +126,14 @@ export interface StartOptions {
    *  or below wal_sender_timeout can false-fire on a genuinely healthy, fully idle stream. Size
    *  it comfortably above wal_sender_timeout. */
   receiveTimeoutMs?: number
+  /** Ceiling on buffered-but-undelivered message bytes before the socket is paused (resumed once
+   *  the queue drains below half) — bounds memory when the consumer stops reading. Default 64 MiB;
+   *  `Infinity` disables the ceiling; zero, negative, and non-finite values fall back to the
+   *  default, so a misconfigured value can never leave the socket paused forever. Counts each
+   *  message's body length only — the parser hands out those bodies as views into the socket's
+   *  accumulated read buffer, so one retained message pins its whole source chunk and real
+   *  retention runs higher; the ceiling exists to stop unbounded growth, not measure it exactly. */
+  maxQueueBytes?: number
   /** BINARY tuple values (PG14+ pgoutput option). Default 'auto': enabled when the server is 14+
    *  AND the driver can binary-decode every published column and every shaped target (one
    *  pre-start catalog probe — a capability check, nothing more). Under binary, arrays decode to
@@ -220,6 +228,8 @@ export class ReplicationConnection {
   private serverMajor = 0       // from the server_version ParameterStatus at startup
   private lastMessageAt = 0     // stamped on every raw socket read — the receiveTimeoutMs liveness clock
   private qPaused = false       // set by maxQueueBytes backpressure; a paused socket has no liveness signal to offer
+  private qBytes = 0            // buffered-but-undelivered message bytes — the maxQueueBytes ceiling
+  private maxQueue = Infinity   // resolved from opts.maxQueueBytes at the top of start()
   private streaming = false     // true from just before START_REPLICATION is sent until the stream ends — guards command()
   private copyOpen = false      // true once CopyBothResponse is accepted; a consumer that stops iterating without
                                  // reaching a server CopyDone leaves this true — command() exits copy mode first
@@ -306,10 +316,22 @@ export class ReplicationConnection {
     this.lastMessageAt = Date.now() // raw bytes prove liveness even when no full message parsed yet
     let msgs: RawMessage[]
     try { msgs = this.parser.push(Buffer.from(d)) } catch (e) { this.fail(e as Error); return }
-    if (msgs.length) this.q.push(...msgs)
+    if (msgs.length) {
+      this.q.push(...msgs)
+      for (const m of msgs) this.qBytes += m.body.length + 5 // +5 = the type byte + int32 length the parser strips
+      if (this.qBytes > this.maxQueue && !this.qPaused) {
+        this.qPaused = true
+        try { (this.socket as unknown as { pause?: () => void } | null)?.pause?.() } catch { /* */ }
+      }
+    }
     const w = this.wake; this.wake = null; w?.()
   }
   private fail(e: Error): void { this.err ??= e; const w = this.wake; this.wake = null; w?.() }
+  private forceResume(): void {
+    if (!this.qPaused) return
+    this.qPaused = false
+    try { (this.socket as unknown as { resume?: () => void } | null)?.resume?.() } catch { /* */ }
+  }
   private param(b: Buffer): void { // ParameterStatus: name\0value\0 — we only care about the version
     let z = 0; while (b[z] !== 0) z++
     if (b.toString('latin1', 0, z) !== 'server_version') return
@@ -322,7 +344,11 @@ export class ReplicationConnection {
   private async next(): Promise<RawMessage | null> {
     for (;;) {
       const m = this.q.shift()
-      if (m) { if (m.type === 'S') { this.param(m.body); continue } if (m.type === 'K' || m.type === 'N' || m.type === 'A') continue; return m }
+      if (m) {
+        this.qBytes -= m.body.length + 5
+        if (this.qPaused && this.qBytes < this.maxQueue / 2) this.forceResume()
+        if (m.type === 'S') { this.param(m.body); continue } if (m.type === 'K' || m.type === 'N' || m.type === 'A') continue; return m
+      }
       if (this.err) throw this.err
       if (this.ended) return null
       await new Promise<void>((r) => { this.wake = r })
@@ -416,6 +442,8 @@ export class ReplicationConnection {
 
   async *start(opts: StartOptions): AsyncGenerator<ReplicationEvent> {
     checkSlot(opts.slot) // lazy by construction: an async generator's body runs on the first next(), so nothing is sent before this
+    const mqb = opts.maxQueueBytes ?? 64 * 1024 * 1024
+    this.maxQueue = Number.isFinite(mqb) && mqb > 0 ? mqb : mqb === Infinity ? Infinity : 64 * 1024 * 1024
     const onAbort = (): void => this.end()
     if (opts.signal) { if (opts.signal.aborted) return; opts.signal.addEventListener('abort', onAbort, { once: true }) }
     const from = opts.from !== undefined ? toLsn(opts.from) : 0n
@@ -518,6 +546,11 @@ export class ReplicationConnection {
       }
     } finally {
       this.streaming = false
+      this.forceResume()
+      // reset BOTH — maxQueue alone would leave a residual byte count from this stream biasing
+      // the next start() on this same connection's first pause decision
+      this.maxQueue = Infinity
+      this.qBytes = 0
       if (status) clearInterval(status)
       if (recv) clearInterval(recv)
       opts.signal?.removeEventListener('abort', onAbort)
@@ -657,6 +690,7 @@ export class ReplicationConnection {
 
   end(): void {
     this.ended = true
+    this.forceResume() // a paused socket left paused after the stream ends would never drain
     try { this.socket?.write(W.terminate()) } catch { /* */ }
     try { this.socket?.end() } catch { /* */ }
     const w = this.wake; this.wake = null; w?.() // wake a parked next() so an in-flight start() iterator finishes NOW
