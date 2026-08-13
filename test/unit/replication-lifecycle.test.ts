@@ -5,7 +5,7 @@
 import { test, expect } from 'bun:test'
 import { Duplex } from 'node:stream'
 import { frame } from '../helpers/wire.ts'
-import { replication, ReplicationReceiveTimeout, InvalidSlotName, PublicationEmpty, type ReplicationConfig } from '../../src/index.ts'
+import { replication, ReplicationReceiveTimeout, InvalidSlotName, PublicationEmpty, PublicationMissing, type ReplicationConfig } from '../../src/index.ts'
 
 const i32 = (n: number) => { const b = Buffer.allocUnsafe(4); b.writeInt32BE(n); return b }
 const u16 = (n: number) => { const b = Buffer.allocUnsafe(2); b.writeUInt16BE(n); return b }
@@ -232,6 +232,27 @@ test('publication: an empty publications array rejects before any round trip', a
     await expect(gen.next()).rejects.toThrow(PublicationEmpty)
     expect(backend.queries.some((q) => q.includes('pg_publication'))).toBe(false)
     expect(backend.queries.some((q) => q.startsWith('START_REPLICATION'))).toBe(false)
+  } finally { repl.end() }
+})
+
+test('abort signal: a start() that fails before streaming leaves no listener on the consumer signal', async () => {
+  const backend = fakeBackend({
+    onQuery(sql) {
+      if (sql.includes('pg_publication')) {
+        const names = [...sql.matchAll(/'([^']*)'/g)].map((m) => m[1]!)
+        return [rowDesc([{ name: 'name', oid: 25 }, { name: 'present', oid: 25 }, { name: 'tables', oid: 25 }]),
+          ...names.map((n) => dataRow([n, 'f', '0'])), ready()]
+      }
+      return [ready()]
+    },
+  })
+  const repl = await replication(cfg({ socket: backend.socket }))
+  try {
+    const ac = new AbortController() // the shared-controller case: one abort must not kill a connection a later start() owns
+    await expect(repl.start({ slot: 'repl_1_ok', publications: ['gone'], signal: ac.signal }).next()).rejects.toThrow(PublicationMissing)
+    ac.abort()
+    await Bun.sleep(10)
+    await repl.command('select 1') // a leaked listener would have end()ed the connection, and this would throw
   } finally { repl.end() }
 })
 

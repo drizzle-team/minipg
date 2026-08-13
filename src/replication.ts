@@ -490,10 +490,7 @@ export class ReplicationConnection {
     // clearing them mid-flight desyncs its decode long before a probe round trip could reject
     if (this.streaming) throw new ReplicationBusy()
     checkSlot(opts.slot) // lazy by construction: an async generator's body runs on the first next(), so nothing is sent before this
-    const mqb = opts.maxQueueBytes ?? 64 * 1024 * 1024
-    this.maxQueue = Number.isFinite(mqb) && mqb > 0 ? mqb : mqb === Infinity ? Infinity : 64 * 1024 * 1024
-    const onAbort = (): void => this.end()
-    if (opts.signal) { if (opts.signal.aborted) return; opts.signal.addEventListener('abort', onAbort, { once: true }) }
+    if (opts.signal?.aborted) return
     const from = opts.from !== undefined ? toLsn(opts.from) : 0n
     const pubs = opts.publications.map((p) => `"${p.replace(/"/g, '""')}"`).join(',')
     this.shaped.clear()
@@ -545,6 +542,14 @@ export class ReplicationConnection {
         && [...this.shaped.values()].every(({ cols }) => cols.every((c) => c.oid === 0 || replBinaryForCol(c, this.decoders) !== null))
     }
     this.binaryMode = bin
+    // as late as possible, and only once nothing above can still throw: an abort listener left on
+    // the consumer's signal by a failed start() would end a connection they went on to re-start(),
+    // and a stale ceiling would govern this connection's plain command() traffic
+    if (opts.signal?.aborted) return
+    const mqb = opts.maxQueueBytes ?? 64 * 1024 * 1024
+    this.maxQueue = Number.isFinite(mqb) && mqb > 0 ? mqb : mqb === Infinity ? Infinity : 64 * 1024 * 1024
+    const onAbort = (): void => this.end()
+    opts.signal?.addEventListener('abort', onAbort, { once: true })
     const sql = `START_REPLICATION SLOT ${opts.slot} LOGICAL ${lsnToString(from)} (proto_version '1', publication_names '${pubs}'${opts.messages === false ? '' : ", messages 'true'"}${bin ? ", binary 'true'" : ''})`
     // set BEFORE the frame write, with the try opened right after: command() must stay guarded
     // across the setup handshake too, and cleared on every exit including a setup-loop PgError
