@@ -148,7 +148,8 @@ export interface StartOptions {
    *  defineType()/geometry markers) — simply keeps the whole stream on text: auto never crashes.
    *  `true` forces binary; an undecodable column then errors loudly naming table.column.
    *  `false` = text. Caveat under 'auto'/'true': DDL AFTER the stream starts isn't re-probed — a
-   *  new column of an undecodable type errors on its first binary value. */
+   *  new column of an undecodable type errors when it is announced (the Relation message), not
+   *  deferred to its first value. */
   binary?: boolean | 'auto'
   /** When idle with nothing unacked, advance the flushed LSN to the server's keepalive
    *  position so an idle slot doesn't retain WAL forever (default true). */
@@ -648,7 +649,11 @@ export class ReplicationConnection {
       }
       return { row, unchanged }
     }
-    const rel = (id: number): RelEntry => this.relations.get(id) ?? { info: { schema: '?', table: `?${id}`, replicaIdentity: 'd', columns: [] }, names: [], decoders: [], bin: null }
+    const rel = (id: number): RelEntry => {
+      const r = this.relations.get(id)
+      if (!r) throw new Error(`minipg: unannounced relation ${id} — no Relation message was received for it (protocol desync)`)
+      return r
+    }
     switch (tag) {
       case 'B': return { kind: 'begin', finalLsn: lsnToString(b.readBigUInt64BE(1)), commitTime: ts(b.readBigUInt64BE(9) ), commitTimeUs: tsUs(b.readBigUInt64BE(9)), xid: b.readInt32BE(17) }
       case 'C': return { kind: 'commit', lsn: lsnToString(b.readBigUInt64BE(2)), endLsn: lsnToString(b.readBigUInt64BE(10)), commitTime: ts(b.readBigUInt64BE(18)), commitTimeUs: tsUs(b.readBigUInt64BE(18)) }
@@ -734,6 +739,10 @@ export class ReplicationConnection {
       const d = sc.oid === 0 && !sc.json ? replBinaryFor(c.oid, this.decoders) : replBinaryForCol(sc, this.decoders)
       return d && sc.xform ? xf(d, sc.xform) : d
     }) : null
+    if (bin) {
+      const i = bin.findIndex((d) => d === null)
+      if (i >= 0) throw new Error(`minipg: binary tuple value for ${info.schema}.${info.table}.${names[i]} (oid ${info.columns[i]?.oid}) has no binary decoder for its declared/default decode — start() without binary:true, use a binary-capable shape target, or override config.types for this type`)
+    }
     return { info, names, decoders, bin }
   }
 

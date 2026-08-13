@@ -241,3 +241,20 @@ test('publication: an empty publications array warns once and skips the probe qu
   repl.end()
   await pending
 })
+
+test('unannounced: an Insert for a relid with no preceding Relation message throws instead of yielding fabricated keys', async () => {
+  const insertNoRel = () => xlogData(Buffer.concat([Buffer.from('I', 'latin1'), i32(999), Buffer.from('N', 'latin1'), u16(0)]))
+  const backend = fakeBackend({
+    onQuery: (sql) => (sql.startsWith('START_REPLICATION') ? [copyBoth(), insertNoRel()] : [ready()]),
+  })
+  const repl = await replication(cfg({ socket: backend.socket }))
+  try {
+    const gen = repl.start({ slot: 'repl_1_ok', publications: ['pub'] })
+    let err: unknown
+    try { await gen.next() } catch (e) { err = e }
+    expect(err).toBeInstanceOf(Error)
+    const msg = (err as Error).message
+    expect(msg).toContain('unannounced relation')
+    expect(msg).toContain('999')
+  } finally { repl.end() }
+})

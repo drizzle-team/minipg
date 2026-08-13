@@ -697,6 +697,42 @@ describe('replication()', () => {
       }
     })
   }, TEST_TIMEOUT)
+
+  test('announce: a mid-stream DDL adding an undecodable-binary column fails at the Relation re-announce, not on first value', async () => {
+    await withConn(async (c) => {
+      await c.query(`create table ${K}_ann(id int4 primary key, n int4)`)
+      await c.query(`create publication ${K}_annpub for table ${K}_ann`)
+      try {
+        const repl = await replication(TEST_CONFIG)
+        try {
+          const slot = await repl.createSlot(`${K}_annslot`, { temporary: true })
+          await c.query(`insert into ${K}_ann values (1, 10)`)
+          const gen = repl.start({ slot: slot.slot, publications: [`${K}_annpub`], binary: true })
+          let r = await gen.next()
+          while (!r.done && r.value.kind !== 'commit') r = await gen.next()
+          expect(r.done).toBe(false)
+          expect(repl.binaryTuples).toBe(true)
+
+          await c.query(`alter table ${K}_ann add column iv interval`) // interval: no binary decoder
+          await c.query(`insert into ${K}_ann values (2, 20, interval '1 day')`)
+          // the ALTER's own DDL transaction commits first with no data changes (begin/commit, no
+          // relation/insert) — the Relation re-announce lives in the FOLLOWING transaction
+          let err: unknown
+          let commits = 0
+          try {
+            while (commits < 2 && !r.done) { r = await gen.next(); if (!r.done && r.value.kind === 'commit') commits++ }
+          } catch (e) { err = e }
+          expect(err).toBeInstanceOf(Error)
+          const msg = (err as Error).message
+          expect(msg).toMatch(/no binary decoder/)
+          expect(msg).toContain(`${K}_ann.iv`)
+        } finally { repl.end() }
+      } finally {
+        await c.query(`drop publication ${K}_annpub`)
+        await c.query(`drop table ${K}_ann`)
+      }
+    })
+  }, TEST_TIMEOUT)
 })
 
 // keep the import used even if helpers change
