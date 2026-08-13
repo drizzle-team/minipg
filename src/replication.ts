@@ -68,7 +68,16 @@ export type ReplicationEvent =
   | { kind: 'relation'; relation: ReplicationRelation } // schema (re-)announced — fires again on DDL changes
 
 export type ReplicationConfig = Pick<ConnectConfig,
-  'url' | 'host' | 'port' | 'user' | 'password' | 'database' | 'ssl' | 'path' | 'socket' | 'applicationName' | 'connectTimeout' | 'types' | 'jsonBigints' | 'options' | 'channelBinding'>
+  'url' | 'host' | 'port' | 'user' | 'password' | 'database' | 'ssl' | 'path' | 'socket' | 'applicationName' | 'connectTimeout' | 'types' | 'jsonBigints' | 'options' | 'channelBinding'> & {
+  /** Enable TCP keepalive (SO_KEEPALIVE) on the underlying socket — a liveness signal independent
+   *  of receiveTimeoutMs. `true` uses the OS default initial delay; the object form sets it
+   *  explicitly. Applied as an explicit setKeepAlive() call after connect rather than a
+   *  tls.connect() option, because tls.connect() silently drops keepalive options
+   *  (nodejs/node#62003). A no-op on unix-socket (`path`) connections and on custom `socket`
+   *  transports that don't expose setKeepAlive (web-stream/CF/Deno) — TCP keepalive is a
+   *  property of the TCP socket, which those transports don't have one of. */
+  keepAlive?: boolean | { initialDelayMs?: number }
+}
 
 /** One table's declared decode shape for `start({ shapes })`. An ARRAY of these (not a keyed
  *  object) so schema/table names containing dots or quotes never need escaping. */
@@ -160,6 +169,19 @@ export class ReplicationReceiveTimeout extends Error {
   constructor(readonly ms: number) { super(`minipg: no message received for ${ms}ms (receiveTimeoutMs) — the connection is presumed dead; reconnect, or raise receiveTimeoutMs relative to the server's wal_sender_timeout`) }
 }
 
+// Postgres restricts slot names to [a-z0-9_]{1,63} (ReplicationSlotValidateName) so the name can
+// double as a directory name on every supported OS. Rejecting beats escaping — there is no escape
+// form the walsender grammar accepts for a name outside that set.
+const SLOT_NAME = /^[a-z0-9_]{1,63}$/
+
+/** A replication slot name outside Postgres's allowed set ([a-z0-9_], 1-63 chars) — rejected
+ *  before any CREATE_REPLICATION_SLOT / DROP_REPLICATION_SLOT / START_REPLICATION command is sent. */
+export class InvalidSlotName extends Error {
+  readonly reason = 'invalid-slot-name' as const
+  constructor(readonly slot: string) { super(`minipg: invalid replication slot name ${JSON.stringify(slot)} — Postgres allows only lower-case letters, digits and underscore, 1 to 63 characters`) }
+}
+const checkSlot = (s: string): string => { if (!SLOT_NAME.test(s)) throw new InvalidSlotName(s); return s }
+
 /** Open a logical-replication connection (walsender). One purpose per connection: this cannot
  *  run extended-protocol queries — use a normal connect() alongside it. */
 export async function replication(config: string | ReplicationConfig = {}): Promise<ReplicationConnection> {
@@ -190,6 +212,7 @@ export class ReplicationConnection {
   private serverMajor = 0       // from the server_version ParameterStatus at startup
   private lastMessageAt = 0     // stamped on every raw socket read — the receiveTimeoutMs liveness clock
   private qPaused = false       // set by maxQueueBytes backpressure; a paused socket has no liveness signal to offer
+  private keepAlive?: boolean | { initialDelayMs?: number }
 
   constructor(config: ReplicationConfig = {}) {
     const rc = resolveUrl(config)
@@ -199,6 +222,7 @@ export class ReplicationConnection {
     }
     const user = rc.user || process.env.PGUSER || process.env.USER || process.env.USERNAME || 'postgres'
     this.decoders = buildDecoders(rc.types, rc.jsonBigints)
+    this.keepAlive = rc.keepAlive
     this.cfg = {
       host: rc.host || process.env.PGHOST || 'localhost',
       port: rc.port || Number(process.env.PGPORT) || 5432,
@@ -231,6 +255,10 @@ export class ReplicationConnection {
     const timer = setTimeout(() => { ac.abort(); this.fail(new Error(`replication connect timed out after ${this.cfg.connectTimeout}ms`)) }, this.cfg.connectTimeout)
     try {
       this.socket = this.cfg.socket ? (await this.cfg.socket()) as unknown as Duplex : await transport!(this.cfg, ac.signal)
+      if (this.keepAlive) {
+        const delay = typeof this.keepAlive === 'object' ? this.keepAlive.initialDelayMs ?? 0 : 0
+        try { (this.socket as unknown as { setKeepAlive?: (e: boolean, d?: number) => unknown }).setKeepAlive?.(true, delay) } catch { /* */ }
+      }
       this.socket.on('data', (d: Buffer) => this.onData(d))
       this.socket.on('error', (e: Error) => this.fail(e))
       this.socket.on('close', () => { if (!this.ended) this.fail(this.err ?? new Error('replication connection closed unexpectedly')) })
@@ -329,6 +357,7 @@ export class ReplicationConnection {
   async createSlot(name: string, opts: { temporary?: boolean; snapshot: 'export' }): Promise<{ slot: string; consistentPoint: string; snapshot: string }>
   async createSlot(name: string, opts?: { temporary?: boolean; snapshot?: 'nothing' }): Promise<{ slot: string; consistentPoint: string; snapshot: null }>
   async createSlot(name: string, opts: { temporary?: boolean; snapshot?: 'export' | 'nothing' } = {}): Promise<{ slot: string; consistentPoint: string; snapshot: string | null }> {
+    checkSlot(name)
     const snap = opts.snapshot === 'export' ? 'EXPORT_SNAPSHOT' : 'NOEXPORT_SNAPSHOT'
     const r = await this.command(`CREATE_REPLICATION_SLOT ${name}${opts.temporary ? ' TEMPORARY' : ''} LOGICAL pgoutput ${snap}`)
     const row = Object.fromEntries(r.columns.map((c, i) => [c, r.rows[0]![i]]))
@@ -336,6 +365,7 @@ export class ReplicationConnection {
   }
 
   async dropSlot(name: string, opts: { wait?: boolean } = {}): Promise<void> {
+    checkSlot(name)
     await this.command(`DROP_REPLICATION_SLOT ${name}${opts.wait ? ' WAIT' : ''}`)
   }
 
@@ -357,6 +387,7 @@ export class ReplicationConnection {
   get binaryTuples(): boolean { return this.binaryMode }
 
   async *start(opts: StartOptions): AsyncGenerator<ReplicationEvent> {
+    checkSlot(opts.slot) // lazy by construction: an async generator's body runs on the first next(), so nothing is sent before this
     const onAbort = (): void => this.end()
     if (opts.signal) { if (opts.signal.aborted) return; opts.signal.addEventListener('abort', onAbort, { once: true }) }
     const from = opts.from !== undefined ? toLsn(opts.from) : 0n
