@@ -109,6 +109,14 @@ export interface StartOptions {
   messages?: boolean
   /** Standby-status heartbeat interval, ms (default 10_000). */
   statusIntervalMs?: number
+  /** Fail the stream if no message (including keepalives) arrives for this many ms — a
+   *  black-holed TCP connection otherwise parks forever. Off by default; undefined, zero, and
+   *  negative all disarm it. The server's wal_sender_timeout (default 60s) pings the client at
+   *  half that interval once it has gone quiet, but the client's OWN status updates
+   *  (statusIntervalMs) postpone that ping, so there is no fixed cadence to rely on — a value at
+   *  or below wal_sender_timeout can false-fire on a genuinely healthy, fully idle stream. Size
+   *  it comfortably above wal_sender_timeout. */
+  receiveTimeoutMs?: number
   /** BINARY tuple values (PG14+ pgoutput option). Default 'auto': enabled when the server is 14+
    *  AND the driver can binary-decode every published column and every shaped target (one
    *  pre-start catalog probe — a capability check, nothing more). Under binary, arrays decode to
@@ -144,6 +152,14 @@ export class ReplicationStreamEnded extends Error {
   constructor() { super('minipg: server ended the replication stream (CopyDone) — start() again or reconnect to resume') }
 }
 
+/** No message — not even a keepalive — arrived for `receiveTimeoutMs`: the connection is presumed
+ *  dead. The slot keeps retaining WAL, so nothing is lost; reconnect and start() again. If this
+ *  fires on a healthy link, raise receiveTimeoutMs relative to the server's wal_sender_timeout. */
+export class ReplicationReceiveTimeout extends Error {
+  readonly reason = 'receive-timeout' as const
+  constructor(readonly ms: number) { super(`minipg: no message received for ${ms}ms (receiveTimeoutMs) — the connection is presumed dead; reconnect, or raise receiveTimeoutMs relative to the server's wal_sender_timeout`) }
+}
+
 /** Open a logical-replication connection (walsender). One purpose per connection: this cannot
  *  run extended-protocol queries — use a normal connect() alongside it. */
 export async function replication(config: string | ReplicationConfig = {}): Promise<ReplicationConnection> {
@@ -172,6 +188,8 @@ export class ReplicationConnection {
   private lastDeliveredStart = 0n // that same commit's lsn — ack() normalizes values inside [start, end)
   private binaryMode = false    // resolved binary decision for the active start() stream
   private serverMajor = 0       // from the server_version ParameterStatus at startup
+  private lastMessageAt = 0     // stamped on every raw socket read — the receiveTimeoutMs liveness clock
+  private qPaused = false       // set by maxQueueBytes backpressure; a paused socket has no liveness signal to offer
 
   constructor(config: ReplicationConfig = {}) {
     const rc = resolveUrl(config)
@@ -246,6 +264,7 @@ export class ReplicationConnection {
   }
 
   private onData(d: Buffer): void {
+    this.lastMessageAt = Date.now() // raw bytes prove liveness even when no full message parsed yet
     let msgs: RawMessage[]
     try { msgs = this.parser.push(Buffer.from(d)) } catch (e) { this.fail(e as Error); return }
     if (msgs.length) this.q.push(...msgs)
@@ -385,6 +404,14 @@ export class ReplicationConnection {
     opts.onReady?.()
     const idleAck = opts.idleAck !== false
     const status = setInterval(() => this.sendStatus(), opts.statusIntervalMs ?? 10_000)
+    this.lastMessageAt = Date.now()
+    const recvMs = opts.receiveTimeoutMs ?? 0
+    const recv = recvMs > 0
+      ? setInterval(() => {
+          if (this.qPaused) { this.lastMessageAt = Date.now(); return } // a paused socket has no liveness signal to offer
+          if (Date.now() - this.lastMessageAt >= recvMs) this.fail(new ReplicationReceiveTimeout(recvMs))
+        }, Math.max(250, Math.min(recvMs / 2, 5_000)))
+      : null
     try {
       for (;;) {
         const m = await this.next()
@@ -416,7 +443,7 @@ export class ReplicationConnection {
           yield e
         }
       }
-    } finally { clearInterval(status); opts.signal?.removeEventListener('abort', onAbort) }
+    } finally { clearInterval(status); if (recv) clearInterval(recv); opts.signal?.removeEventListener('abort', onAbort) }
   }
 
   private sendStatus(): void {

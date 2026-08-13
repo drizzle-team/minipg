@@ -545,6 +545,29 @@ describe('replication()', () => {
       }
     })
   }, TEST_TIMEOUT)
+
+  test('start(): a healthy idle stream with server keepalives does NOT trip a 5s receive timeout (idle)', async () => {
+    await withConn(async (c) => {
+      await c.query(`create table ${K}_idle(id int4 primary key)`)
+      await c.query(`create publication ${K}_idlepub for table ${K}_idle`)
+      try {
+        const repl = await replication({ ...TEST_CONFIG, options: '-c wal_sender_timeout=2000' })
+        try {
+          const slot = await repl.createSlot(`${K}_idleslot`, { temporary: true })
+          const ac = new AbortController()
+          setTimeout(() => ac.abort(), 6500)
+          const events = await collectUntil(
+            repl.start({ slot: slot.slot, publications: [`${K}_idlepub`], statusIntervalMs: 30_000, receiveTimeoutMs: 5000, signal: ac.signal }),
+            () => false,
+          )
+          expect(events.length).toBe(0)
+        } finally { repl.end() }
+      } finally {
+        await c.query(`drop publication ${K}_idlepub`)
+        await c.query(`drop table ${K}_idle`)
+      }
+    })
+  }, 10_000)
 })
 
 // keep the import used even if helpers change
