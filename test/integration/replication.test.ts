@@ -1,7 +1,7 @@
 // replication(): logical replication over the real auth/transport stack (TCP + SCRAM here).
 // Requires the local cluster with wal_level=logical (test/setup-pg.sh cluster, reconfigured).
 import { test, expect, describe } from 'bun:test'
-import { replication, connect, defineType, Jsonb, Collect, Transform, ReplicationStreamEnded, ReplicationBusy, PublicationMissing, PublicationEmpty, PgError, type ReplicationEvent, type TableShape } from '../../src/index.ts'
+import { replication, connect, defineType, Jsonb, Collect, Transform, ReplicationStreamEnded, ReplicationBusy, PublicationMissing, PublicationEmpty, PgError, type ReplicationEvent, type ReplicationWarning, type TableShape } from '../../src/index.ts'
 import { TEST_CONFIG, withConn, testPool, TEST_TIMEOUT } from '../helpers/db.ts'
 
 const K = `repl_${process.pid}`
@@ -602,9 +602,8 @@ describe('replication()', () => {
 
   test('command(): a failed start() setup clears the streaming flag — identify() works after', async () => {
     await withConn(async (c) => {
-      // an existing, non-empty publication so the probe passes through to the bad-slot rejection this test is about
-      await c.query(`create table ${K}_nosuch(id int4 primary key)`)
-      await c.query(`create publication ${K}_nosuchpub for table ${K}_nosuch`)
+      // an existing (empty) publication so the probe passes through to the bad-slot rejection this test is about
+      await c.query(`create publication ${K}_nosuchpub`)
       try {
         const repl2 = await replication(TEST_CONFIG)
         try {
@@ -615,7 +614,6 @@ describe('replication()', () => {
         } finally { repl2.end() }
       } finally {
         await c.query(`drop publication ${K}_nosuchpub`)
-        await c.query(`drop table ${K}_nosuch`)
       }
     })
   }, TEST_TIMEOUT)
@@ -633,32 +631,42 @@ describe('replication()', () => {
     } finally { repl.end() }
   }, TEST_TIMEOUT)
 
-  test('publication: a tableless publication and an empty list both reject with PublicationEmpty; a normal one starts', async () => {
+  test('publication: an empty list rejects; a tableless publication warns, streams, and picks up a table added after start()', async () => {
     await withConn(async (c) => {
       await c.query(`create publication ${K}_emptypub`) // no FOR clause -> valid, publishes zero tables
       try {
         const repl = await replication(TEST_CONFIG)
         try {
           const slot = await repl.createSlot(`${K}_emptyslot`, { temporary: true })
-          let err: unknown
-          try { await repl.start({ slot: slot.slot, publications: [`${K}_emptypub`] }).next() } catch (e) { err = e }
-          expect(err).toBeInstanceOf(PublicationEmpty)
-          expect((err as PublicationEmpty).reason).toBe('publication-empty')
-          expect((err as PublicationEmpty).publications).toEqual([`${K}_emptypub`])
 
-          // an empty list can't even be sent: pgoutput rejects publication_names '' as missing, and
+          // an empty list can't be sent at all: pgoutput reads publication_names '' as absent, and
           // the binary capability probe would emit `pubname in ()` first
-          let err2: unknown
-          try { await repl.start({ slot: slot.slot, publications: [] }).next() } catch (e) { err2 = e }
-          expect(err2).toBeInstanceOf(PublicationEmpty)
-          expect((err2 as PublicationEmpty).publications).toEqual([])
-
-          // the rejections leave the connection usable — nothing was written to the walsender
-          const sys = await repl.identify()
+          let err: unknown
+          try { await repl.start({ slot: slot.slot, publications: [] }).next() } catch (e) { err = e }
+          expect(err).toBeInstanceOf(PublicationEmpty)
+          expect((err as PublicationEmpty).reason).toBe('publications-empty')
+          const sys = await repl.identify() // rejected before anything reached the walsender
           expect(sys.timeline).toBeGreaterThan(0)
+
+          const warnings: ReplicationWarning[] = []
+          const gen = repl.start({ slot: slot.slot, publications: [`${K}_emptypub`], onWarning: (w) => warnings.push(w) })
+          const first = gen.next() // establishes the stream; nothing to deliver yet
+          await Bun.sleep(50)
+          expect(warnings).toEqual([{ kind: 'publication-empty', publication: `${K}_emptypub`, message: expect.any(String) }])
+
+          // the point of warning instead of throwing: a table added afterwards reaches this stream
+          await c.query(`create table ${K}_late(id int4 primary key)`)
+          await c.query(`alter publication ${K}_emptypub add table ${K}_late`)
+          await c.query(`insert into ${K}_late values (7)`)
+          let ins = (await first).value as ReplicationEvent // the DDL transaction commits first, with no data changes
+          for await (const e of gen) { ins = e; if (e.kind === 'insert') break }
+          expect(ins.kind).toBe('insert')
+          expect((ins as Extract<ReplicationEvent, { kind: 'insert' }>).table).toBe(`${K}_late`)
+          expect((ins as Extract<ReplicationEvent, { kind: 'insert' }>).new.id).toBe(7)
         } finally { repl.end() }
       } finally {
         await c.query(`drop publication ${K}_emptypub`)
+        await c.query(`drop table if exists ${K}_late`)
       }
 
       await c.query(`create table ${K}_normal(id int4 primary key)`)
@@ -667,14 +675,14 @@ describe('replication()', () => {
         const repl2 = await replication(TEST_CONFIG)
         try {
           const slot2 = await repl2.createSlot(`${K}_normalslot`, { temporary: true })
-          let ready2 = false
+          const warnings2: ReplicationWarning[] = []
           const ac2 = new AbortController()
           const gen2 = repl2.start({
             slot: slot2.slot, publications: [`${K}_normalpub`],
-            onReady: () => { ready2 = true; ac2.abort() }, signal: ac2.signal,
+            onWarning: (w) => warnings2.push(w), onReady: () => ac2.abort(), signal: ac2.signal,
           })
           await collectUntil(gen2, () => false)
-          expect(ready2).toBe(true)
+          expect(warnings2.length).toBe(0) // a publication with tables never warns
         } finally { repl2.end() }
       } finally {
         await c.query(`drop publication ${K}_normalpub`)
@@ -706,7 +714,7 @@ describe('replication()', () => {
     })
   }, TEST_TIMEOUT)
 
-  test('publication: FOR ALL TABLES over a non-empty database is never read as empty (pins pg_publication_tables expansion)', async () => {
+  test('publication: FOR ALL TABLES over a non-empty database never warns empty (pins pg_publication_tables expansion)', async () => {
     await withConn(async (c) => {
       await c.query(`create table ${K}_fat(id int4 primary key)`) // create the table BEFORE the publication
       await c.query(`create publication ${K}_fatpub for all tables`)
@@ -714,14 +722,14 @@ describe('replication()', () => {
         const repl = await replication(TEST_CONFIG)
         try {
           const slot = await repl.createSlot(`${K}_fatslot`, { temporary: true })
-          let ready = false
+          const warnings: ReplicationWarning[] = []
           const ac = new AbortController()
           const gen = repl.start({
             slot: slot.slot, publications: [`${K}_fatpub`],
-            onReady: () => { ready = true; ac.abort() }, signal: ac.signal,
+            onWarning: (w) => warnings.push(w), onReady: () => ac.abort(), signal: ac.signal,
           })
           await collectUntil(gen, () => false)
-          expect(ready).toBe(true) // a false read here would reject every FOR ALL TABLES publication as empty
+          expect(warnings.length).toBe(0) // a false read here would spuriously warn every FOR ALL TABLES publication empty
         } finally { repl.end() }
       } finally {
         await c.query(`drop publication ${K}_fatpub`)
