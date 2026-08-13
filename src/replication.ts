@@ -540,7 +540,10 @@ export class ReplicationConnection {
       for (;;) {
         const m = await this.next()
         if (!m) return // end()/abort during setup — clean finish
-        if (m.type === 'W') break
+        // copy mode is open from the moment the server says so — a throw out of onReady() below
+        // must not leave the driver believing otherwise, or the next command() writes a plain 'Q'
+        // into an open CopyBoth stream and desyncs the connection
+        if (m.type === 'W') { this.copyOpen = true; break }
         // simple-protocol errors are always followed by ReadyForQuery — drain to 'Z' before
         // throwing, or the connection's next command() reads this rejection's leftover 'Z'
         // instead of its own results (identify() right after a slot-conflict start() otherwise
@@ -553,7 +556,6 @@ export class ReplicationConnection {
       // fires BEFORE this, and a throw from the callback fails this next() like any stream error.
       opts.onReady?.()
       const idleAck = opts.idleAck !== false
-      this.copyOpen = true
       status = setInterval(() => this.sendStatus(), opts.statusIntervalMs ?? 10_000)
       this.lastMessageAt = Date.now()
       const recvMs = opts.receiveTimeoutMs ?? 0
