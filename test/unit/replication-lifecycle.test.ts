@@ -5,7 +5,7 @@
 import { test, expect } from 'bun:test'
 import { Duplex } from 'node:stream'
 import { frame } from '../helpers/wire.ts'
-import { replication, ReplicationReceiveTimeout, InvalidSlotName, type ReplicationConfig } from '../../src/index.ts'
+import { replication, ReplicationReceiveTimeout, InvalidSlotName, PublicationEmpty, type ReplicationConfig } from '../../src/index.ts'
 
 const i32 = (n: number) => { const b = Buffer.allocUnsafe(4); b.writeInt32BE(n); return b }
 const u16 = (n: number) => { const b = Buffer.allocUnsafe(2); b.writeUInt16BE(n); return b }
@@ -224,22 +224,15 @@ test('backpressure: pauses the socket at the ceiling, resumes at half, no timeou
   } finally { repl.end() }
 })
 
-test('publication: an empty publications array warns once and skips the probe query entirely', async () => {
+test('publication: an empty publications array rejects before any round trip', async () => {
   const backend = fakeBackend()
   const repl = await replication(cfg({ socket: backend.socket }))
-  const warnings: unknown[] = []
-  const gen = repl.start({ slot: 'repl_1_ok', publications: [], onWarning: (w) => warnings.push(w) })
-  const pending = gen.next() // parks awaiting messages after CopyBoth — nothing else the fake sends by default
-  await Bun.sleep(50)
-  expect(warnings.length).toBe(1)
-  const w = warnings[0] as { kind: string; publication: string; message: string }
-  expect(w.kind).toBe('publication-empty')
-  expect(w.publication).toBe('')
-  expect(typeof w.message).toBe('string')
-  expect(backend.queries.some((q) => q.includes('pg_publication'))).toBe(false) // probe round trip skipped for []
-  expect(backend.queries.some((q) => q.startsWith('START_REPLICATION'))).toBe(true) // the stream still started
-  repl.end()
-  await pending
+  try {
+    const gen = repl.start({ slot: 'repl_1_ok', publications: [] })
+    await expect(gen.next()).rejects.toThrow(PublicationEmpty)
+    expect(backend.queries.some((q) => q.includes('pg_publication'))).toBe(false)
+    expect(backend.queries.some((q) => q.startsWith('START_REPLICATION'))).toBe(false)
+  } finally { repl.end() }
 })
 
 test('unannounced: an Insert for a relid with no preceding Relation message throws instead of yielding fabricated keys', async () => {

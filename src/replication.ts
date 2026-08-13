@@ -99,11 +99,13 @@ export interface TableShape {
 
 export interface StartOptions {
   slot: string
-  /** Publications to subscribe. A missing publication rejects with PublicationMissing before
+  /** Publications to subscribe. A missing publication rejects with PublicationMissing and one that
+   *  publishes no tables (including an empty list here) with PublicationEmpty, both before
    *  START_REPLICATION is written (a driver-side catalog probe — pgoutput itself only reports a
    *  missing publication lazily, and PG18 no longer reports it to the client at all). The probe
    *  only answers "does it exist NOW": a publication created after the slot can still be invisible
-   *  to the slot's historical catalog snapshot even once this check passes. */
+   *  to the slot's historical catalog snapshot even once this check passes, and a table added to a
+   *  publication after start() streams normally. */
   publications: string[]
   /** Per-table decode shapes, matched by (schema, table) when the relation is announced.
    *  Declared columns decode exactly like the same spec in a query() shape, and — like a
@@ -162,11 +164,12 @@ export interface StartOptions {
    *  this is the observable "streaming established" hook; a slot-already-active PgError fires before
    *  it, and a throw from the callback fails the stream's current next(). */
   onReady?: () => void
-  /** The library's only warning channel — non-fatal conditions detected at start() (an empty
-   *  publication, for example) that are worth surfacing but aren't errors. Called synchronously,
-   *  zero or more times, before the stream begins. Absent = the warning is simply not delivered;
-   *  minipg never writes warnings to the process streams itself. Later diagnostics reuse this
-   *  same field with new ReplicationWarning `kind` members rather than adding a second channel. */
+  /** The library's only warning channel — non-fatal conditions detected at start() that are worth
+   *  surfacing but aren't errors. Called synchronously, zero or more times, before the stream
+   *  begins; nothing currently qualifies, so today it never fires. Absent = the warning is simply
+   *  not delivered; minipg never writes warnings to the process streams itself. Later diagnostics
+   *  reuse this same field with new ReplicationWarning `kind` values rather than adding a second
+   *  channel. */
   onWarning?: (w: ReplicationWarning) => void
 }
 
@@ -222,10 +225,23 @@ export class PublicationMissing extends Error {
   }
 }
 
+/** A publication that cannot stream anything: either `publications` was empty, or a named
+ *  publication exists but publishes no tables. pgoutput refuses an empty publication_names list
+ *  outright and a tableless publication decodes nothing, so both are rejected before
+ *  START_REPLICATION rather than surfaced as a silent no-op stream. */
+export class PublicationEmpty extends Error {
+  readonly reason = 'publication-empty' as const
+  constructor(readonly publications: string[]) {
+    super(publications.length
+      ? `minipg: publication ${publications.map((p) => JSON.stringify(p)).join(', ')} exists but publishes no tables — add tables to it, or remove it from publications`
+      : 'minipg: publications is empty — pgoutput needs at least one publication to stream')
+  }
+}
+
 /** A non-fatal condition detected at start() — the library's only warning channel (see
- *  StartOptions.onWarning). A union of one member today; later phases add new `kind` values
- *  without reshaping this field. */
-export type ReplicationWarning = { kind: 'publication-empty'; publication: string; message: string }
+ *  StartOptions.onWarning). No condition currently qualifies; the shape is open so later
+ *  diagnostics add `kind` values without reshaping the field. */
+export type ReplicationWarning = { kind: string; message: string }
 
 /** Open a logical-replication connection (walsender). One purpose per connection: this cannot
  *  run extended-protocol queries — use a normal connect() alongside it. */
@@ -495,23 +511,22 @@ export class ReplicationConnection {
     // lazily (first decoded change) or not at all on PG18 (downgraded to a WARNING); see
     // PublicationMissing and StartOptions.publications for what this probe can and cannot promise.
     // Runs before this.streaming is set, so command() is still legal here.
-    if (opts.publications.length === 0) {
-      opts.onWarning?.({ kind: 'publication-empty', publication: '', message: 'minipg: publications is empty — the stream will decode no tables until at least one publication is set' })
-    } else {
-      const pubLits = opts.publications.map((p) => `'${p.replace(/'/g, "''")}'`).join(',')
-      const pubProbe = await this.command(
-        'select n.name, p.oid is not null as present, coalesce(t.cnt, 0)::text'
-        + ` from unnest(array[${pubLits}]::text[]) as n(name)`
-        + ' left join pg_publication p on p.pubname = n.name'
-        + ' left join (select pubname, count(*)::int as cnt from pg_publication_tables group by 1) t on t.pubname = n.name')
-      const missingPubs: string[] = []
-      for (const row of pubProbe.rows) {
-        const [name, present, tables] = row as [string, string, string]
-        if (present !== 't') { missingPubs.push(name); continue }
-        if (tables === '0') opts.onWarning?.({ kind: 'publication-empty', publication: name, message: `minipg: publication ${JSON.stringify(name)} exists but publishes no tables — the stream will start but deliver nothing until it does` })
-      }
-      if (missingPubs.length) throw new PublicationMissing(missingPubs)
+    if (opts.publications.length === 0) throw new PublicationEmpty([])
+    const pubLits = opts.publications.map((p) => `'${p.replace(/'/g, "''")}'`).join(',')
+    const pubProbe = await this.command(
+      'select n.name, p.oid is not null as present, coalesce(t.cnt, 0)::text'
+      + ` from unnest(array[${pubLits}]::text[]) as n(name)`
+      + ' left join pg_publication p on p.pubname = n.name'
+      + ' left join (select pubname, count(*)::int as cnt from pg_publication_tables group by 1) t on t.pubname = n.name')
+    const missingPubs: string[] = []
+    const emptyPubs: string[] = []
+    for (const row of pubProbe.rows) {
+      const [name, present, tables] = row as [string, string, string]
+      if (present !== 't') missingPubs.push(name)
+      else if (tables === '0') emptyPubs.push(name)
     }
+    if (missingPubs.length) throw new PublicationMissing(missingPubs)
+    if (emptyPubs.length) throw new PublicationEmpty(emptyPubs)
     const want = opts.binary ?? 'auto'
     let bin = want === true
     if (want === 'auto' && this.serverMajor >= 14) {
