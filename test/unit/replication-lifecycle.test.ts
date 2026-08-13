@@ -65,6 +65,8 @@ function fakeBackend(opts: { onQuery?: (sql: string) => Buffer[] } = {}) {
           const sql = body.toString('utf8', 0, z)
           queries.push(sql)
           for (const f of onQuery(sql)) dx.push(f)
+        } else if (type === 'c') {
+          dx.push(ready()) // CopyDone -> CommandComplete/ReadyForQuery, as a real walsender answers
         } else if (type === 'd' || type === 'X') {
           sent.push(Buffer.from(body))
         }
@@ -232,6 +234,42 @@ test('publication: an empty publications array rejects before any round trip', a
     await expect(gen.next()).rejects.toThrow(PublicationEmpty)
     expect(backend.queries.some((q) => q.includes('pg_publication'))).toBe(false)
     expect(backend.queries.some((q) => q.startsWith('START_REPLICATION'))).toBe(false)
+  } finally { repl.end() }
+})
+
+test('backpressure: an abandoned stream\'s undelivered frames do not loosen the next stream\'s ceiling', async () => {
+  const backend = fakeBackend({
+    onQuery(sql) {
+      if (sql.startsWith('START_REPLICATION')) return [copyBoth(), pgBegin()]
+      if (sql.includes('pg_publication')) {
+        const names = [...sql.matchAll(/'([^']*)'/g)].map((m) => m[1]!)
+        return [rowDesc([{ name: 'name', oid: 25 }, { name: 'present', oid: 25 }, { name: 'tables', oid: 25 }]),
+          ...names.map((n) => dataRow([n, 't', '1'])), ready()]
+      }
+      return [ready()]
+    },
+  })
+  const repl = await replication(cfg({ socket: backend.socket }))
+  try {
+    let pauses = 0
+    const origPause = backend.dx.pause.bind(backend.dx)
+    ;(backend.dx as unknown as { pause: () => void }).pause = () => { pauses++; origPause() }
+
+    const gen1 = repl.start({ slot: 'repl_1_ok', publications: ['pub'], maxQueueBytes: 512 })
+    await gen1.next()
+    for (let i = 0; i < 60; i++) backend.dx.push(keepalive(0)) // 60 x 23 bytes, far past the ceiling
+    await Bun.sleep(50)
+    expect(pauses).toBeGreaterThan(0)
+    await gen1.return(undefined as never) // abandon the stream with those frames still queued
+    await repl.command('select 1')        // exiting copy mode drains them, subtracting their bytes
+
+    const before = pauses
+    const gen2 = repl.start({ slot: 'repl_1_ok', publications: ['pub'], maxQueueBytes: 512 })
+    await gen2.next()
+    for (let i = 0; i < 30; i++) backend.dx.push(keepalive(0)) // 690 bytes: over the ceiling on its own
+    await Bun.sleep(50)
+    expect(pauses).toBeGreaterThan(before) // a counter left negative by the residue would not reach it
+    await gen2.return(undefined as never)
   } finally { repl.end() }
 })
 

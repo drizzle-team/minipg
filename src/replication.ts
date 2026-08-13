@@ -436,7 +436,7 @@ export class ReplicationConnection {
       else if (m.type === 'D') rows.push(parseDataRow(m.body).map((c) => (c === null ? null : c.toString('utf8'))))
       else if (m.type === 'E') err = new PgError(parseErrorFields(m.body))
       else if (m.type === 'Z') break
-      else if (m.type === 'W') { this.q.unshift(m); break } // CopyBothResponse — streaming begins
+      else if (m.type === 'W') { this.q.unshift(m); this.qBytes += m.body.length + 5; break } // CopyBothResponse — streaming begins
     }
     if (err) throw err
     return { columns, rows }
@@ -622,10 +622,11 @@ export class ReplicationConnection {
     } finally {
       this.streaming = false
       this.forceResume()
-      // reset BOTH — maxQueue alone would leave a residual byte count from this stream biasing
-      // the next start() on this same connection's first pause decision
       this.maxQueue = Infinity
-      this.qBytes = 0
+      // recount rather than zero: a consumer that stopped mid-stream leaves undelivered frames in
+      // the queue, and next() still subtracts their bytes as they drain — zeroing here drives the
+      // counter negative and loosens the next stream's ceiling by the abandoned residue
+      this.qBytes = this.q.reduce((n, m) => n + m.body.length + 5, 0)
       if (status) clearInterval(status)
       if (recv) clearInterval(recv)
       opts.signal?.removeEventListener('abort', onAbort)
