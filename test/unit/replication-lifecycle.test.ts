@@ -287,6 +287,27 @@ test('end(): stops the stream timers even when the generator is suspended at a y
   void gen
 })
 
+test('end(): resumes a socket the queue ceiling left paused', async () => {
+  const backend = fakeBackend({
+    onQuery: (sql) => (sql.startsWith('START_REPLICATION') ? [copyBoth(), pgBegin()] : [ready()]),
+  })
+  const repl = await replication(cfg({ socket: backend.socket }))
+  const resumeCalls: number[] = []
+  const origResume = backend.dx.resume.bind(backend.dx)
+  ;(backend.dx as unknown as { resume: () => void }).resume = () => { resumeCalls.push(resumeCalls.length); origResume() }
+
+  // Park at the yield so nothing drains the queue, then flood past the ceiling to trip the pause.
+  const gen = repl.start({ slot: 'repl_1_ok', publications: ['pub'], maxQueueBytes: 512, statusIntervalMs: 60_000 })
+  expect((await gen.next()).value.kind).toBe('begin')
+  for (let i = 0; i < 60; i++) backend.dx.push(keepalive(0))
+  await Bun.sleep(50)
+  expect(resumeCalls.length).toBe(0) // paused, and the suspended generator will never resume it
+
+  repl.end()
+  expect(resumeCalls.length).toBeGreaterThan(0) // end() is the only remaining path off the pause
+  void gen
+})
+
 test('abort signal: a start() that fails before streaming leaves no listener on the consumer signal', async () => {
   const backend = fakeBackend({
     onQuery(sql) {

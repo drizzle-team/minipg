@@ -406,6 +406,42 @@ describe('replication()', () => {
     })
   }, TEST_TIMEOUT)
 
+  test('command(): a real CopyDone exchange leaves the connection usable after an abandoned stream', async () => {
+    await withConn(async (c) => {
+      await c.query(`create table ${K}_xc(id int4 primary key)`)
+      await c.query(`create publication ${K}_xcpub for table ${K}_xc`)
+      try {
+        const repl = await replication(TEST_CONFIG)
+        try {
+          const slot = await repl.createSlot(`${K}_xcslot`, { temporary: true })
+          await c.query(`insert into ${K}_xc values (1)`)
+          const gen = repl.start({ slot: slot.slot, publications: [`${K}_xcpub`] })
+          // Abandon mid-stream. The generator's finally clears `streaming`, but copy mode stays
+          // open on the server — the client-side CopyDone is deferred to the next command.
+          for (;;) { const r = await gen.next(); if (r.done || (r.value as ReplicationEvent).kind === 'insert') break }
+          await gen.return(undefined as never)
+
+          // Each of these drives a REAL CopyDone/ReadyForQuery exchange with the walsender, not an
+          // injected one. Without it the plain 'Q' below lands mid-copy and the server hangs up.
+          const id = await repl.identify()
+          expect(id.timeline).toBeGreaterThan(0)
+          expect(id.dbname).toBe(TEST_CONFIG.database ?? 'testdb')
+
+          // Second command: copy mode is already closed, so this must not send another CopyDone.
+          const rows = await repl.command('IDENTIFY_SYSTEM')
+          expect(rows.rows.length).toBe(1)
+
+          // The connection is fully usable — a new stream can still start on it.
+          const slot2 = await repl.createSlot(`${K}_xcslot2`, { temporary: true })
+          expect(slot2.slot).toBe(`${K}_xcslot2`)
+        } finally { repl.end() }
+      } finally {
+        await c.query(`drop publication ${K}_xcpub`)
+        await c.query(`drop table ${K}_xc`)
+      }
+    })
+  }, TEST_TIMEOUT)
+
   test('end() and AbortSignal deterministically finish a parked start() iterator', async () => {
     await withConn(async (c) => {
       await c.query(`create table ${K}_e2(id int4 primary key)`)
