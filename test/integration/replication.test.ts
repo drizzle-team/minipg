@@ -1,7 +1,7 @@
 // replication(): logical replication over the real auth/transport stack (TCP + SCRAM here).
 // Requires the local cluster with wal_level=logical (test/setup-pg.sh cluster, reconfigured).
 import { test, expect, describe } from 'bun:test'
-import { replication, connect, defineType, Jsonb, Collect, Transform, ReplicationStreamEnded, type ReplicationEvent, type TableShape } from '../../src/index.ts'
+import { replication, connect, defineType, Jsonb, Collect, Transform, ReplicationStreamEnded, ReplicationBusy, PgError, type ReplicationEvent, type TableShape } from '../../src/index.ts'
 import { TEST_CONFIG, withConn, testPool, TEST_TIMEOUT } from '../helpers/db.ts'
 
 const K = `repl_${process.pid}`
@@ -568,6 +568,47 @@ describe('replication()', () => {
       }
     })
   }, 10_000)
+
+  test('command(): rejects with ReplicationBusy mid-stream; the stream keeps delivering afterward', async () => {
+    await withConn(async (c) => {
+      await c.query(`create table ${K}_cmd(id int4 primary key)`)
+      await c.query(`create publication ${K}_cmdpub for table ${K}_cmd`)
+      try {
+        const repl = await replication(TEST_CONFIG)
+        try {
+          const slot = await repl.createSlot(`${K}_cmdslot`, { temporary: true })
+          const gen = repl.start({ slot: slot.slot, publications: [`${K}_cmdpub`] })
+          await c.query(`insert into ${K}_cmd values (1)`)
+          let r = await gen.next()
+          while (!r.done && r.value.kind !== 'commit') r = await gen.next()
+          expect(r.done).toBe(false) // suspended at the yield — the generator body is paused mid-stream
+
+          await expect(repl.command('select 1')).rejects.toThrow(ReplicationBusy)
+
+          await c.query(`insert into ${K}_cmd values (2)`)
+          r = await gen.next()
+          while (!r.done && r.value.kind !== 'commit') r = await gen.next()
+          expect(r.done).toBe(false) // the second insert's commit still arrives — the rejected command() didn't kill the stream
+
+          await gen.return(undefined)
+          await repl.command('select 1') // resolves once more — the flag cleared when the consumer stopped
+        } finally { repl.end() }
+      } finally {
+        await c.query(`drop publication ${K}_cmdpub`)
+        await c.query(`drop table ${K}_cmd`)
+      }
+    })
+  }, TEST_TIMEOUT)
+
+  test('command(): a failed start() setup clears the streaming flag — identify() works after', async () => {
+    const repl2 = await replication(TEST_CONFIG)
+    try {
+      const gen = repl2.start({ slot: 'no_such_slot_02x', publications: [`${K}_nosuchpub`] })
+      await expect(gen.next()).rejects.toThrow(PgError)
+      const sys = await repl2.identify()
+      expect(sys.timeline).toBeGreaterThan(0)
+    } finally { repl2.end() }
+  }, TEST_TIMEOUT)
 })
 
 // keep the import used even if helpers change

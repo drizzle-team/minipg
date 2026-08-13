@@ -182,6 +182,14 @@ export class InvalidSlotName extends Error {
 }
 const checkSlot = (s: string): string => { if (!SLOT_NAME.test(s)) throw new InvalidSlotName(s); return s }
 
+/** command() was called while a start() stream is active. Both would drain the same message
+ *  queue, so a command sent mid-stream would eat CopyData frames the stream is waiting on.
+ *  Finish the stream (break/return the iterator) or end() the connection, then retry. */
+export class ReplicationBusy extends Error {
+  readonly reason = 'streaming' as const
+  constructor() { super('minipg: command() called while a start() stream is active — finish the stream (break/return the iterator) or end() the connection first') }
+}
+
 /** Open a logical-replication connection (walsender). One purpose per connection: this cannot
  *  run extended-protocol queries — use a normal connect() alongside it. */
 export async function replication(config: string | ReplicationConfig = {}): Promise<ReplicationConnection> {
@@ -212,6 +220,9 @@ export class ReplicationConnection {
   private serverMajor = 0       // from the server_version ParameterStatus at startup
   private lastMessageAt = 0     // stamped on every raw socket read — the receiveTimeoutMs liveness clock
   private qPaused = false       // set by maxQueueBytes backpressure; a paused socket has no liveness signal to offer
+  private streaming = false     // true from just before START_REPLICATION is sent until the stream ends — guards command()
+  private copyOpen = false      // true once CopyBothResponse is accepted; a consumer that stops iterating without
+                                 // reaching a server CopyDone leaves this true — command() exits copy mode first
   private keepAlive?: boolean | { initialDelayMs?: number }
 
   constructor(config: ReplicationConfig = {}) {
@@ -323,9 +334,26 @@ export class ReplicationConnection {
     this.socket?.write(Buffer.concat([head, payload]))
   }
 
+  // A stream a consumer stopped reading (break/return()) without a server CopyDone leaves the
+  // WALSENDER thinking copy mode is still active — a plain 'Q' into that state desyncs the
+  // protocol and the server drops the connection. Exchange the client-side CopyDone lazily,
+  // right before the next command needs the connection back in simple-query mode; ack()-after-
+  // break never touches this (it only ever writes standby-status CopyData, which stays valid
+  // regardless), so that flow keeps working unpaused.
+  private async exitCopyModeIfOpen(): Promise<void> {
+    if (!this.copyOpen) return
+    this.copyOpen = false
+    try {
+      this.frame('c', Buffer.alloc(0))
+      for (;;) { const n = await this.next(); if (!n || n.type === 'Z') break }
+    } catch { /* connection unusable — the command below surfaces the failure */ }
+  }
+
   /** Simple-protocol command: the walsender grammar (IDENTIFY_SYSTEM, CREATE_REPLICATION_SLOT, …)
    *  or plain SQL — the logical walsender accepts both. Rows come back as text. */
   async command(sql: string): Promise<{ columns: string[]; rows: (string | null)[][] }> {
+    if (this.streaming) throw new ReplicationBusy()
+    await this.exitCopyModeIfOpen()
     this.frame('Q', Buffer.from(sql + '\0', 'utf8'))
     let columns: string[] = []
     const rows: (string | null)[][] = []
@@ -422,33 +450,47 @@ export class ReplicationConnection {
     }
     this.binaryMode = bin
     const sql = `START_REPLICATION SLOT ${opts.slot} LOGICAL ${lsnToString(from)} (proto_version '1', publication_names '${pubs}'${opts.messages === false ? '' : ", messages 'true'"}${bin ? ", binary 'true'" : ''})`
-    this.frame('Q', Buffer.from(sql + '\0', 'utf8'))
-    for (;;) {
-      const m = await this.next()
-      if (!m) return // end()/abort during setup — clean finish
-      if (m.type === 'W') break
-      if (m.type === 'E') throw new PgError(parseErrorFields(m.body))
-    }
-    // START_REPLICATION accepted (CopyBothResponse): the slot is active server-side NOW. This is the
-    // "streaming established" moment start()'s laziness otherwise hides — a slot-conflict PgError above
-    // fires BEFORE this, and a throw from the callback fails this next() like any stream error.
-    opts.onReady?.()
-    const idleAck = opts.idleAck !== false
-    const status = setInterval(() => this.sendStatus(), opts.statusIntervalMs ?? 10_000)
-    this.lastMessageAt = Date.now()
-    const recvMs = opts.receiveTimeoutMs ?? 0
-    const recv = recvMs > 0
-      ? setInterval(() => {
-          if (this.qPaused) { this.lastMessageAt = Date.now(); return } // a paused socket has no liveness signal to offer
-          if (Date.now() - this.lastMessageAt >= recvMs) this.fail(new ReplicationReceiveTimeout(recvMs))
-        }, Math.max(250, Math.min(recvMs / 2, 5_000)))
-      : null
+    // set BEFORE the frame write, with the try opened right after: command() must stay guarded
+    // across the setup handshake too, and cleared on every exit including a setup-loop PgError
+    // (slot already active) — a flag that survives that path deadlocks command() permanently.
+    this.streaming = true
+    let status: ReturnType<typeof setInterval> | undefined
+    let recv: ReturnType<typeof setInterval> | null = null
     try {
+      this.frame('Q', Buffer.from(sql + '\0', 'utf8'))
+      let setupErr: PgError | null = null
+      for (;;) {
+        const m = await this.next()
+        if (!m) return // end()/abort during setup — clean finish
+        if (m.type === 'W') break
+        // simple-protocol errors are always followed by ReadyForQuery — drain to 'Z' before
+        // throwing, or the connection's next command() reads this rejection's leftover 'Z'
+        // instead of its own results (identify() right after a slot-conflict start() otherwise
+        // sees an empty reply)
+        if (m.type === 'E') { setupErr = new PgError(parseErrorFields(m.body)); continue }
+        if (m.type === 'Z') { if (setupErr) throw setupErr; break }
+      }
+      // START_REPLICATION accepted (CopyBothResponse): the slot is active server-side NOW. This is the
+      // "streaming established" moment start()'s laziness otherwise hides — a slot-conflict PgError above
+      // fires BEFORE this, and a throw from the callback fails this next() like any stream error.
+      opts.onReady?.()
+      const idleAck = opts.idleAck !== false
+      this.copyOpen = true
+      status = setInterval(() => this.sendStatus(), opts.statusIntervalMs ?? 10_000)
+      this.lastMessageAt = Date.now()
+      const recvMs = opts.receiveTimeoutMs ?? 0
+      recv = recvMs > 0
+        ? setInterval(() => {
+            if (this.qPaused) { this.lastMessageAt = Date.now(); return } // a paused socket has no liveness signal to offer
+            if (Date.now() - this.lastMessageAt >= recvMs) this.fail(new ReplicationReceiveTimeout(recvMs))
+          }, Math.max(250, Math.min(recvMs / 2, 5_000)))
+        : null
       for (;;) {
         const m = await this.next()
         if (!m) return // end()/abort — the consumer's own stop: clean finish through the finally
         if (m.type === 'E') throw new PgError(parseErrorFields(m.body))
         if (m.type === 'c') { // SERVER CopyDone (shutdown/failover): handshake out of copy mode, then THROW — a clean return must stay reserved for the consumer's own stop
+          this.copyOpen = false
           try {
             this.frame('c', Buffer.alloc(0))
             for (;;) { const n = await this.next(); if (!n || n.type === 'Z') break } // CommandComplete etc. skipped
@@ -474,7 +516,12 @@ export class ReplicationConnection {
           yield e
         }
       }
-    } finally { clearInterval(status); if (recv) clearInterval(recv); opts.signal?.removeEventListener('abort', onAbort) }
+    } finally {
+      this.streaming = false
+      if (status) clearInterval(status)
+      if (recv) clearInterval(recv)
+      opts.signal?.removeEventListener('abort', onAbort)
+    }
   }
 
   private sendStatus(): void {
