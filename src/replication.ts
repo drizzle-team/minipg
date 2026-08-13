@@ -495,7 +495,10 @@ export class ReplicationConnection {
     checkSlot(opts.slot) // lazy by construction: an async generator's body runs on the first next(), so nothing is sent before this
     if (opts.signal?.aborted) return
     const from = opts.from !== undefined ? toLsn(opts.from) : 0n
-    const pubs = opts.publications.map((p) => `"${p.replace(/"/g, '""')}"`).join(',')
+    // publication_names is a comma-separated identifier list carried inside a single-quoted
+    // walsender option literal, so each name is escaped twice: once for the identifier parser,
+    // once for the literal it rides in. The catalog probe below quotes the same names its own way.
+    const pubs = opts.publications.map((p) => `"${p.replace(/"/g, '""')}"`).join(',').replace(/'/g, "''")
     this.shaped.clear()
     this.relations.clear() // relations re-announce per stream; stale entries would carry the previous stream's shapes
     for (const s of opts.shapes ?? []) {

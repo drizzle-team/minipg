@@ -683,6 +683,29 @@ describe('replication()', () => {
     })
   }, TEST_TIMEOUT)
 
+  test('publication: a name containing a single quote streams (probe and START_REPLICATION agree)', async () => {
+    await withConn(async (c) => {
+      const pub = `${K}_it's_pub` // legal, and it terminates the option literal unless escaped
+      await c.query(`create table ${K}_q(id int4 primary key)`)
+      await c.query(`create publication "${pub}" for table ${K}_q`)
+      try {
+        const repl = await replication(TEST_CONFIG)
+        try {
+          const slot = await repl.createSlot(`${K}_qslot`, { temporary: true })
+          await c.query(`insert into ${K}_q values (1)`)
+          const events = await collectUntil(
+            repl.start({ slot: slot.slot, publications: [pub] }),
+            (es) => es.some((e) => e.kind === 'commit'))
+          const ins = events.find((e) => e.kind === 'insert') as Extract<ReplicationEvent, { kind: 'insert' }>
+          expect(ins.new.id).toBe(1)
+        } finally { repl.end() }
+      } finally {
+        await c.query(`drop publication "${pub}"`)
+        await c.query(`drop table ${K}_q`)
+      }
+    })
+  }, TEST_TIMEOUT)
+
   test('publication: FOR ALL TABLES over a non-empty database is never read as empty (pins pg_publication_tables expansion)', async () => {
     await withConn(async (c) => {
       await c.query(`create table ${K}_fat(id int4 primary key)`) // create the table BEFORE the publication
