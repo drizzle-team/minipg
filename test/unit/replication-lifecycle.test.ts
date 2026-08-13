@@ -273,6 +273,27 @@ test('backpressure: an abandoned stream\'s undelivered frames do not loosen the 
   } finally { repl.end() }
 })
 
+test('end(): stops the stream timers even when the generator is suspended at a yield', async () => {
+  const backend = fakeBackend({
+    onQuery: (sql) => (sql.startsWith('START_REPLICATION') ? [copyBoth(), pgBegin()] : [ready()]),
+  })
+  const repl = await replication(cfg({ socket: backend.socket }))
+  let writes = 0
+  const origWrite = backend.dx.write.bind(backend.dx)
+  ;(backend.dx as unknown as { write: (c: Buffer) => boolean }).write = (c) => { writes++; return origWrite(c) }
+
+  // manual iteration, no for-await: taking an event and never asking for another parks the
+  // generator at the yield, where nothing is waiting in next() for end() to wake
+  const gen = repl.start({ slot: 'repl_1_ok', publications: ['pub'], statusIntervalMs: 50, receiveTimeoutMs: 400 })
+  expect((await gen.next()).value.kind).toBe('begin')
+  repl.end()
+
+  const after = writes
+  await Bun.sleep(300) // six status ticks' worth
+  expect(writes).toBe(after) // a timer the generator's own finally can never reach keeps writing forever
+  void gen
+})
+
 test('abort signal: a start() that fails before streaming leaves no listener on the consumer signal', async () => {
   const backend = fakeBackend({
     onQuery(sql) {

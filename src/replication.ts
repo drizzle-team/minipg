@@ -278,6 +278,9 @@ export class ReplicationConnection {
   private streaming = false     // true from just before START_REPLICATION is sent until the stream ends — guards command()
   private copyOpen = false      // true once CopyBothResponse is accepted; a consumer that stops iterating without
                                  // reaching a server CopyDone leaves this true — command() exits copy mode first
+  // held on the instance, not in start()'s frame: a generator suspended at a yield has nobody
+  // parked in next(), so end() can never reach its finally — only end() itself can stop these
+  private timers: ReturnType<typeof setInterval>[] = []
   private keepAlive?: boolean | { initialDelayMs?: number }
 
   constructor(config: ReplicationConfig = {}) {
@@ -555,8 +558,6 @@ export class ReplicationConnection {
     // across the setup handshake too, and cleared on every exit including a setup-loop PgError
     // (slot already active) — a flag that survives that path deadlocks command() permanently.
     this.streaming = true
-    let status: ReturnType<typeof setInterval> | undefined
-    let recv: ReturnType<typeof setInterval> | null = null
     try {
       this.frame('Q', Buffer.from(sql + '\0', 'utf8'))
       let setupErr: PgError | null = null
@@ -579,15 +580,13 @@ export class ReplicationConnection {
       // fires BEFORE this, and a throw from the callback fails this next() like any stream error.
       opts.onReady?.()
       const idleAck = opts.idleAck !== false
-      status = setInterval(() => this.sendStatus(), opts.statusIntervalMs ?? 10_000)
+      this.timers.push(setInterval(() => this.sendStatus(), opts.statusIntervalMs ?? 10_000))
       this.lastMessageAt = Date.now()
       const recvMs = opts.receiveTimeoutMs ?? 0
-      recv = recvMs > 0
-        ? setInterval(() => {
-            if (this.qPaused) { this.lastMessageAt = Date.now(); return } // a paused socket has no liveness signal to offer
-            if (Date.now() - this.lastMessageAt >= recvMs) this.fail(new ReplicationReceiveTimeout(recvMs))
-          }, Math.max(250, Math.min(recvMs / 2, 5_000)))
-        : null
+      if (recvMs > 0) this.timers.push(setInterval(() => {
+        if (this.qPaused) { this.lastMessageAt = Date.now(); return } // a paused socket has no liveness signal to offer
+        if (Date.now() - this.lastMessageAt >= recvMs) this.fail(new ReplicationReceiveTimeout(recvMs))
+      }, Math.max(250, Math.min(recvMs / 2, 5_000))))
       for (;;) {
         const m = await this.next()
         if (!m) return // end()/abort — the consumer's own stop: clean finish through the finally
@@ -627,8 +626,7 @@ export class ReplicationConnection {
       // the queue, and next() still subtracts their bytes as they drain — zeroing here drives the
       // counter negative and loosens the next stream's ceiling by the abandoned residue
       this.qBytes = this.q.reduce((n, m) => n + m.body.length + 5, 0)
-      if (status) clearInterval(status)
-      if (recv) clearInterval(recv)
+      this.clearTimers()
       opts.signal?.removeEventListener('abort', onAbort)
     }
   }
@@ -772,8 +770,11 @@ export class ReplicationConnection {
     return { info, names, decoders, bin }
   }
 
+  private clearTimers(): void { for (const t of this.timers) clearInterval(t); this.timers.length = 0 }
+
   end(): void {
     this.ended = true
+    this.clearTimers()
     this.forceResume() // a paused socket left paused after the stream ends would never drain
     try { this.socket?.write(W.terminate()) } catch { /* */ }
     try { this.socket?.end() } catch { /* */ }
