@@ -33,7 +33,18 @@ function fakeBackend(opts: { onQuery?: (sql: string) => Buffer[] } = {}) {
   const sent: Buffer[] = []    // CopyData/Terminate frames received after streaming begins
   const queries: string[] = [] // every 'Q' frame's SQL text, in order
   let authenticated = false
-  const onQuery = opts.onQuery ?? ((sql: string) => (sql.startsWith('START_REPLICATION') ? [copyBoth()] : [ready()]))
+  const onQuery = opts.onQuery ?? ((sql: string) => {
+    if (sql.startsWith('START_REPLICATION')) return [copyBoth()]
+    if (sql.includes('pg_publication')) {
+      const names = [...sql.matchAll(/'([^']*)'/g)].map((m) => m[1]!) // publication literals inside array[...]
+      return [
+        rowDesc([{ name: 'name' }, { name: 'present' }, { name: 'tables' }]),
+        ...names.map((n) => dataRow([n, 't', '1'])),
+        ready(),
+      ]
+    }
+    return [ready()]
+  })
   const dx: Duplex = new Duplex({
     write(chunk: Buffer, _enc, cb) {
       if (!authenticated) {
@@ -211,4 +222,22 @@ test('backpressure: pauses the socket at the ceiling, resumes at half, no timeou
     expect(r2.value.kind).toBe('begin') // arrival order preserved: begin, begin
     expect(resumeCalls.length).toBeGreaterThan(0)
   } finally { repl.end() }
+})
+
+test('publication: an empty publications array warns once and skips the probe query entirely', async () => {
+  const backend = fakeBackend()
+  const repl = await replication(cfg({ socket: backend.socket }))
+  const warnings: unknown[] = []
+  const gen = repl.start({ slot: 'repl_1_ok', publications: [], onWarning: (w) => warnings.push(w) })
+  const pending = gen.next() // parks awaiting messages after CopyBoth — nothing else the fake sends by default
+  await Bun.sleep(50)
+  expect(warnings.length).toBe(1)
+  const w = warnings[0] as { kind: string; publication: string; message: string }
+  expect(w.kind).toBe('publication-empty')
+  expect(w.publication).toBe('')
+  expect(typeof w.message).toBe('string')
+  expect(backend.queries.some((q) => q.includes('pg_publication'))).toBe(false) // probe round trip skipped for []
+  expect(backend.queries.some((q) => q.startsWith('START_REPLICATION'))).toBe(true) // the stream still started
+  repl.end()
+  await pending
 })

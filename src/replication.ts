@@ -99,6 +99,11 @@ export interface TableShape {
 
 export interface StartOptions {
   slot: string
+  /** Publications to subscribe. A missing publication rejects with PublicationMissing before
+   *  START_REPLICATION is written (a driver-side catalog probe — pgoutput itself only reports a
+   *  missing publication lazily, and PG18 no longer reports it to the client at all). The probe
+   *  only answers "does it exist NOW": a publication created after the slot can still be invisible
+   *  to the slot's historical catalog snapshot even once this check passes. */
   publications: string[]
   /** Per-table decode shapes, matched by (schema, table) when the relation is announced.
    *  Declared columns decode exactly like the same spec in a query() shape, and — like a
@@ -156,6 +161,12 @@ export interface StartOptions {
    *  this is the observable "streaming established" hook; a slot-already-active PgError fires before
    *  it, and a throw from the callback fails the stream's current next(). */
   onReady?: () => void
+  /** The library's only warning channel — non-fatal conditions detected at start() (an empty
+   *  publication, for example) that are worth surfacing but aren't errors. Called synchronously,
+   *  zero or more times, before the stream begins. Absent = the warning is simply not delivered;
+   *  minipg never writes warnings to the process streams itself. Later diagnostics reuse this
+   *  same field with new ReplicationWarning `kind` members rather than adding a second channel. */
+  onWarning?: (w: ReplicationWarning) => void
 }
 
 /** The SERVER ended the replication stream (CopyDone): clean primary shutdown, failover, or a
@@ -197,6 +208,23 @@ export class ReplicationBusy extends Error {
   readonly reason = 'streaming' as const
   constructor() { super('minipg: command() called while a start() stream is active — finish the stream (break/return the iterator) or end() the connection first') }
 }
+
+/** A named publication in start()'s publications list does not exist right now — caught by an
+ *  unconditional driver-side catalog probe before START_REPLICATION is sent, because pgoutput
+ *  itself only reports this lazily (from the change callback at the first decoded change,
+ *  PG14-17) or not at all (PG18 downgrades it to a WARNING the client never sees). See
+ *  StartOptions.publications for the historical-snapshot case this probe cannot cover. */
+export class PublicationMissing extends Error {
+  readonly reason = 'publication-missing' as const
+  constructor(readonly publications: string[]) {
+    super(`minipg: publication ${publications.map((p) => JSON.stringify(p)).join(', ')} does not exist — create it before start(), or remove it from publications`)
+  }
+}
+
+/** A non-fatal condition detected at start() — the library's only warning channel (see
+ *  StartOptions.onWarning). A union of one member today; later phases add new `kind` values
+ *  without reshaping this field. */
+export type ReplicationWarning = { kind: 'publication-empty'; publication: string; message: string }
 
 /** Open a logical-replication connection (walsender). One purpose per connection: this cannot
  *  run extended-protocol queries — use a normal connect() alongside it. */
@@ -458,6 +486,27 @@ export class ReplicationConnection {
       const keys = new Set(cols.map((c) => c.name))
       for (const k of Object.keys(s.columns ?? {})) if (!keys.has(k)) throw new Error(`minipg: replication shape for ${schema}.${s.table}: columns maps ${JSON.stringify(k)} but the shape has no such key`)
       this.shaped.set(schema + '\0' + s.table, { cols, columns: s.columns })
+    }
+    // RAW-06: unconditional catalog probe — pgoutput itself only reports a missing publication
+    // lazily (first decoded change) or not at all on PG18 (downgraded to a WARNING); see
+    // PublicationMissing and StartOptions.publications for what this probe can and cannot promise.
+    // Runs before this.streaming is set, so command() is still legal here.
+    if (opts.publications.length === 0) {
+      opts.onWarning?.({ kind: 'publication-empty', publication: '', message: 'minipg: publications is empty — the stream will decode no tables until at least one publication is set' })
+    } else {
+      const pubLits = opts.publications.map((p) => `'${p.replace(/'/g, "''")}'`).join(',')
+      const pubProbe = await this.command(
+        'select n.name, p.oid is not null as present, coalesce(t.cnt, 0)::text'
+        + ` from unnest(array[${pubLits}]::text[]) as n(name)`
+        + ' left join pg_publication p on p.pubname = n.name'
+        + ' left join (select pubname, count(*)::int as cnt from pg_publication_tables group by 1) t on t.pubname = n.name')
+      const missingPubs: string[] = []
+      for (const row of pubProbe.rows) {
+        const [name, present, tables] = row as [string, string, string]
+        if (present !== 't') { missingPubs.push(name); continue }
+        if (tables === '0') opts.onWarning?.({ kind: 'publication-empty', publication: name, message: `minipg: publication ${JSON.stringify(name)} exists but publishes no tables — the stream will start but deliver nothing until it does` })
+      }
+      if (missingPubs.length) throw new PublicationMissing(missingPubs)
     }
     const want = opts.binary ?? 'auto'
     let bin = want === true
