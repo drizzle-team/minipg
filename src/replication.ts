@@ -510,7 +510,7 @@ export class ReplicationConnection {
       for (const k of Object.keys(s.columns ?? {})) if (!keys.has(k)) throw new Error(`minipg: replication shape for ${schema}.${s.table}: columns maps ${JSON.stringify(k)} but the shape has no such key`)
       this.shaped.set(schema + '\0' + s.table, { cols, columns: s.columns })
     }
-    // RAW-06: unconditional catalog probe — pgoutput itself only reports a missing publication
+    // unconditional catalog probe — pgoutput itself only reports a missing publication
     // lazily (first decoded change) or not at all on PG18 (downgraded to a WARNING); see
     // PublicationMissing and StartOptions.publications for what this probe can and cannot promise.
     // Runs before this.streaming is set, so command() is still legal here.
