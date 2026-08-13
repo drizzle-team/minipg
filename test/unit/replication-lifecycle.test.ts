@@ -4,24 +4,17 @@
 // serverMajor stays 0 and the binary 'auto' probe never engages against it.
 import { test, expect } from 'bun:test'
 import { Duplex } from 'node:stream'
-import { frame } from '../helpers/wire.ts'
+import { frame, rowDescription, dataRow as dataRowBody, type WireCol, type Cell } from '../helpers/wire.ts'
 import { replication, ReplicationReceiveTimeout, InvalidSlotName, PublicationEmpty, PublicationMissing, type ReplicationConfig } from '../../src/index.ts'
 
 const i32 = (n: number) => { const b = Buffer.allocUnsafe(4); b.writeInt32BE(n); return b }
 const u16 = (n: number) => { const b = Buffer.allocUnsafe(2); b.writeUInt16BE(n); return b }
-const cstr = (s: string) => Buffer.concat([Buffer.from(s, 'utf8'), Buffer.from([0])])
 const i64zero = Buffer.alloc(8)
 
 const authOk = () => frame('R', i32(0))
 const ready = (s = 'I') => frame('Z', Buffer.from(s, 'latin1'))
-const rowDesc = (fields: { name: string; oid?: number }[]) => frame('T', Buffer.concat([
-  u16(fields.length),
-  ...fields.map((f) => Buffer.concat([cstr(f.name), i32(0), u16(0), i32(f.oid ?? 25), u16(0xffff), i32(-1), u16(0)])),
-]))
-const dataRow = (row: (string | null)[]) => frame('D', Buffer.concat([
-  u16(row.length),
-  ...row.map((v) => (v === null ? i32(-1) : (() => { const b = Buffer.from(v, 'utf8'); return Buffer.concat([i32(b.length), b]) })())),
-]))
+const rowDesc = (cols: WireCol[]) => frame('T', rowDescription(cols))
+const dataRow = (cells: Cell[]) => frame('D', dataRowBody(cells))
 const copyBoth = () => frame('W', Buffer.from([0, 0, 0]))
 const xlogData = (payload: Buffer) => frame('d', Buffer.concat([Buffer.from('w', 'latin1'), i64zero, i64zero, i64zero, payload]))
 const keepalive = (reply = 0) => frame('d', Buffer.concat([Buffer.from('k', 'latin1'), i64zero, i64zero, Buffer.from([reply])]))
@@ -38,7 +31,7 @@ function fakeBackend(opts: { onQuery?: (sql: string) => Buffer[] } = {}) {
     if (sql.includes('pg_publication')) {
       const names = [...sql.matchAll(/'([^']*)'/g)].map((m) => m[1]!) // publication literals inside array[...]
       return [
-        rowDesc([{ name: 'name' }, { name: 'present' }, { name: 'tables' }]),
+        rowDesc([{ name: 'name', oid: 25 }, { name: 'present', oid: 25 }, { name: 'tables', oid: 25 }]),
         ...names.map((n) => dataRow([n, 't', '1'])),
         ready(),
       ]
@@ -139,7 +132,7 @@ test('slot name: non-ASCII and over-length names reject; boundary and normal nam
       if (sql.startsWith('CREATE_REPLICATION_SLOT')) {
         const name = sql.split(' ')[1]!
         return [
-          rowDesc([{ name: 'slot_name' }, { name: 'consistent_point' }, { name: 'snapshot_name' }, { name: 'output_plugin' }]),
+          rowDesc([{ name: 'slot_name', oid: 25 }, { name: 'consistent_point', oid: 25 }, { name: 'snapshot_name', oid: 25 }, { name: 'output_plugin', oid: 25 }]),
           dataRow([name, '0/0', null, 'pgoutput']),
           ready(),
         ]
