@@ -1296,3 +1296,57 @@ test('cdc CR-02: a backfillTimeoutMs timeout on a durable slot still abandons th
   expect(backfillCalls).toBe(1) // never retried in place — a timeout routes through the outer catch, not the retry loop
   await handle.stop()
 })
+
+test('cdc W-01: a throw from retryDelayMs is caught and routed through fireFatal, not an unhandled rejection', async () => {
+  const backend = cdcBackend()
+  let fatalErr: Error | undefined
+  let uncaught: unknown
+  const onUnhandled = (reason: unknown): void => { uncaught = reason }
+  process.on('unhandledRejection', onUnhandled)
+  try {
+    const handle = replicate({
+      url: cfg({ socket: backend.socket }),
+      slot: 'temporary',
+      publications: ['pub'],
+      backfill: async () => {},
+      onTransaction: () => {},
+      retryDelayMs: () => { throw new Error('retryDelayMs itself is broken') },
+      onFatalError: (err) => { fatalErr = err },
+    })
+    await until(() => !!backend.latest?.queries.some((q) => q.startsWith('START_REPLICATION')))
+    backend.latest!.dx.destroy() // session failure -> the outer catch invokes the (throwing) retryDelayMs
+    await until(() => fatalErr !== undefined)
+    expect(fatalErr).toBeInstanceOf(Error)
+    expect((fatalErr as Error).message).toBe('retryDelayMs itself is broken')
+    await Bun.sleep(20)
+    expect(uncaught).toBeUndefined() // must never surface as an unhandled rejection
+    await handle.stop()
+  } finally {
+    process.off('unhandledRejection', onUnhandled)
+  }
+})
+
+test('cdc W-01: onFatalError itself throwing does not produce an unhandled rejection', async () => {
+  const backend = cdcBackend()
+  let uncaught: unknown
+  const onUnhandled = (reason: unknown): void => { uncaught = reason }
+  process.on('unhandledRejection', onUnhandled)
+  try {
+    const handle = replicate({
+      url: cfg({ socket: backend.socket }),
+      slot: 'temporary',
+      publications: ['pub'],
+      backfill: async () => {},
+      onTransaction: () => {},
+      retryDelayMs: () => null, // fatal on the very first failure
+      onFatalError: () => { throw new Error('onFatalError itself is broken') },
+    })
+    await until(() => !!backend.latest?.queries.some((q) => q.startsWith('START_REPLICATION')))
+    backend.latest!.dx.destroy()
+    await Bun.sleep(50)
+    expect(uncaught).toBeUndefined()
+    await handle.stop()
+  } finally {
+    process.off('unhandledRejection', onUnhandled)
+  }
+})

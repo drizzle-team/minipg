@@ -310,7 +310,10 @@ export function replicate(opts: ReplicateOptions): ReplicateHandle {
     fatalFired = true
     repl?.end()
     state = 'dead'
-    opts.onFatalError?.(err)
+    // The terminal callback: nothing downstream of this catches a throw, so one is caught and
+    // reported here, exactly like deliverWarning does for onWarning — a throwing onFatalError
+    // must not itself become an unhandled rejection through run()'s own promise.
+    try { opts.onFatalError?.(err) } catch (e) { console.error('minipg: onFatalError callback threw', e) }
   }
 
   async function run(): Promise<void> {
@@ -583,7 +586,10 @@ export function replicate(opts: ReplicateOptions): ReplicateHandle {
     state = 'stopped'
   }
 
-  Promise.resolve().then(run)
+  // retryDelayMs is invoked from inside run()'s own catch blocks (a handler/backfill retry, or
+  // the per-session catch) — a throw there has nothing left inside run() to catch it, and would
+  // otherwise reject this floating promise and kill the process outside fireFatal's teardown.
+  Promise.resolve().then(run).catch((e) => fireFatal(e as Error))
 
   return { stop }
 }
