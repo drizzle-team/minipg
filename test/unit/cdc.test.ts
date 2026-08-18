@@ -7,7 +7,7 @@ import { test, expect } from 'bun:test'
 import { Duplex } from 'node:stream'
 import { frame, rowDescription, dataRow as dataRowBody, type WireCol, type Cell } from '../helpers/wire.ts'
 import { replication as rawReplication, batchTransactions as rawBatchTransactions, type ReplicationConfig, type TransactionBatch } from '../../src/index.ts'
-import { replicate, SlotInvalidatedError, BackfillTimeoutError, SlotBusyError } from '../../src/cdc.ts'
+import { replicate, SlotInvalidatedError, BackfillTimeoutError, SlotBusyError, type CdcWarning } from '../../src/cdc.ts'
 
 const i32 = (n: number) => { const b = Buffer.allocUnsafe(4); b.writeInt32BE(n); return b }
 const u16 = (n: number) => { const b = Buffer.allocUnsafe(2); b.writeUInt16BE(n); return b }
@@ -295,5 +295,243 @@ test('cdc one connection: all slot administration rides the single streaming ses
   expect(settingsIdx).toBeGreaterThanOrEqual(0)
   expect(createIdx).toBeGreaterThan(settingsIdx)
   expect(startIdx).toBeGreaterThan(createIdx)
+  await handle.stop()
+})
+
+test('cdc default retry: additive jitter, 30s cap, null at attempt 10', async () => {
+  // The real D-01 formula is only reachable through an actual session failure (the policy is
+  // module-private by design — not part of the public surface). Rather than waiting out real
+  // 1s-30s delays, intercept setTimeout to record what delay the layer actually asked for, then
+  // fast-forward it — this observes the REAL computed values, not a re-implementation of them.
+  const delays: number[] = []
+  const realSetTimeout = globalThis.setTimeout
+  globalThis.setTimeout = ((fn: (...a: unknown[]) => void, ms?: number, ...rest: unknown[]) => {
+    if (typeof ms === 'number' && ms >= 500) { delays.push(ms); return realSetTimeout(fn, 0) }
+    return realSetTimeout(fn, ms, ...rest)
+  }) as typeof setTimeout
+
+  let fatalErr: Error | undefined
+  try {
+    // A minimal always-fails transport: authenticates, then dies on the very next query — no
+    // cdcBackend fake-walsender router needed, this is a pure connection-never-stabilizes loop.
+    const failingSocket = (): Duplex => {
+      let authenticated = false
+      const dx: Duplex = new Duplex({
+        write(_chunk: Buffer, _enc, cb) {
+          if (!authenticated) { authenticated = true; dx.push(authOk()); dx.push(ready()); cb(); return }
+          queueMicrotask(() => dx.destroy())
+          cb()
+        },
+        read() { /* pushed manually */ },
+      })
+      return dx
+    }
+    replicate({
+      url: cfg({ socket: failingSocket, connectTimeout: 5 }),
+      slot: 'temporary',
+      publications: ['pub'],
+      backfill: async () => {},
+      onTransaction: () => {},
+      onFatalError: (err) => { fatalErr = err },
+    })
+    await until(() => delays.length >= 9 && fatalErr !== undefined, 5000)
+  } finally {
+    globalThis.setTimeout = realSetTimeout
+  }
+
+  expect(delays.length).toBe(9) // attempt 10 returns null before ever calling sleep()
+  expect(delays[0]).toBeGreaterThanOrEqual(1000); expect(delays[0]).toBeLessThan(2000) // attempt 1
+  expect(delays[4]).toBeGreaterThanOrEqual(16000); expect(delays[4]).toBeLessThan(17000) // attempt 5
+  expect(delays[8]).toBeLessThanOrEqual(30000) // attempt 9, capped
+  expect(fatalErr).toBeDefined()
+})
+
+test('cdc budget: the retry counter resets on acked progress, not delivery', async () => {
+  const backend = cdcBackend()
+  const seenAttempts: number[] = []
+  const handle = replicate({
+    url: cfg({ socket: backend.socket }),
+    slot: 'temporary',
+    publications: ['pub'],
+    backfill: async () => {},
+    onTransaction: async () => {},
+    retryDelayMs: (attempt) => { seenAttempts.push(attempt); return 1 },
+  })
+
+  await until(() => !!backend.latest?.queries.some((q) => q.startsWith('START_REPLICATION')))
+  backend.latest!.dx.destroy() // session 1 dies with nothing acked -> attempt 1
+  await until(() => seenAttempts.length >= 1)
+  expect(seenAttempts[0]).toBe(1)
+
+  await until(() => backend.sessions.length >= 2 && !!backend.latest?.queries.some((q) => q.startsWith('START_REPLICATION')))
+  backend.latest!.dx.destroy() // session 2 also dies with nothing acked -> attempt 2, no reset
+  await until(() => seenAttempts.length >= 2)
+  expect(seenAttempts[1]).toBe(2)
+
+  await until(() => backend.sessions.length >= 3 && !!backend.latest?.queries.some((q) => q.startsWith('START_REPLICATION')))
+  const s3 = backend.latest!
+  const relId = 9, commitLsn = 0x60n, endLsn = 0x70n
+  s3.dx.push(pgBegin())
+  s3.dx.push(pgRelation(relId, 'public', 't3', 'd', [{ name: 'id', oid: 23, key: true }]))
+  s3.dx.push(pgInsert(relId, [textCell('1')]))
+  s3.dx.push(pgCommit(commitLsn, endLsn))
+  await until(() => lastFlushed(s3.sent) >= endLsn) // acked -> the ONLY reset site fires here
+
+  s3.dx.destroy() // session 3 dies right after the ack -> the budget was just reset -> attempt 1, not 3
+  await until(() => seenAttempts.length >= 3)
+  expect(seenAttempts[2]).toBe(1)
+
+  await handle.stop()
+})
+
+test('cdc null stops: retryDelayMs returning null goes fatal without another attempt', async () => {
+  const backend = cdcBackend()
+  let fatalErr: Error | undefined
+  const handle = replicate({
+    url: cfg({ socket: backend.socket }),
+    slot: 'temporary',
+    publications: ['pub'],
+    backfill: async () => {},
+    onTransaction: () => {},
+    retryDelayMs: () => null,
+    onFatalError: (err) => { fatalErr = err },
+  })
+  await until(() => !!backend.latest?.queries.some((q) => q.startsWith('START_REPLICATION')))
+  backend.latest!.dx.destroy()
+  await until(() => fatalErr !== undefined)
+  expect(fatalErr).toBeDefined()
+  expect(backend.sessions.length).toBe(1)
+
+  const before = backend.sessions.length
+  await Bun.sleep(300)
+  expect(backend.sessions.length).toBe(before) // no reconnect attempted after going fatal
+  await handle.stop()
+})
+
+test('cdc fatal: onFatalError fires exactly once and nothing runs after it', async () => {
+  const backend = cdcBackend()
+  let fatalCount = 0
+  let txnCount = 0
+  const handle = replicate({
+    url: cfg({ socket: backend.socket }),
+    slot: 'temporary',
+    publications: ['pub'],
+    backfill: async () => {},
+    onTransaction: () => { txnCount++ },
+    retryDelayMs: (attempt) => (attempt === 1 ? 1 : null), // one reconnect, then give up
+    onFatalError: () => { fatalCount++ },
+  })
+  await until(() => !!backend.latest?.queries.some((q) => q.startsWith('START_REPLICATION')))
+  backend.latest!.dx.destroy() // failure source 1 -> attempt 1 -> reconnects
+  await until(() => backend.sessions.length >= 2 && !!backend.latest?.queries.some((q) => q.startsWith('START_REPLICATION')))
+  backend.latest!.dx.destroy() // failure source 2 -> attempt 2 -> null -> fatal
+  await until(() => fatalCount >= 1)
+
+  expect(fatalCount).toBe(1)
+  expect(txnCount).toBe(0)
+  expect(backend.sessions.length).toBe(2)
+
+  await Bun.sleep(200)
+  expect(backend.sessions.length).toBe(2) // no further session opened
+  expect(fatalCount).toBe(1) // still exactly once
+
+  const t0 = Date.now()
+  await handle.stop() // nothing in flight after fatal -> resolves promptly
+  expect(Date.now() - t0).toBeLessThan(200)
+})
+
+test('cdc one START_REPLICATION: no session ever receives a second start command', async () => {
+  const backend = cdcBackend()
+  const seenBatches: TransactionBatch[] = []
+  let queriesAtThrow = -1
+  let queriesAtRetry = -1
+  const handle = replicate({
+    url: cfg({ socket: backend.socket }),
+    slot: 'temporary',
+    publications: ['pub'],
+    backfill: async () => {},
+    onTransaction: async (batch) => {
+      seenBatches.push(batch)
+      if (seenBatches.length === 1) {
+        queriesAtThrow = backend.latest!.queries.length
+        throw new Error('handler boom')
+      }
+      queriesAtRetry = backend.latest!.queries.length
+    },
+    retryDelayMs: () => 1,
+  })
+
+  await until(() => !!backend.latest?.queries.some((q) => q.startsWith('START_REPLICATION')))
+  const s1 = backend.latest!
+  const relId = 11, commitLsn = 0x80n, endLsn = 0x90n
+  s1.dx.push(pgBegin())
+  s1.dx.push(pgRelation(relId, 'public', 't', 'd', [{ name: 'id', oid: 23, key: true }]))
+  s1.dx.push(pgInsert(relId, [textCell('1')]))
+  s1.dx.push(pgCommit(commitLsn, endLsn))
+
+  await until(() => lastFlushed(s1.sent) >= endLsn) // handler-throw retry, then ack, all on session 1
+  expect(seenBatches.length).toBe(2)
+  expect(seenBatches[0]).toBe(seenBatches[1]) // same in-memory batch object, re-presented (D-06)
+  expect(queriesAtRetry).toBe(queriesAtThrow) // zero commands issued between the two invocations
+  expect(backend.sessions.length).toBe(1) // the throw never reconnected
+
+  // Now force a server CopyDone on session 1 — the ONLY path that must reconnect (CDC-04
+  // satisfied by equivalence, D-06): the session cannot stream again (PostgreSQL BUG #18754).
+  s1.dx.push(frame('c', Buffer.alloc(0)))
+  await until(() => backend.sessions.length >= 2)
+  await until(() => !!backend.latest?.queries.some((q) => q.startsWith('START_REPLICATION')))
+
+  for (const session of backend.sessions) {
+    const starts = session.queries.filter((q) => q.startsWith('START_REPLICATION'))
+    expect(starts.length).toBeLessThanOrEqual(1)
+  }
+  await handle.stop()
+})
+
+test('cdc isReconnect: false on the first session, true on the rebuilt one', async () => {
+  const backend = cdcBackend()
+  const seen: boolean[] = []
+  const handle = replicate({
+    url: cfg({ socket: backend.socket }),
+    slot: 'temporary',
+    publications: ['pub'],
+    backfill: async ({ isReconnect }) => { seen.push(isReconnect) },
+    onTransaction: () => {},
+    retryDelayMs: () => 1,
+  })
+  await until(() => !!backend.latest?.queries.some((q) => q.startsWith('START_REPLICATION')))
+  expect(seen).toEqual([false])
+
+  backend.latest!.dx.destroy()
+  await until(() => backend.sessions.length >= 2 && !!backend.latest?.queries.some((q) => q.startsWith('START_REPLICATION')))
+  expect(seen).toEqual([false, true])
+
+  await handle.stop()
+})
+
+test('cdc backfill timeout: the deadline aborts the signal and routes through retryDelayMs', async () => {
+  const backend = cdcBackend()
+  let sawAborted = false
+  let capturedErr: Error | undefined
+  const warnings: CdcWarning[] = []
+  const handle = replicate({
+    url: cfg({ socket: backend.socket }),
+    slot: 'temporary',
+    publications: ['pub'],
+    backfillTimeoutMs: 50,
+    backfill: async ({ signal }) => {
+      await new Promise<void>((resolve) => { signal.addEventListener('abort', () => resolve(), { once: true }) })
+      sawAborted = signal.aborted
+    },
+    onTransaction: () => {},
+    retryDelayMs: (_attempt, err) => { capturedErr = err; return null }, // one capture, then stop
+    onWarning: (w) => { warnings.push(w) },
+    onFatalError: () => {},
+  })
+  await until(() => capturedErr !== undefined)
+  expect(sawAborted).toBe(true)
+  expect(capturedErr).toBeInstanceOf(BackfillTimeoutError)
+  expect((capturedErr as BackfillTimeoutError).ms).toBe(50)
+  expect(warnings.some((w) => w.kind === 'backfill-timeout')).toBe(true)
   await handle.stop()
 })
