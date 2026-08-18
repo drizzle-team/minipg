@@ -1013,3 +1013,61 @@ test('cdc eviction denied: 42501 goes fatal without a retry or a further poll', 
   expect(retryCalled).toBe(false)
   await handle.stop()
 })
+
+test('cdc wal_sender_timeout zero: receive timeout stays off, keepAlive on, a warning names the setting', async () => {
+  const backend = cdcBackend({
+    onQuery: (sql) => sql.includes('wal_sender_timeout') ? [rowDesc([{ name: 'setting', oid: 25 }]), dataRow(['0']), ready()] : undefined,
+  })
+  const keepAliveBySession: Record<number, { enable: boolean; delay?: number }[]> = {}
+  const wrappedSocket = (): Duplex => {
+    const sessionIndex = backend.sessions.length
+    const dx = backend.socket()
+    keepAliveBySession[sessionIndex] = []
+    ;(dx as unknown as { setKeepAlive: (e: boolean, d?: number) => void }).setKeepAlive = (enable, delay) => {
+      keepAliveBySession[sessionIndex]!.push({ enable, delay })
+    }
+    return dx
+  }
+
+  const warnings: CdcWarning[] = []
+  const delays: number[] = []
+  const realSetInterval = globalThis.setInterval
+  globalThis.setInterval = ((fn: (...a: unknown[]) => void, ms?: number, ...rest: unknown[]) => {
+    if (typeof ms === 'number') delays.push(ms)
+    return realSetInterval(fn as never, ms as never, ...(rest as []))
+  }) as typeof setInterval
+
+  try {
+    const handle = replicate({
+      url: cfg({ socket: wrappedSocket }),
+      slot: 'temporary',
+      publications: ['pub'],
+      backfill: async () => {},
+      onTransaction: () => {},
+      retryDelayMs: () => 0, // speed the forced reconnect below past the default ~1-2s jitter
+      onWarning: (w) => { warnings.push(w) },
+    })
+    await until(() => !!backend.latest?.queries.some((q) => q.startsWith('START_REPLICATION')))
+
+    // (a) the warning fired, naming the setting
+    expect(warnings.some((w) => w.kind === 'wal-sender-timeout-disabled' && w.message.includes('wal_sender_timeout'))).toBe(true)
+
+    // (b) the FIRST session's recorded setInterval delays, taken BEFORE the CopyDone reconnect
+    // below — a cumulative spy would otherwise pick up the second session's own status-cadence
+    // interval too. The two setInterval sites in src/replication.ts separate cleanly on delay:
+    // receive-liveness (armed iff receiveTimeoutMs is set) caps at 5000ms; status cadence never
+    // drops below 10000ms under D-07's floor. A wrongly-undisarmed receiveTimeoutMs at wst=0
+    // would arm a receive timer at 5000ms and trip the first assertion.
+    expect(delays.some((d) => d < 10000)).toBe(false)
+    expect(delays.some((d) => d >= 10000)).toBe(true)
+
+    // (c) push a server CopyDone to force one reconnect, then check the SECOND session's socket
+    backend.latest!.dx.push(frame('c', Buffer.alloc(0)))
+    await until(() => backend.sessions.length >= 2 && !!backend.latest?.queries.some((q) => q.startsWith('START_REPLICATION')))
+    expect(keepAliveBySession[1]?.some((c) => c.enable === true)).toBe(true)
+
+    await handle.stop()
+  } finally {
+    globalThis.setInterval = realSetInterval
+  }
+})

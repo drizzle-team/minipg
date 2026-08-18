@@ -103,13 +103,19 @@ export interface ReplicateOptions {
   onResume?: (info: { confirmedFlush: string; restartLsn: string }) => void | Promise<void>
   /** Forwarded to start() unchanged; see StartOptions.messages. */
   messages?: boolean
-  /** Forwarded to start() unchanged; see StartOptions.statusIntervalMs. Overriding this defeats
-   *  the value plan 04-03 derives from the server's own wal_sender_timeout — leave it unset
-   *  unless you have a specific reason. */
+  /** Forwarded to start() when set. Omitted defaults to a value DERIVED from the server's own
+   *  wal_sender_timeout, read once per connect: max(10_000, wal_sender_timeout * 0.75) — kept
+   *  comfortably above half the server's own ping interval so the server's keepalive clock
+   *  actually expires instead of resetting on every status update (D-07). A value set here
+   *  always wins over the derived one. */
   statusIntervalMs?: number
-  /** Forwarded to start() unchanged; see StartOptions.receiveTimeoutMs. Overriding this defeats
-   *  the value plan 04-03 derives from the server's own wal_sender_timeout — leave it unset
-   *  unless you have a specific reason. */
+  /** Forwarded to start() when set. Omitted defaults to a value DERIVED from the server's own
+   *  wal_sender_timeout, read once per connect: max(60_000, wal_sender_timeout * 2) — a fixed
+   *  60s figure alone false-fires on a healthy idle stream once statusIntervalMs's own cadence
+   *  is factored in (D-07). When wal_sender_timeout reads 0 (disabled — the server never pings),
+   *  this is left off entirely and keepAlive is turned on instead, with a
+   *  'wal-sender-timeout-disabled' warning naming the setting. A value set here always wins over
+   *  the derived one. */
   receiveTimeoutMs?: number
   /** Forwarded to start() unchanged; see StartOptions.maxQueueBytes. */
   maxQueueBytes?: number
@@ -165,8 +171,8 @@ export class SlotBusyError extends Error {
  *  backfillTimeoutMs elapsed and the session is being abandoned. `slot-evicted`: onSlotBusy:
  *  'evict' terminated another backend holding the slot. `wal-sender-timeout-disabled`: the
  *  server's wal_sender_timeout reads 0 (no server-side liveness pings), so receiveTimeoutMs is
- *  left off and keepAlive is turned on instead (lands plan 04-03). A throw from onWarning is
- *  caught and reported to stderr, exactly like the raw layer's own onWarning. */
+ *  left off and keepAlive is turned on instead. A throw from onWarning is caught and reported to
+ *  stderr, exactly like the raw layer's own onWarning. */
 export type CdcWarning =
   | ReplicationWarning
   | { kind: 'reconnect-attempt'; attempt: number; delayMs: number; message: string }
@@ -254,6 +260,15 @@ async function evictAndAwaitClear(conn: ReplicationConnection, name: string, pid
   }
 }
 
+// Merges keepAlive: true into the connect config for the NEXT session only when D-07's wst = 0
+// branch decided this connect needs it and the consumer never set their own keepAlive — the
+// decision can only be made AFTER probing wal_sender_timeout on the connection it applies to, so
+// it always lags one connect behind the observation that produced it.
+function withDerivedKeepAlive(url: string | ReplicationConfig, forceKeepAlive: boolean): string | ReplicationConfig {
+  if (!forceKeepAlive) return url
+  return typeof url === 'string' ? { url, keepAlive: true } : { ...url, keepAlive: true }
+}
+
 /** Start a managed CDC session: connect, administer the slot, backfill inside the exported-
  *  snapshot window, then stream with ack tied to onTransaction's resolution. Returns the handle
  *  SYNCHRONOUSLY — the loop itself starts on a microtask, so a stop() called immediately after
@@ -267,13 +282,15 @@ export function replicate(opts: ReplicateOptions): ReplicateHandle {
   let repl: ReplicationConnection | null = null
   let current: Promise<unknown> | null = null // the in-flight backfill or handler promise, awaited by stop()
   let pendingAckLsn: string | null = null      // a done:true batch's endLsn once its handler resolves, until acked
-  let walSenderTimeoutMs: number | null = null // stashed for plan 04-03's timer derivation; unused here
+  let walSenderTimeoutMs: number | null = null // read once per connect; derives statusIntervalMs/receiveTimeoutMs and the wst=0 keepAlive fallback below
   let stopPromise: Promise<void> | null = null
   let sawSlot = false                    // D-08: absent on the FIRST observation creates the durable slot; absent on any LATER one invalidates it
   let lastSystemId: string | null = null // persisted across connects; a durable slot's systemId/timeline must never move under it
   let lastTimeline: number | null = null
+  let derivedKeepAlive = false // D-07: true once a connect measures wal_sender_timeout = 0 and the consumer didn't set their own keepAlive
   let currentSlotName: string | null = null // durable-session bookkeeping for the catch block's 42704 -> SlotInvalidatedError mapping below
   let currentIsDurable = false
+  const consumerSetKeepAlive = typeof opts.url !== 'string' && opts.url.keepAlive !== undefined
   const controller = new AbortController() // internal signal: reaches start()'s own signal, so stop() wakes a parked next()
   const effectiveRetryDelayMs = opts.retryDelayMs ?? defaultRetryDelayMs
   // CDC-02: the consumer's own signal behaves exactly like calling stop() — same teardown, same
@@ -301,7 +318,7 @@ export function replicate(opts: ReplicateOptions): ReplicateHandle {
       currentSlotName = null
       try {
         state = 'connecting'
-        repl = await replication(opts.url)
+        repl = await replication(withDerivedKeepAlive(opts.url, derivedKeepAlive))
         if (stopping) { repl.end(); state = 'stopped'; return }
 
         state = 'preparing'
@@ -311,6 +328,19 @@ export function replicate(opts: ReplicateOptions): ReplicateHandle {
         const raw = wst.rows[0]?.[0]
         walSenderTimeoutMs = raw == null ? null : Number(raw)
         if (stopping) { repl.end(); state = 'stopped'; return }
+
+        // D-07: both liveness timers derive from the server's own wal_sender_timeout rather than
+        // shipping as fixed constants — a fixed 60s receiveTimeoutMs false-fires at ~70s on a
+        // healthy idle stream (Pitfall 2), because the server only pings once the client has been
+        // silent for wal_sender_timeout/2, and a fixed 10s statusIntervalMs keeps resetting that
+        // clock. wst = 0 means the server never pings at all: leave receiveTimeoutMs off, lean on
+        // keepAlive for the NEXT connect instead, and say so.
+        const derivedStatusIntervalMs = walSenderTimeoutMs == null ? undefined : Math.max(10_000, walSenderTimeoutMs * 0.75)
+        const derivedReceiveTimeoutMs = walSenderTimeoutMs == null || walSenderTimeoutMs === 0 ? undefined : Math.max(60_000, walSenderTimeoutMs * 2)
+        derivedKeepAlive = walSenderTimeoutMs === 0 && !consumerSetKeepAlive
+        if (walSenderTimeoutMs === 0) {
+          deliverWarning(opts.onWarning, { kind: 'wal-sender-timeout-disabled', message: "minipg: the server's wal_sender_timeout is 0 (disabled) — it will never ping this connection, so receiveTimeoutMs is left off and keepAlive is enabled instead" })
+        }
 
         const isDurable = typeof opts.slot !== 'string'
         const name = typeof opts.slot === 'string' ? tempSlotName() : opts.slot.name
@@ -405,8 +435,8 @@ export function replicate(opts: ReplicateOptions): ReplicateHandle {
           shapes: opts.shapes,
           signal: controller.signal,
           messages: opts.messages,
-          statusIntervalMs: opts.statusIntervalMs,
-          receiveTimeoutMs: opts.receiveTimeoutMs,
+          statusIntervalMs: opts.statusIntervalMs ?? derivedStatusIntervalMs,
+          receiveTimeoutMs: opts.receiveTimeoutMs ?? derivedReceiveTimeoutMs,
           maxQueueBytes: opts.maxQueueBytes,
           binary: opts.binary,
           hydrateToast: opts.hydrateToast,
