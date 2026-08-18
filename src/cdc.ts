@@ -260,10 +260,10 @@ async function evictAndAwaitClear(conn: ReplicationConnection, name: string, pid
   }
 }
 
-// Merges keepAlive: true into the connect config for the NEXT session only when D-07's wst = 0
-// branch decided this connect needs it and the consumer never set their own keepAlive — the
-// decision can only be made AFTER probing wal_sender_timeout on the connection it applies to, so
-// it always lags one connect behind the observation that produced it.
+// Merges keepAlive: true into the connect config whenever the caller has decided this connect
+// needs it — D-07's wst = 0 case, forced onto the very connect that measured it via the one
+// reconnect in run() below, and carried onto every later session through derivedKeepAlive once
+// it's known.
 function withDerivedKeepAlive(url: string | ReplicationConfig, forceKeepAlive: boolean): string | ReplicationConfig {
   if (!forceKeepAlive) return url
   return typeof url === 'string' ? { url, keepAlive: true } : { ...url, keepAlive: true }
@@ -329,12 +329,26 @@ export function replicate(opts: ReplicateOptions): ReplicateHandle {
         walSenderTimeoutMs = raw == null ? null : Number(raw)
         if (stopping) { repl.end(); state = 'stopped'; return }
 
-        // D-07: both liveness timers derive from the server's own wal_sender_timeout rather than
+        // D-07: wst = 0 means the server never pings at all, so THIS connection needs keepAlive —
+        // but the setting can only be read after the socket exists, and this is that socket. If it
+        // didn't already carry keepAlive (derivedKeepAlive still reflects whatever the PREVIOUS
+        // session decided), reconnect once, now with it on, before anything else happens: no slot
+        // administration has run yet, so there is nothing to unwind. derivedKeepAlive flips to true
+        // right below, so this condition cannot hold twice for the same session.
+        if (walSenderTimeoutMs === 0 && !consumerSetKeepAlive && !derivedKeepAlive) {
+          repl.end()
+          state = 'connecting'
+          repl = await replication(withDerivedKeepAlive(opts.url, true))
+          if (stopping) { repl.end(); state = 'stopped'; return }
+          state = 'preparing'
+        }
+
+        // Both liveness timers derive from the server's own wal_sender_timeout rather than
         // shipping as fixed constants — a fixed 60s receiveTimeoutMs false-fires at ~70s on a
         // healthy idle stream (Pitfall 2), because the server only pings once the client has been
         // silent for wal_sender_timeout/2, and a fixed 10s statusIntervalMs keeps resetting that
-        // clock. wst = 0 means the server never pings at all: leave receiveTimeoutMs off, lean on
-        // keepAlive for the NEXT connect instead, and say so.
+        // clock. wst = 0 means the server never pings at all: leave receiveTimeoutMs off and rely
+        // on the keepAlive turned on above instead.
         const derivedStatusIntervalMs = walSenderTimeoutMs == null ? undefined : Math.max(10_000, walSenderTimeoutMs * 0.75)
         const derivedReceiveTimeoutMs = walSenderTimeoutMs == null || walSenderTimeoutMs === 0 ? undefined : Math.max(60_000, walSenderTimeoutMs * 2)
         derivedKeepAlive = walSenderTimeoutMs === 0 && !consumerSetKeepAlive
