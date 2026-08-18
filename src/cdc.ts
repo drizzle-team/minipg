@@ -380,6 +380,7 @@ export function replicate(opts: ReplicateOptions): ReplicateHandle {
           lastTimeline = identity.timeline
           if (stopping) { repl.end(); state = 'stopped'; return }
 
+          let evictions = 0 // caps S2 -> S2 rounds: two 'evict'-configured consumers pointed at the same slot must not terminate each other forever
           for (;;) { // S2 -> S2 on eviction: re-reads the row over the SAME connection, no reconnect, bounded only by evictAndAwaitClear's own ~3s deadline
             const row = await readSlotHealth(repl, name)
             if (stopping) { repl.end(); state = 'stopped'; return }
@@ -391,7 +392,10 @@ export function replicate(opts: ReplicateOptions): ReplicateHandle {
             if (row.wal_status === 'lost') throw new SlotInvalidatedError(name, 'wal-lost')
             if (row.confirmed_flush_lsn == null) throw new SlotInvalidatedError(name, 'no-confirmed-flush') // guards every LSN use below — this check must run first
             if (row.active === 't' && row.active_pid != null) {
-              if (opts.onSlotBusy !== 'evict') throw new SlotBusyError(name, Number(row.active_pid))
+              // A holder who keeps re-acquiring the slot after being evicted never heals by
+              // trying again — cap the rounds and diagnose it as a permanently busy slot instead
+              // of terminating backends in a tight, unbounded ping-pong.
+              if (opts.onSlotBusy !== 'evict' || ++evictions > 3) throw new SlotBusyError(name, Number(row.active_pid))
               await evictAndAwaitClear(repl, name, Number(row.active_pid), opts, controller.signal)
               if (stopping) { repl.end(); state = 'stopped'; return }
               continue

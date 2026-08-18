@@ -1350,3 +1350,39 @@ test('cdc W-01: onFatalError itself throwing does not produce an unhandled rejec
     process.off('unhandledRejection', onUnhandled)
   }
 })
+
+test('cdc WR-02: eviction rounds are capped — a rival that keeps re-acquiring the slot goes fatal instead of looping forever', async () => {
+  let terminateCalls = 0
+  const backend = cdcBackend({
+    onQuery: (sql) => {
+      if (sql.startsWith('select pg_terminate_backend')) {
+        terminateCalls++
+        return [rowDesc([{ name: 'pg_terminate_backend', oid: 25 }]), dataRow(['t']), ready()]
+      }
+      // The rival always wins the re-read after eviction clears — evictAndAwaitClear's own poll
+      // sees it gone, but the NEXT S2 health read finds it busy again forever.
+      if (sql.startsWith('select active from pg_replication_slots')) return [rowDesc([{ name: 'active', oid: 25 }]), dataRow(['f']), ready()]
+      if (sql.startsWith('select active,')) return [rowDesc(healthCols), dataRow(['t', '77777', 'reserved', '0/10', '0/8']), ready()]
+      return undefined
+    },
+  })
+  let fatalErr: Error | undefined
+  let retryCalled = false
+  const handle = replicate({
+    url: cfg({ socket: backend.socket }),
+    slot: { name: 'durable_pingpong' },
+    publications: ['pub'],
+    onSlotBusy: 'evict',
+    backfill: async () => {},
+    onTransaction: () => {},
+    retryDelayMs: () => { retryCalled = true; return 1 },
+    onFatalError: (err) => { fatalErr = err },
+  })
+  await until(() => fatalErr !== undefined)
+  expect(fatalErr).toBeInstanceOf(SlotBusyError)
+  expect((fatalErr as SlotBusyError).pid).toBe(77777)
+  expect(terminateCalls).toBe(3) // three eviction rounds, then it gives up rather than a fourth
+  expect(retryCalled).toBe(false) // SlotBusyError is permanent — no retry budget spent
+  expect(backend.sessions.length).toBe(1) // never reconnected — this is entirely S2 -> S2
+  await handle.stop()
+})
