@@ -909,3 +909,107 @@ test('cdc 42704: a slot-acquisition error during start() maps to SlotInvalidated
   expect(retryCalled).toBe(false)
   await handle.stop()
 })
+
+test('cdc slot busy error: default mode raises without terminating anyone', async () => {
+  const backend = cdcBackend({
+    onQuery: (sql) => sql.includes('pg_replication_slots')
+      ? [rowDesc(healthCols), dataRow(['t', '63139', 'reserved', '0/10', '0/8']), ready()]
+      : undefined,
+  })
+  let fatalErr: Error | undefined
+  let retryCalled = false
+  const handle = replicate({
+    url: cfg({ socket: backend.socket }),
+    slot: { name: 'durable_busy' },
+    publications: ['pub'],
+    backfill: async () => {},
+    onTransaction: () => {},
+    retryDelayMs: () => { retryCalled = true; return 1 },
+    onFatalError: (err) => { fatalErr = err },
+  })
+  await until(() => fatalErr !== undefined)
+  expect(fatalErr).toBeInstanceOf(SlotBusyError)
+  expect((fatalErr as SlotBusyError).slot).toBe('durable_busy')
+  expect((fatalErr as SlotBusyError).pid).toBe(63139)
+  expect(retryCalled).toBe(false)
+  expect(backend.sessions.length).toBe(1)
+  expect(backend.latest!.queries.some((q) => q.startsWith('select pg_terminate_backend'))).toBe(false)
+  await handle.stop()
+})
+
+test('cdc already gone: pg_terminate_backend returning f continues the eviction poll', async () => {
+  let terminateCalls = 0
+  let pollCalls = 0
+  const backend = cdcBackend({
+    onQuery: (sql) => {
+      if (sql.startsWith('select pg_terminate_backend')) {
+        terminateCalls++
+        return [rowDesc([{ name: 'pg_terminate_backend', oid: 25 }]), dataRow(['f']), ready()]
+      }
+      if (sql.startsWith('select active from pg_replication_slots')) {
+        pollCalls++
+        return [rowDesc([{ name: 'active', oid: 25 }]), dataRow(['f']), ready()]
+      }
+      if (sql.startsWith('select active,')) {
+        // First health read (before eviction runs): busy. The re-read after eviction: healthy.
+        return terminateCalls === 0
+          ? [rowDesc(healthCols), dataRow(['t', '63139', 'reserved', '0/10', '0/8']), ready()]
+          : [rowDesc(healthCols), dataRow(['f', null, 'reserved', '0/10', '0/8']), ready()]
+      }
+      return undefined
+    },
+  })
+  const warnings: CdcWarning[] = []
+  const handle = replicate({
+    url: cfg({ socket: backend.socket }),
+    slot: { name: 'durable_evict' },
+    publications: ['pub'],
+    onSlotBusy: 'evict',
+    backfill: async () => {},
+    onTransaction: () => {},
+    onWarning: (w) => { warnings.push(w) },
+  })
+  await until(() => !!backend.latest?.queries.some((q) => q.startsWith('START_REPLICATION')))
+  expect(terminateCalls).toBe(1)
+  expect(pollCalls).toBeGreaterThanOrEqual(1)
+  const evicted = warnings.find((w) => w.kind === 'slot-evicted')
+  expect(evicted).toBeDefined()
+  expect((evicted as { slot: string }).slot).toBe('durable_evict')
+  expect((evicted as { pid: number }).pid).toBe(63139)
+  await handle.stop()
+})
+
+test('cdc eviction denied: 42501 goes fatal without a retry or a further poll', async () => {
+  let terminateCalls = 0
+  let pollCalls = 0
+  const backend = cdcBackend({
+    onQuery: (sql) => {
+      if (sql.startsWith('select pg_terminate_backend')) {
+        terminateCalls++
+        return [errFrame('42501', 'must be a member of the role whose process is being terminated or member of pg_signal_backend'), ready()]
+      }
+      if (sql.startsWith('select active from pg_replication_slots')) { pollCalls++; return [rowDesc([{ name: 'active', oid: 25 }]), dataRow(['f']), ready()] }
+      if (sql.startsWith('select active,')) return [rowDesc(healthCols), dataRow(['t', '63139', 'reserved', '0/10', '0/8']), ready()]
+      return undefined
+    },
+  })
+  let fatalErr: Error | undefined
+  let retryCalled = false
+  const handle = replicate({
+    url: cfg({ socket: backend.socket }),
+    slot: { name: 'durable_denied' },
+    publications: ['pub'],
+    onSlotBusy: 'evict',
+    backfill: async () => {},
+    onTransaction: () => {},
+    retryDelayMs: () => { retryCalled = true; return 1 },
+    onFatalError: (err) => { fatalErr = err },
+  })
+  await until(() => fatalErr !== undefined)
+  expect(fatalErr).toBeInstanceOf(PgError)
+  expect((fatalErr as PgError).code).toBe('42501')
+  expect(terminateCalls).toBe(1)
+  expect(pollCalls).toBe(0)
+  expect(retryCalled).toBe(false)
+  await handle.stop()
+})

@@ -95,8 +95,7 @@ export interface ReplicateOptions {
    *  SlotBusyError — retrying a slot someone else legitimately holds never heals on its own.
    *  'evict' terminates the holding backend with pg_terminate_backend and polls until it clears;
    *  it needs the pg_signal_backend grant and fails permanently (42501) without it. Opt-in
-   *  because the driver cannot distinguish a stale zombie from a live consumer (lands plan
-   *  04-03). */
+   *  because the driver cannot distinguish a stale zombie from a live consumer. */
   onSlotBusy?: 'error' | 'evict'
   /** Fires instead of backfill when a durable slot already existed and passed its health check —
    *  there is nothing to backfill, the slot already carries a resumable position. A throw here
@@ -164,11 +163,10 @@ export class SlotBusyError extends Error {
  *  before attempt number `attempt` — fired both for a full reconnect (S6) and for the in-place
  *  handler retry (D-06), since both draw on the same D-01 budget. `backfill-timeout`:
  *  backfillTimeoutMs elapsed and the session is being abandoned. `slot-evicted`: onSlotBusy:
- *  'evict' terminated another backend holding the slot (lands plan 04-03).
- *  `wal-sender-timeout-disabled`: the server's wal_sender_timeout reads 0 (no
- *  server-side liveness pings), so receiveTimeoutMs is left off and keepAlive is turned on
- *  instead (lands plan 04-03). A throw from onWarning is caught and reported to stderr, exactly
- *  like the raw layer's own onWarning. */
+ *  'evict' terminated another backend holding the slot. `wal-sender-timeout-disabled`: the
+ *  server's wal_sender_timeout reads 0 (no server-side liveness pings), so receiveTimeoutMs is
+ *  left off and keepAlive is turned on instead (lands plan 04-03). A throw from onWarning is
+ *  caught and reported to stderr, exactly like the raw layer's own onWarning. */
 export type CdcWarning =
   | ReplicationWarning
   | { kind: 'reconnect-attempt'; attempt: number; delayMs: number; message: string }
@@ -214,11 +212,12 @@ const sleep = (ms: number, signal: AbortSignal): Promise<void> =>
   })
 
 // Mirrors isFatalAuth's shape (src/connection.ts:167-171): these never heal with time, so retrying
-// them identically ten times just delays onFatalError. SlotInvalidatedError and SlotBusyError join
-// the auth/publication/slot-name set: neither heals by waiting.
+// them identically ten times just delays onFatalError. SlotInvalidatedError, SlotBusyError, and
+// 42501 (eviction denied — missing pg_signal_backend) join the auth/publication/slot-name set:
+// none of them heal by waiting.
 function isPermanentFailure(err: unknown): boolean {
   const code = (err as { code?: string } | null)?.code
-  if (code === '28P01' || code === '28000' || code === '3D000') return true
+  if (code === '28P01' || code === '28000' || code === '3D000' || code === '42501') return true
   return err instanceof PublicationMissing || err instanceof PublicationEmpty || err instanceof InvalidSlotName ||
     err instanceof SlotInvalidatedError || err instanceof SlotBusyError
 }
@@ -232,6 +231,27 @@ async function readSlotHealth(conn: ReplicationConnection, name: string): Promis
   const r = await conn.command(`select active, active_pid, wal_status, confirmed_flush_lsn, restart_lsn from pg_replication_slots where slot_name = '${name}' and slot_type = 'logical'`)
   if (r.rows.length === 0) return null
   return Object.fromEntries(r.columns.map((c, i) => [c, r.rows[0]![i]])) as unknown as SlotHealthRow
+}
+
+// CDC-09's eviction procedure, entirely over command() (CDC-15): terminate the holding backend,
+// then poll until the slot reads inactive or a ~3s deadline passes. 't' and 'f' from
+// pg_terminate_backend both mean "keep polling" — 'f' is the already-gone case (per research,
+// pg_terminate_backend never raises 42704; that code belongs to pg_drop_replication_slot). A
+// 42501 PgError propagates out of command() untouched; the caller's isPermanentFailure()
+// classifies it, so eviction itself never has to know about retry budgets.
+async function evictAndAwaitClear(conn: ReplicationConnection, name: string, pid: number, opts: ReplicateOptions, signal: AbortSignal): Promise<void> {
+  if (!Number.isInteger(pid)) throw new SlotBusyError(name, pid) // the trust boundary: a server-sourced value about to ride into SQL
+  await conn.command(`select pg_terminate_backend(${pid})`)
+  const deadline = Date.now() + 3000
+  for (;;) {
+    const poll = await conn.command(`select active from pg_replication_slots where slot_name = '${name}'`)
+    if (poll.rows[0]?.[0] === 'f') {
+      deliverWarning(opts.onWarning, { kind: 'slot-evicted', slot: name, pid, message: `minipg: evicted PID ${pid} holding replication slot ${JSON.stringify(name)}` })
+      return
+    }
+    if (Date.now() >= deadline) throw new SlotBusyError(name, pid) // the active flag lags the backend's actual death by a beat — this is what 55006 guards against
+    await sleep(100, signal) // the handle's own signal, so stop() interrupts a stuck eviction cleanly
+  }
 }
 
 /** Start a managed CDC session: connect, administer the slot, backfill inside the exported-
@@ -311,21 +331,24 @@ export function replicate(opts: ReplicateOptions): ReplicateHandle {
           lastTimeline = identity.timeline
           if (stopping) { repl.end(); state = 'stopped'; return }
 
-          const row = await readSlotHealth(repl, name)
-          if (stopping) { repl.end(); state = 'stopped'; return }
-          if (!row) {
-            if (sawSlot) throw new SlotInvalidatedError(name, 'absent') // was there, now gone — D-02: never silently recreated
-            // else: first observation ever — fall through to createSlot below (D-08)
-          } else {
+          for (;;) { // S2 -> S2 on eviction: re-reads the row over the SAME connection, no reconnect, bounded only by evictAndAwaitClear's own ~3s deadline
+            const row = await readSlotHealth(repl, name)
+            if (stopping) { repl.end(); state = 'stopped'; return }
+            if (!row) {
+              if (!sawSlot) break // first observation ever: fall through to createSlot below (D-08)
+              throw new SlotInvalidatedError(name, 'absent') // was there, now gone — D-02: never silently recreated
+            }
             sawSlot = true
             if (row.wal_status === 'lost') throw new SlotInvalidatedError(name, 'wal-lost')
             if (row.confirmed_flush_lsn == null) throw new SlotInvalidatedError(name, 'no-confirmed-flush') // guards every LSN use below — this check must run first
             if (row.active === 't' && row.active_pid != null) {
-              // The full onSlotBusy branch (eviction) lands separately; for now the slot is
-              // simply busy, permanently, exactly like the 'error' mode of that option.
-              throw new SlotBusyError(name, Number(row.active_pid))
+              if (opts.onSlotBusy !== 'evict') throw new SlotBusyError(name, Number(row.active_pid))
+              await evictAndAwaitClear(repl, name, Number(row.active_pid), opts, controller.signal)
+              if (stopping) { repl.end(); state = 'stopped'; return }
+              continue
             }
             resumed = { confirmedFlush: row.confirmed_flush_lsn, restartLsn: row.restart_lsn! }
+            break
           }
         }
         if (stopping) { repl.end(); state = 'stopped'; return }
@@ -438,7 +461,8 @@ export function replicate(opts: ReplicateOptions): ReplicateHandle {
         repl?.end()
         if (stopping) { state = 'stopped'; return }
         // CDC-09's correction: 42704 belongs to slot ACQUISITION (e.g. start() racing a manual
-        // drop on a durable slot), never to pg_terminate_backend.
+        // drop on a durable slot), never to pg_terminate_backend — 'already gone' from THAT path
+        // is a plain 'f' row, handled inside evictAndAwaitClear above.
         const err: Error = currentIsDurable && rawErr instanceof PgError && rawErr.code === '42704'
           ? new SlotInvalidatedError(currentSlotName!, 'absent')
           : (rawErr as Error)
