@@ -1,7 +1,7 @@
 // replication(): logical replication over the real auth/transport stack (TCP + SCRAM here).
 // Requires the local cluster with wal_level=logical (test/setup-pg.sh cluster, reconfigured).
 import { test, expect, describe } from 'bun:test'
-import { replication, connect, defineType, Jsonb, Collect, Transform, ReplicationStreamEnded, ReplicationBusy, ReplicationReceiveTimeout, PublicationMissing, PublicationEmpty, PgError, batchTransactions, type ReplicationEvent, type ReplicationWarning, type TableShape, type TransactionBatch } from '../../src/index.ts'
+import { replication, connect, defineType, Jsonb, Collect, Transform, ReplicationStreamEnded, ReplicationBusy, ReplicationReceiveTimeout, PublicationMissing, PublicationEmpty, PgError, batchTransactions, lsnFromString, type ReplicationEvent, type ReplicationWarning, type TableShape, type TransactionBatch } from '../../src/index.ts'
 import { replicate } from '../../src/cdc.ts'
 import { TEST_CONFIG, withConn, testPool, TEST_TIMEOUT } from '../helpers/db.ts'
 
@@ -871,6 +871,274 @@ describe('replication()', () => {
       }
     })
   }, 15_000)
+
+  test('cdc slot health: a durable slot is created when absent and health-checked on reconnect', async () => {
+    await withConn(async (c) => {
+      await c.query(`create table ${K}_cdchealth(id int4 primary key)`)
+      await c.query(`create publication ${K}_cdchealthpub for table ${K}_cdchealth`)
+      const slotName = `${K}_cdchealthslot`
+      try {
+        let backfillCalls = 0
+        let firstIsReconnect: boolean | undefined
+        let resolveSlotCreated: (() => void) | undefined
+        const slotCreated = new Promise<void>((resolve) => { resolveSlotCreated = resolve })
+        let resolveFirst: (() => void) | undefined
+        const firstStreamed = new Promise<void>((resolve) => { resolveFirst = resolve })
+        const handle = replicate({
+          url: TEST_CONFIG,
+          slot: { name: slotName },
+          publications: [`${K}_cdchealthpub`],
+          backfill: async ({ isReconnect }) => { backfillCalls++; firstIsReconnect = isReconnect; resolveSlotCreated?.() },
+          onTransaction: (batch) => {
+            if (batch.done && batch.events.some((e) => e.kind === 'insert')) resolveFirst?.()
+          },
+        })
+        try {
+          await slotCreated // the slot must exist before the insert, or it lands before the slot's restart point
+          await c.query(`insert into ${K}_cdchealth values (1)`)
+          await Promise.race([
+            firstStreamed,
+            Bun.sleep(10_000).then(() => { throw new Error('timed out waiting for the first insert to stream') }),
+          ])
+        } finally { await handle.stop() }
+        expect(backfillCalls).toBe(1) // creation path only
+        expect(firstIsReconnect).toBe(false)
+
+        const health = await c.query(`select confirmed_flush_lsn::text from pg_replication_slots where slot_name = '${slotName}'`)
+        expect((health.rows[0] as unknown[])[0]).not.toBeNull()
+
+        // a fresh handle against the SAME durable slot: resumes, no createSlot/backfill
+        let secondBackfillCalls = 0
+        let onResumeFired = false
+        let resolveSecond: (() => void) | undefined
+        const secondStreamed = new Promise<void>((resolve) => { resolveSecond = resolve })
+        const handle2 = replicate({
+          url: TEST_CONFIG,
+          slot: { name: slotName },
+          publications: [`${K}_cdchealthpub`],
+          backfill: async () => { secondBackfillCalls++ },
+          onResume: () => { onResumeFired = true },
+          onTransaction: (batch) => {
+            if (batch.done && batch.events.some((e) => e.kind === 'insert')) resolveSecond?.()
+          },
+        })
+        try {
+          await c.query(`insert into ${K}_cdchealth values (2)`)
+          await Promise.race([
+            secondStreamed,
+            Bun.sleep(10_000).then(() => { throw new Error('timed out waiting for the second insert to stream') }),
+          ])
+        } finally { await handle2.stop() }
+        expect(onResumeFired).toBe(true)
+        expect(secondBackfillCalls).toBe(0)
+      } finally {
+        const r2 = await replication(TEST_CONFIG)
+        try { await r2.dropSlot(slotName) } finally { r2.end() }
+        await c.query(`drop publication ${K}_cdchealthpub`)
+        await c.query(`drop table ${K}_cdchealth`)
+      }
+    })
+  }, 20_000)
+
+  test('cdc onResume: an existing durable slot reports confirmedFlush and restartLsn and backfill is not called', async () => {
+    await withConn(async (c) => {
+      await c.query(`create table ${K}_cdcresume(id int4 primary key)`)
+      await c.query(`create publication ${K}_cdcresumepub for table ${K}_cdcresume`)
+      const slotName = `${K}_cdcresumeslot`
+      const raw = await replication(TEST_CONFIG)
+      try { await raw.createSlot(slotName) } finally { raw.end() } // durable, no export needed
+      try {
+        let backfillCalls = 0
+        let resumePayload: { confirmedFlush: string; restartLsn: string } | undefined
+        let resolveStreamed: (() => void) | undefined
+        const streamed = new Promise<void>((resolve) => { resolveStreamed = resolve })
+        const handle = replicate({
+          url: TEST_CONFIG,
+          slot: { name: slotName },
+          publications: [`${K}_cdcresumepub`],
+          backfill: async () => { backfillCalls++ },
+          onResume: (info) => { resumePayload = info },
+          onTransaction: (batch) => {
+            if (batch.done && batch.events.some((e) => e.kind === 'insert')) resolveStreamed?.()
+          },
+        })
+        try {
+          await c.query(`insert into ${K}_cdcresume values (1)`)
+          await Promise.race([
+            streamed,
+            Bun.sleep(10_000).then(() => { throw new Error('timed out waiting for the insert to stream') }),
+          ])
+        } finally { await handle.stop() }
+        expect(backfillCalls).toBe(0)
+        expect(resumePayload).toBeDefined()
+        expect(lsnFromString(resumePayload!.confirmedFlush)).toBeGreaterThan(0n)
+        expect(lsnFromString(resumePayload!.restartLsn)).toBeGreaterThan(0n)
+      } finally {
+        const r2 = await replication(TEST_CONFIG)
+        try { await r2.dropSlot(slotName) } finally { r2.end() }
+        await c.query(`drop publication ${K}_cdcresumepub`)
+        await c.query(`drop table ${K}_cdcresume`)
+      }
+    })
+  }, 15_000)
+
+  test('cdc backfill window: the exported snapshot excludes rows inserted after slot creation', async () => {
+    await withConn(async (c) => {
+      await c.query(`create table ${K}_cdcwin(id int4 primary key)`)
+      await c.query(`create publication ${K}_cdcwinpub for table ${K}_cdcwin`)
+      await c.query(`insert into ${K}_cdcwin values (1)`) // baseline: visible to the snapshot
+      try {
+        let baselineSeen: number[] = []
+        let postSlotVisible = false
+        let resolveStreamed: (() => void) | undefined
+        const streamed = new Promise<void>((resolve) => { resolveStreamed = resolve })
+        const handle = replicate({
+          url: TEST_CONFIG,
+          slot: 'temporary',
+          publications: [`${K}_cdcwinpub`],
+          backfill: async ({ snapshot }) => {
+            await c.query(`insert into ${K}_cdcwin values (2)`) // strictly post-slot: stream-only
+            const seen = await withConn(async (bc) =>
+              bc.begin({ isolation: 'repeatable read' }, async (tx) => {
+                await tx.query(`set transaction snapshot '${snapshot}'`)
+                return tx.query(`select id from ${K}_cdcwin order by id`)
+              }))
+            baselineSeen = (seen.rows as unknown[][]).map((row) => row[0] as number)
+            postSlotVisible = baselineSeen.includes(2)
+          },
+          onTransaction: (batch) => {
+            if (batch.done && batch.events.some((e) => e.kind === 'insert' && (e as Extract<ReplicationEvent, { kind: 'insert' }>).new.id === 2)) resolveStreamed?.()
+          },
+        })
+        try {
+          await Promise.race([
+            streamed,
+            Bun.sleep(10_000).then(() => { throw new Error('timed out waiting for the post-slot insert to stream') }),
+          ])
+        } finally { await handle.stop() }
+        expect(baselineSeen).toEqual([1]) // baseline visible to the exported snapshot
+        expect(postSlotVisible).toBe(false) // post-slot row invisible to the same snapshot
+      } finally {
+        await c.query(`drop publication ${K}_cdcwinpub`)
+        await c.query(`drop table ${K}_cdcwin`)
+      }
+    })
+  }, 15_000)
+
+  test('cdc slot busy evict: eviction terminates the holder and streaming proceeds', async () => {
+    await withConn(async (c) => {
+      await c.query(`create table ${K}_cdcevict(id int4 primary key)`)
+      await c.query(`create publication ${K}_cdcevictpub for table ${K}_cdcevict`)
+      const slotName = `${K}_cdcevictslot`
+      const holder = await replication(TEST_CONFIG)
+      await holder.createSlot(slotName)
+      const holderGen = holder.start({ slot: slotName, publications: [`${K}_cdcevictpub`] })
+      const holderNext = holderGen.next() // parks, but START_REPLICATION lands first -> active_pid is set
+      await Bun.sleep(300)
+      const activeRow = await c.query(`select active from pg_replication_slots where slot_name = '${slotName}'`)
+      expect((activeRow.rows[0] as unknown[])[0]).toBe(true)
+
+      try {
+        const warnings: string[] = []
+        let resolveStreamed: (() => void) | undefined
+        const streamed = new Promise<void>((resolve) => { resolveStreamed = resolve })
+        const handle = replicate({
+          url: TEST_CONFIG,
+          slot: { name: slotName },
+          publications: [`${K}_cdcevictpub`],
+          onSlotBusy: 'evict',
+          onWarning: (w) => { if (w.kind === 'slot-evicted') warnings.push(w.kind) },
+          onTransaction: (batch) => {
+            if (batch.done && batch.events.some((e) => e.kind === 'insert')) resolveStreamed?.()
+          },
+        })
+        try {
+          await c.query(`insert into ${K}_cdcevict values (1)`)
+          await Promise.race([
+            streamed,
+            Bun.sleep(10_000).then(() => { throw new Error('timed out waiting for eviction to unblock streaming') }),
+          ])
+          expect(warnings).toContain('slot-evicted')
+
+          // The insert above may have already queued a begin/insert/commit for the holder before
+          // its termination reached the socket, so the FIRST next() can resolve normally — loop
+          // until the terminate's FATAL (or a clean end) actually surfaces.
+          let holderErr: unknown
+          try {
+            let r = await holderNext
+            while (!r.done) r = await holderGen.next()
+          } catch (e) { holderErr = e }
+          expect(holderErr).toBeInstanceOf(Error) // PgError 57P01, a socket error, or ReplicationStreamEnded — all mean "terminated"
+        } finally { await handle.stop() }
+      } finally {
+        holder.end()
+        const r2 = await replication(TEST_CONFIG)
+        try { await r2.dropSlot(slotName) } finally { r2.end() }
+        await c.query(`drop publication ${K}_cdcevictpub`)
+        await c.query(`drop table ${K}_cdcevict`)
+      }
+    })
+  }, 20_000)
+
+  test('cdc reconnect: a killed walsender is survived and the durable slot resumes without backfill', async () => {
+    await withConn(async (c) => {
+      await c.query(`create table ${K}_cdcrec(id int4 primary key)`)
+      await c.query(`create publication ${K}_cdcrecpub for table ${K}_cdcrec`)
+      const slotName = `${K}_cdcrecslot`
+      try {
+        let backfillCalls = 0
+        let reconnectWarnings = 0
+        let resumeCalls = 0
+        let resolveSlotCreated: (() => void) | undefined
+        const slotCreated = new Promise<void>((resolve) => { resolveSlotCreated = resolve })
+        let resolveFirst: (() => void) | undefined
+        const firstStreamed = new Promise<void>((resolve) => { resolveFirst = resolve })
+        let resolveSecond: (() => void) | undefined
+        const secondStreamed = new Promise<void>((resolve) => { resolveSecond = resolve })
+        const handle = replicate({
+          url: TEST_CONFIG,
+          slot: { name: slotName },
+          publications: [`${K}_cdcrecpub`],
+          backfill: async () => { backfillCalls++; resolveSlotCreated?.() },
+          onResume: () => { resumeCalls++ },
+          onWarning: (w) => { if (w.kind === 'reconnect-attempt') reconnectWarnings++ },
+          onTransaction: (batch) => {
+            if (!batch.done) return
+            if (batch.events.some((e) => e.kind === 'insert' && (e as Extract<ReplicationEvent, { kind: 'insert' }>).new.id === 1)) resolveFirst?.()
+            if (batch.events.some((e) => e.kind === 'insert' && (e as Extract<ReplicationEvent, { kind: 'insert' }>).new.id === 2)) resolveSecond?.()
+          },
+        })
+        try {
+          await slotCreated // the slot must exist before the insert, or it lands before the slot's restart point
+          await c.query(`insert into ${K}_cdcrec values (1)`)
+          await Promise.race([
+            firstStreamed,
+            Bun.sleep(10_000).then(() => { throw new Error('timed out waiting for the first insert to stream') }),
+          ])
+          expect(backfillCalls).toBe(1) // creation path only
+
+          const pidRow = await c.query(`select active_pid from pg_replication_slots where slot_name = '${slotName}'`)
+          const pid = (pidRow.rows[0] as unknown[])[0] as number
+          expect(pid).toBeGreaterThan(0)
+          await c.query(`select pg_terminate_backend(${pid})`)
+
+          await c.query(`insert into ${K}_cdcrec values (2)`)
+          await Promise.race([
+            secondStreamed,
+            Bun.sleep(15_000).then(() => { throw new Error('timed out waiting for the second insert to stream after reconnect') }),
+          ])
+          expect(backfillCalls).toBe(1) // reconnect resumed the durable slot — no second backfill
+          expect(reconnectWarnings).toBeGreaterThan(0)
+          expect(resumeCalls).toBeGreaterThan(0)
+        } finally { await handle.stop() }
+      } finally {
+        const r2 = await replication(TEST_CONFIG)
+        try { await r2.dropSlot(slotName) } finally { r2.end() }
+        await c.query(`drop publication ${K}_cdcrecpub`)
+        await c.query(`drop table ${K}_cdcrec`)
+      }
+    })
+  }, 20_000)
 })
 
 // keep the import used even if helpers change
