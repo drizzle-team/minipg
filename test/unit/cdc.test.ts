@@ -1082,3 +1082,115 @@ test('cdc wal_sender_timeout zero: receive timeout stays off, keepAlive on from 
     globalThis.setInterval = realSetInterval
   }
 })
+
+test('cdc 55006: object_in_use after eviction retries the session instead of failing permanently', async () => {
+  // Contrast with 'cdc eviction denied' above: 42501 (missing pg_signal_backend) is permanent,
+  // 55006 (the slot briefly still active server-side right after termination) is not — it has no
+  // named branch in src/cdc.ts at all, so the assertion is that isPermanentFailure() genuinely
+  // omits it, not a re-implementation of the omission.
+  let healthReadsSession0 = 0
+  let terminateCalls = 0
+  let startCallsSession0 = 0
+  const backend = cdcBackend({
+    onQuery: (sql, session) => {
+      if (sql.startsWith('select pg_terminate_backend')) {
+        terminateCalls++
+        return [rowDesc([{ name: 'pg_terminate_backend', oid: 25 }]), dataRow(['t']), ready()]
+      }
+      if (sql.startsWith('select active from pg_replication_slots')) {
+        return [rowDesc([{ name: 'active', oid: 25 }]), dataRow(['f']), ready()] // clears right away
+      }
+      if (sql.startsWith('select active,')) {
+        if (session === 0) {
+          healthReadsSession0++
+          // first read on session 0: busy, drives eviction; the re-read after eviction's continue: healthy
+          return healthReadsSession0 === 1
+            ? [rowDesc(healthCols), dataRow(['t', '24680', 'reserved', '0/10', '0/8']), ready()]
+            : [rowDesc(healthCols), dataRow(['f', null, 'reserved', '0/10', '0/8']), ready()]
+        }
+        return [rowDesc(healthCols), dataRow(['f', null, 'reserved', '0/10', '0/8']), ready()] // already clear on retry
+      }
+      if (sql.startsWith('START_REPLICATION') && session === 0) {
+        startCallsSession0++
+        return [errFrame('55006', 'replication slot "durable_55006" is active for PID 24680'), ready()]
+      }
+      return undefined
+    },
+  })
+
+  const warnings: CdcWarning[] = []
+  let fatalErr: Error | undefined
+  const handle = replicate({
+    url: cfg({ socket: backend.socket }),
+    slot: { name: 'durable_55006' },
+    publications: ['pub'],
+    onSlotBusy: 'evict',
+    backfill: async () => {},
+    onTransaction: () => {},
+    retryDelayMs: () => 1,
+    onWarning: (w) => { warnings.push(w) },
+    onFatalError: (err) => { fatalErr = err },
+  })
+
+  // session 0's START_REPLICATION rejects with 55006; the layer must open a second session
+  // (a further attempt) and reach a real START_REPLICATION there, never firing onFatalError.
+  await until(() => backend.sessions.length >= 2 && !!backend.latest?.queries.some((q) => q.startsWith('START_REPLICATION')))
+  expect(startCallsSession0).toBe(1)
+  expect(terminateCalls).toBe(1) // eviction ran once; the retry's re-read already saw the slot clear
+  expect(fatalErr).toBeUndefined()
+  expect(warnings.some((w) => w.kind === 'reconnect-attempt')).toBe(true) // 55006 consumed an ordinary retry attempt
+  await Bun.sleep(50)
+  expect(fatalErr).toBeUndefined() // still no fatal after settling
+  await handle.stop()
+})
+
+test('cdc eviction deadline: an active slot that never clears raises SlotBusyError, not a forever poll', async () => {
+  // The ~3s deadline in evictAndAwaitClear is real wall-clock arithmetic (Date.now() vs a fixed
+  // deadline) — driven here by advancing what THAT comparison observes, once the poll loop has
+  // genuinely started, rather than waiting out 3 real seconds or reimplementing the arithmetic.
+  let terminateCalls = 0
+  let pollCalls = 0
+  let armDeadline = false
+  const backend = cdcBackend({
+    onQuery: (sql) => {
+      if (sql.startsWith('select pg_terminate_backend')) {
+        terminateCalls++
+        return [rowDesc([{ name: 'pg_terminate_backend', oid: 25 }]), dataRow(['t']), ready()]
+      }
+      if (sql.startsWith('select active from pg_replication_slots')) {
+        pollCalls++
+        armDeadline = true // the deadline was already computed before this first poll landed
+        return [rowDesc([{ name: 'active', oid: 25 }]), dataRow(['t']), ready()] // never clears
+      }
+      if (sql.startsWith('select active,')) {
+        return [rowDesc(healthCols), dataRow(['t', '55221', 'reserved', '0/10', '0/8']), ready()]
+      }
+      return undefined
+    },
+  })
+
+  const realNow = Date.now
+  Date.now = () => armDeadline ? realNow() + 5000 : realNow()
+
+  let fatalErr: Error | undefined
+  try {
+    const handle = replicate({
+      url: cfg({ socket: backend.socket }),
+      slot: { name: 'durable_deadline' },
+      publications: ['pub'],
+      onSlotBusy: 'evict',
+      backfill: async () => {},
+      onTransaction: () => {},
+      onFatalError: (err) => { fatalErr = err },
+    })
+    await until(() => fatalErr !== undefined)
+    expect(fatalErr).toBeInstanceOf(SlotBusyError)
+    expect((fatalErr as SlotBusyError).slot).toBe('durable_deadline')
+    expect((fatalErr as SlotBusyError).pid).toBe(55221)
+    expect(terminateCalls).toBe(1)
+    expect(pollCalls).toBe(1) // the deadline trips on the very first poll once Date.now() reports it elapsed
+    await handle.stop()
+  } finally {
+    Date.now = realNow
+  }
+})
