@@ -56,6 +56,10 @@
       "types": "./dist/replication.d.ts",
       "import": "./dist/replication.js"
     },
+    "./cdc": {
+      "types": "./dist/cdc.d.ts",
+      "import": "./dist/cdc.js"
+    },
     "./neon-ws": {
       "types": "./dist/neon-ws.d.ts",
       "import": "./dist/neon-ws.js"

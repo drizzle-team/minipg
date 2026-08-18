@@ -2,6 +2,7 @@
 // Requires the local cluster with wal_level=logical (test/setup-pg.sh cluster, reconfigured).
 import { test, expect, describe } from 'bun:test'
 import { replication, connect, defineType, Jsonb, Collect, Transform, ReplicationStreamEnded, ReplicationBusy, ReplicationReceiveTimeout, PublicationMissing, PublicationEmpty, PgError, batchTransactions, type ReplicationEvent, type ReplicationWarning, type TableShape, type TransactionBatch } from '../../src/index.ts'
+import { replicate } from '../../src/cdc.ts'
 import { TEST_CONFIG, withConn, testPool, TEST_TIMEOUT } from '../helpers/db.ts'
 
 const K = `repl_${process.pid}`
@@ -817,6 +818,59 @@ describe('replication()', () => {
       }
     })
   }, TEST_TIMEOUT)
+
+  test('cdc temporary slot: the naive four-line sketch backfills in the window and streams', async () => {
+    await withConn(async (c) => {
+      await c.query(`create table ${K}_cdc(id int4 primary key)`)
+      await c.query(`create publication ${K}_cdcpub for table ${K}_cdc`)
+      await c.query(`insert into ${K}_cdc values (1)`)
+      let backfillRows: number[] = []
+      const batches: TransactionBatch[] = []
+      let releaseBackfillRead: (() => void) | undefined
+      const backfillRead = new Promise<void>((resolve) => { releaseBackfillRead = resolve })
+      let allowBackfillToReturn: (() => void) | undefined
+      const insertDone = new Promise<void>((resolve) => { allowBackfillToReturn = resolve })
+      let resolveStreamed: (() => void) | undefined
+      const streamed = new Promise<void>((resolve) => { resolveStreamed = resolve })
+
+      const handle = replicate({
+        url: TEST_CONFIG,
+        slot: 'temporary',
+        publications: [`${K}_cdcpub`],
+        backfill: async ({ snapshot }) => {
+          await withConn(async (bc) => {
+            await bc.query('begin isolation level repeatable read')
+            await bc.query(`set transaction snapshot '${snapshot}'`)
+            const r = await bc.query(`select id from ${K}_cdc order by id`)
+            backfillRows = (r.rows as unknown[][]).map((row) => row[0] as number)
+            await bc.query('commit')
+          })
+          releaseBackfillRead?.()
+          await insertDone // still inside the backfill window: no command runs on the replication connection meanwhile
+        },
+        onTransaction: (batch) => {
+          batches.push(batch)
+          if (batch.done && batch.events.some((e) => e.kind === 'insert')) resolveStreamed?.()
+        },
+      })
+      try {
+        await backfillRead
+        await c.query(`insert into ${K}_cdc values (2)`) // strictly post-slot: stream-only
+        allowBackfillToReturn?.()
+        await Promise.race([
+          streamed,
+          Bun.sleep(10_000).then(() => { throw new Error('timed out waiting for the post-slot insert to stream') }),
+        ])
+        expect(backfillRows).toEqual([1])
+        const ins = batches.flatMap((b) => b.events).find((e) => e.kind === 'insert') as Extract<ReplicationEvent, { kind: 'insert' }> | undefined
+        expect(ins?.new.id).toBe(2)
+      } finally {
+        await handle.stop()
+        await c.query(`drop publication ${K}_cdcpub`)
+        await c.query(`drop table ${K}_cdc`)
+      }
+    })
+  }, 15_000)
 })
 
 // keep the import used even if helpers change
