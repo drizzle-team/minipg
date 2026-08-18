@@ -56,10 +56,12 @@ export interface ReplicateOptions {
    *  level repeatable read`, `set transaction snapshot '<snapshot>'` (outside REPEATABLE READ or
    *  SERIALIZABLE the server raises 0A000), read the baseline, then commit. isReconnect is false
    *  on the handle's first invocation and true when a dropped connection forced a new session
-   *  (CDC-13). A throw here retries like a connection failure, bounded by retryDelayMs —
-   *  backfill has no cheap path (it only ever runs on a session that just created a slot), so
-   *  the retry rebuilds the whole session: new slot, new snapshot, backfill again with
-   *  isReconnect true (D-03). */
+   *  (CDC-13). A throw here retries IN PLACE, bounded by retryDelayMs: the same slot, the same
+   *  exported snapshot, and the same isReconnect value are handed to another call to backfill —
+   *  no new slot, no new snapshot, no reconnect. The snapshot survives an in-place retry because
+   *  the layer still issues zero commands on the replication connection between attempts; it
+   *  only dies once one runs (SQLSTATE 22023), which START_REPLICATION is. Only a
+   *  backfillTimeoutMs timeout abandons the session and takes the full reconnect path instead. */
   backfill?: (info: { snapshot: string; streamStartLsn: string; isReconnect: boolean; signal: AbortSignal }) => void | Promise<void>
   /** Abandon the session if backfill has not resolved within this many ms (omitted = unbounded).
    *  Fires BackfillTimeoutError and routes through retryDelayMs like a connection failure
@@ -429,16 +431,38 @@ export function replicate(opts: ReplicateOptions): ReplicateHandle {
           const isReconnect = !firstBackfill
           firstBackfill = false
           try {
-            // ZERO commands run on this connection inside the window: the very next thing sent
-            // below is START_REPLICATION.
-            const p = Promise.resolve(opts.backfill?.({ snapshot: created.snapshot, streamStartLsn: created.consistentPoint, isReconnect, signal: window.signal }))
-            current = p
-            await p
-            window.signal.throwIfAborted() // a backfill that ignored the signal still fails the window
+            // A non-timeout throw retries IN PLACE, on the SAME slot/snapshot/window — no new
+            // session, no new slot, no new snapshot (D-03, D-06's shape applied to backfill).
+            // The deadline above bounds the whole window, retries included: it is armed once,
+            // outside this loop, and never re-armed per attempt.
+            for (;;) {
+              try {
+                // ZERO commands run on this connection inside the window: the very next thing
+                // sent below (on success) is START_REPLICATION.
+                const p = Promise.resolve(opts.backfill?.({ snapshot: created.snapshot, streamStartLsn: created.consistentPoint, isReconnect, signal: window.signal }))
+                current = p
+                await p
+                current = null
+                window.signal.throwIfAborted() // a backfill that ignored the signal still fails the window
+                break
+              } catch (backfillErr) {
+                current = null
+                // The deadline firing is identified by the window's own abort reason, never by
+                // message text — it is the one throw that abandons the session instead of
+                // retrying in place, because a partial backfill is never usable (CDC-12).
+                if (window.signal.reason instanceof BackfillTimeoutError) throw window.signal.reason
+                if (stopping) { repl.end(); state = 'stopped'; return }
+                attempt++
+                const delay = effectiveRetryDelayMs(attempt, backfillErr as Error)
+                if (delay == null) { fireFatal(backfillErr as Error); return }
+                deliverWarning(opts.onWarning, { kind: 'reconnect-attempt', attempt, delayMs: delay, message: `minipg: backfill threw (${(backfillErr as Error).message}) — retrying the same snapshot in place in ${delay}ms (attempt ${attempt})` })
+                await sleep(delay, controller.signal)
+                if (stopping) { repl.end(); state = 'stopped'; return }
+              }
+            }
           } finally {
             clearTimeout(deadline)
             controller.signal.removeEventListener('abort', onWindowAbort)
-            current = null
           }
         }
 

@@ -1235,3 +1235,64 @@ test('cdc stop guards buffered batches: onTransaction never runs again once stop
   await Bun.sleep(30) // give a wrongly-scheduled second invocation a chance to run
   expect(calls).toBe(1)
 })
+
+test('cdc CR-02: a durable backfill throw retries in place, on the same snapshot, no new slot, no onResume', async () => {
+  const backend = cdcBackend({
+    // Session 0: zero rows -> durable create path. Any later session (a reconnect, which the
+    // fix must never cause): the slot now exists and is healthy — this is what makes the
+    // counterfactual (no in-place retry) manifest CR-02's actual bug, a silent resume, instead
+    // of timing out some other way.
+    onQuery: (sql, session) => sql.includes('pg_replication_slots')
+      ? (session === 0 ? [rowDesc(healthCols), ready()] : [rowDesc(healthCols), dataRow(['f', null, 'reserved', '0/10', '0/8']), ready()])
+      : undefined,
+  })
+  const backfillCalls: { snapshot: string; streamStartLsn: string; isReconnect: boolean }[] = []
+  let onResumeCalls = 0
+  const handle = replicate({
+    url: cfg({ socket: backend.socket }),
+    slot: { name: 'durable_backfill_retry' },
+    publications: ['pub'],
+    backfill: async ({ snapshot, streamStartLsn, isReconnect }) => {
+      backfillCalls.push({ snapshot, streamStartLsn, isReconnect })
+      if (backfillCalls.length === 1) throw new Error('backfill failed once')
+    },
+    onResume: async () => { onResumeCalls++ },
+    onTransaction: () => {},
+    retryDelayMs: () => 1,
+  })
+  await until(() => !!backend.latest?.queries.some((q) => q.startsWith('START_REPLICATION')))
+  expect(backfillCalls.length).toBe(2)
+  expect(backfillCalls[0]!.snapshot).toBe(backfillCalls[1]!.snapshot)
+  expect(backfillCalls[0]!.streamStartLsn).toBe(backfillCalls[1]!.streamStartLsn)
+  expect(backfillCalls[0]!.isReconnect).toBe(false)
+  expect(backfillCalls[1]!.isReconnect).toBe(false) // still the SAME window, never a rebuilt session
+  expect(onResumeCalls).toBe(0) // never took the resume path — this is still the create-slot session
+  expect(backend.sessions.length).toBe(1) // no reconnect for the whole retry
+  expect(backend.latest!.queries.filter((q) => q.startsWith('CREATE_REPLICATION_SLOT')).length).toBe(1)
+  await handle.stop()
+})
+
+test('cdc CR-02: a backfillTimeoutMs timeout on a durable slot still abandons the session (full path)', async () => {
+  const backend = cdcBackend({
+    onQuery: (sql) => sql.includes('pg_replication_slots') ? [rowDesc(healthCols), ready()] : undefined,
+  })
+  let backfillCalls = 0
+  let fatalErr: Error | undefined
+  const handle = replicate({
+    url: cfg({ socket: backend.socket }),
+    slot: { name: 'durable_backfill_timeout' },
+    publications: ['pub'],
+    backfillTimeoutMs: 30,
+    backfill: async ({ signal }) => {
+      backfillCalls++
+      await new Promise<void>((resolve) => { signal.addEventListener('abort', () => resolve(), { once: true }) })
+    },
+    onTransaction: () => {},
+    retryDelayMs: (_attempt, err) => { fatalErr = err; return null }, // one capture, then stop
+    onFatalError: () => {},
+  })
+  await until(() => fatalErr !== undefined)
+  expect(fatalErr).toBeInstanceOf(BackfillTimeoutError)
+  expect(backfillCalls).toBe(1) // never retried in place — a timeout routes through the outer catch, not the retry loop
+  await handle.stop()
+})
