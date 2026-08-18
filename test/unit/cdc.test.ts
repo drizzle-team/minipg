@@ -1194,3 +1194,44 @@ test('cdc eviction deadline: an active slot that never clears raises SlotBusyErr
     Date.now = realNow
   }
 })
+
+test('cdc stop guards buffered batches: onTransaction never runs again once stop() is called', async () => {
+  // CR-01: next() drains its queue before honoring `ended`, so a transaction fully received and
+  // buffered while the handler is parked on an earlier one must not still reach onTransaction —
+  // even though the raw layer already has it queued when stop() is called.
+  const backend = cdcBackend()
+  let calls = 0
+  let release: (() => void) | undefined
+  const handle = replicate({
+    url: cfg({ socket: backend.socket }),
+    slot: 'temporary',
+    publications: ['pub'],
+    backfill: async () => {},
+    onTransaction: async () => {
+      calls++
+      if (calls === 1) await new Promise<void>((resolve) => { release = resolve })
+    },
+  })
+  await until(() => !!backend.latest?.queries.some((q) => q.startsWith('START_REPLICATION')))
+  const session = backend.latest!
+
+  session.dx.push(pgBegin())
+  session.dx.push(pgRelation(20, 'public', 't', 'd', [{ name: 'id', oid: 23, key: true }]))
+  session.dx.push(pgInsert(20, [textCell('1')]))
+  session.dx.push(pgCommit(0xa0n, 0xb0n))
+  await until(() => !!release) // handler #1 is parked
+
+  // Fully received and buffered in the raw layer's message queue, never yet pulled by next().
+  session.dx.push(pgBegin())
+  session.dx.push(pgRelation(20, 'public', 't', 'd', [{ name: 'id', oid: 23, key: true }]))
+  session.dx.push(pgInsert(20, [textCell('2')]))
+  session.dx.push(pgCommit(0xc0n, 0xd0n))
+  await Bun.sleep(20) // let the bytes settle into the raw layer's own queue before stopping
+
+  const stopPromise = handle.stop() // `stopping` flips true now, while handler #1 is still parked
+  release!() // let the parked handler resolve
+  await stopPromise
+
+  await Bun.sleep(30) // give a wrongly-scheduled second invocation a chance to run
+  expect(calls).toBe(1)
+})

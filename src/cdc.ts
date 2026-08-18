@@ -459,6 +459,10 @@ export function replicate(opts: ReplicateOptions): ReplicateHandle {
         })
 
         for await (const batch of batchTransactions(stream, { maxEvents: opts.maxTransactionEvents })) {
+          // next() drains its queue before honoring `ended` (src/replication.ts), so a fast
+          // producer can leave several transactions already parsed and buffered when stop()
+          // resolves — this check keeps every one of them from still reaching onTransaction.
+          if (stopping) { repl.end(); state = 'stopped'; return }
           state = 'handling'
           pendingAckLsn = batch.done ? batch.endLsn : null // done:false carries no commit fields — nothing to ack
 
