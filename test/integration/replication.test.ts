@@ -1,7 +1,7 @@
 // replication(): logical replication over the real auth/transport stack (TCP + SCRAM here).
 // Requires the local cluster with wal_level=logical (test/setup-pg.sh cluster, reconfigured).
 import { test, expect, describe } from 'bun:test'
-import { replication, connect, defineType, Jsonb, Collect, Transform, ReplicationStreamEnded, ReplicationBusy, ReplicationReceiveTimeout, PublicationMissing, PublicationEmpty, PgError, type ReplicationEvent, type ReplicationWarning, type TableShape } from '../../src/index.ts'
+import { replication, connect, defineType, Jsonb, Collect, Transform, ReplicationStreamEnded, ReplicationBusy, ReplicationReceiveTimeout, PublicationMissing, PublicationEmpty, PgError, batchTransactions, type ReplicationEvent, type ReplicationWarning, type TableShape, type TransactionBatch } from '../../src/index.ts'
 import { TEST_CONFIG, withConn, testPool, TEST_TIMEOUT } from '../helpers/db.ts'
 
 const K = `repl_${process.pid}`
@@ -879,6 +879,294 @@ void connect
       } finally {
         await c.query(`drop publication ${K}_t2pub`)
         await c.query(`drop table ${K}_t2`)
+      }
+    })
+  }, TEST_TIMEOUT)
+
+  test('hydrateToast: false restores the sparse TOAST shape (unchanged still listed)', async () => {
+    await withConn(async (c) => {
+      await c.query(`create table ${K}_hy(id int4 primary key, fat text, n int4)`)
+      await c.query(`alter table ${K}_hy replica identity full`)
+      await c.query(`create publication ${K}_hypub for table ${K}_hy`)
+      try {
+        const repl = await replication(TEST_CONFIG)
+        try {
+          const slot = await repl.createSlot(`${K}_hyslot`, { temporary: true })
+          // incompressible-enough payload so it TOASTs out-of-line (>2KB post-compression)
+          await c.query(`insert into ${K}_hy select 1, string_agg(md5(random()::text), ''), 0 from generate_series(1, 2000)`)
+          await c.query(`update ${K}_hy set n = 7 where id = 1`) // fat untouched -> pgoutput omits it ('u')
+          const events = await collectUntil(
+            repl.start({ slot: slot.slot, publications: [`${K}_hypub`], hydrateToast: false }),
+            (es) => es.filter((e) => e.kind === 'commit').length >= 2)
+          const upd = events.find((e) => e.kind === 'update') as Extract<ReplicationEvent, { kind: 'update' }>
+          expect(upd.oldKind).toBe('full')
+          expect('fat' in upd.new).toBe(false)                          // NOT filled — sparse shape restored
+          expect(upd.unchanged).toEqual(['fat'])                        // still listed: the flag changes the fill, not the wire
+          expect(typeof upd.old!.fat).toBe('string')                    // the old tuple still carries the value
+          expect((upd.old!.fat as string).length).toBe(64000)
+        } finally { repl.end() }
+      } finally {
+        await c.query(`drop publication ${K}_hypub`)
+        await c.query(`drop table ${K}_hy`)
+      }
+    })
+  }, TEST_TIMEOUT)
+
+  test('keyChanged: FULL identity, declared int PK — false on non-key update, true on key-changing update, absent on delete', async () => {
+    await withConn(async (c) => {
+      await c.query(`create table ${K}_kc(id int4 primary key, v text)`)
+      await c.query(`alter table ${K}_kc replica identity full`)
+      await c.query(`create publication ${K}_kcpub for table ${K}_kc`)
+      try {
+        const repl = await replication(TEST_CONFIG)
+        try {
+          const slot = await repl.createSlot(`${K}_kcslot`, { temporary: true })
+          await c.query(`insert into ${K}_kc values (1, 'a')`)
+          await c.query(`update ${K}_kc set v = 'b' where id = 1`) // non-key change
+          await c.query(`update ${K}_kc set id = 2 where id = 1`) // key change
+          await c.query(`delete from ${K}_kc where id = 2`)
+          const shapes: TableShape[] = [{ table: `${K}_kc`, shape: { id: 'int4' }, key: ['id'] }]
+          const events = await collectUntil(
+            repl.start({ slot: slot.slot, publications: [`${K}_kcpub`], shapes }),
+            (es) => es.filter((e) => e.kind === 'commit').length >= 4)
+          const updates = events.filter((e) => e.kind === 'update') as Extract<ReplicationEvent, { kind: 'update' }>[]
+          expect(updates[0]!.keyChanged).toBe(false)
+          expect(updates[1]!.keyChanged).toBe(true)
+          const del = events.find((e) => e.kind === 'delete') as Extract<ReplicationEvent, { kind: 'delete' }>
+          expect('keyChanged' in del).toBe(false)
+        } finally { repl.end() }
+      } finally {
+        await c.query(`drop publication ${K}_kcpub`)
+        await c.query(`drop table ${K}_kc`)
+      }
+    })
+  }, TEST_TIMEOUT)
+
+  test('keyChanged: FULL identity, composite Date/Buffer key — sameValue not reference equality', async () => {
+    await withConn(async (c) => {
+      await c.query(`create table ${K}_kd(id int4 primary key, ts timestamptz, b bytea, v text)`)
+      await c.query(`alter table ${K}_kd replica identity full`)
+      await c.query(`create publication ${K}_kdpub for table ${K}_kd`)
+      try {
+        const repl = await replication(TEST_CONFIG)
+        try {
+          const slot = await repl.createSlot(`${K}_kdslot`, { temporary: true })
+          await c.query(`insert into ${K}_kd values (1, '2026-01-01T00:00:00.000Z', '\\xdeadbeef', 'a')`)
+          await c.query(`update ${K}_kd set v = 'b' where id = 1`) // neither key column touched
+          await c.query(`update ${K}_kd set ts = '2026-01-01T00:00:00.001Z' where id = 1`) // 1ms shift
+          await c.query(`update ${K}_kd set b = '\\xfeedface' where id = 1`) // bytea change
+          const shapes: TableShape[] = [{ table: `${K}_kd`, shape: { ts: 'timestamptz', b: 'bytea' }, key: ['ts', 'b'] }]
+          const events = await collectUntil(
+            repl.start({ slot: slot.slot, publications: [`${K}_kdpub`], shapes }),
+            (es) => es.filter((e) => e.kind === 'commit').length >= 4)
+          const updates = events.filter((e) => e.kind === 'update') as Extract<ReplicationEvent, { kind: 'update' }>[]
+          expect(updates[0]!.keyChanged).toBe(false)
+          expect(updates[1]!.keyChanged).toBe(true)
+          expect(updates[2]!.keyChanged).toBe(true)
+        } finally { repl.end() }
+      } finally {
+        await c.query(`drop publication ${K}_kdpub`)
+        await c.query(`drop table ${K}_kd`)
+      }
+    })
+  }, TEST_TIMEOUT)
+
+  test('keyChanged: DEFAULT identity — oldKind key yields true with no comparison, oldKind null yields false', async () => {
+    await withConn(async (c) => {
+      await c.query(`create table ${K}_ke(id int4 primary key, v text)`)
+      await c.query(`create publication ${K}_kepub for table ${K}_ke`)
+      try {
+        const repl = await replication(TEST_CONFIG)
+        try {
+          const slot = await repl.createSlot(`${K}_keslot`, { temporary: true })
+          await c.query(`insert into ${K}_ke values (1, 'a')`)
+          await c.query(`update ${K}_ke set v = 'b' where id = 1`) // non-key change -> oldKind null
+          await c.query(`update ${K}_ke set id = 2 where id = 1`) // key change -> oldKind key
+          const shapes: TableShape[] = [{ table: `${K}_ke`, shape: { id: 'int4' }, key: ['id'] }]
+          const events = await collectUntil(
+            repl.start({ slot: slot.slot, publications: [`${K}_kepub`], shapes }),
+            (es) => es.filter((e) => e.kind === 'commit').length >= 3)
+          const updates = events.filter((e) => e.kind === 'update') as Extract<ReplicationEvent, { kind: 'update' }>[]
+          expect(updates[0]!.oldKind).toBe(null)
+          expect(updates[0]!.keyChanged).toBe(false)
+          expect(updates[1]!.oldKind).toBe('key')
+          expect(updates[1]!.keyChanged).toBe(true)
+        } finally { repl.end() }
+      } finally {
+        await c.query(`drop publication ${K}_kepub`)
+        await c.query(`drop table ${K}_ke`)
+      }
+    })
+  }, TEST_TIMEOUT)
+
+  test('keyChanged: absent when TableShape.key is not declared', async () => {
+    await withConn(async (c) => {
+      await c.query(`create table ${K}_kn(id int4 primary key, v text)`)
+      await c.query(`alter table ${K}_kn replica identity full`)
+      await c.query(`create publication ${K}_knpub for table ${K}_kn`)
+      try {
+        const repl = await replication(TEST_CONFIG)
+        try {
+          const slot = await repl.createSlot(`${K}_knslot`, { temporary: true })
+          await c.query(`insert into ${K}_kn values (1, 'a')`)
+          await c.query(`update ${K}_kn set v = 'b' where id = 1`)
+          const events = await collectUntil(
+            repl.start({ slot: slot.slot, publications: [`${K}_knpub`] }),
+            (es) => es.filter((e) => e.kind === 'commit').length >= 2)
+          const upd = events.find((e) => e.kind === 'update') as Extract<ReplicationEvent, { kind: 'update' }>
+          expect('keyChanged' in upd).toBe(false)
+        } finally { repl.end() }
+      } finally {
+        await c.query(`drop publication ${K}_knpub`)
+        await c.query(`drop table ${K}_kn`)
+      }
+    })
+  }, TEST_TIMEOUT)
+
+  test('replica identity warning: DEFAULT identity warns once across two updates and a delete', async () => {
+    await withConn(async (c) => {
+      await c.query(`create table ${K}_ri(id int4 primary key, v int4)`)
+      await c.query(`create publication ${K}_ripub for table ${K}_ri`)
+      try {
+        const repl = await replication(TEST_CONFIG)
+        try {
+          const slot = await repl.createSlot(`${K}_rislot`, { temporary: true })
+          await c.query(`insert into ${K}_ri values (1, 0)`)
+          await c.query(`update ${K}_ri set v = 1 where id = 1`)
+          await c.query(`update ${K}_ri set v = 2 where id = 1`)
+          await c.query(`delete from ${K}_ri where id = 1`)
+          const warnings: ReplicationWarning[] = []
+          await collectUntil(
+            repl.start({ slot: slot.slot, publications: [`${K}_ripub`], onWarning: (w) => warnings.push(w) }),
+            (es) => es.filter((e) => e.kind === 'commit').length >= 4)
+          expect(warnings).toEqual([{ kind: 'replica-identity', schema: 'public', table: `${K}_ri`, replicaIdentity: 'd', message: expect.any(String) }])
+        } finally { repl.end() }
+      } finally {
+        await c.query(`drop publication ${K}_ripub`)
+        await c.query(`drop table ${K}_ri`)
+      }
+    })
+  }, TEST_TIMEOUT)
+
+  test('replica identity warning: FULL table never warns', async () => {
+    await withConn(async (c) => {
+      await c.query(`create table ${K}_rf(id int4 primary key, v int4)`)
+      await c.query(`alter table ${K}_rf replica identity full`)
+      await c.query(`create publication ${K}_rfpub for table ${K}_rf`)
+      try {
+        const repl = await replication(TEST_CONFIG)
+        try {
+          const slot = await repl.createSlot(`${K}_rfslot`, { temporary: true })
+          await c.query(`insert into ${K}_rf values (1, 0)`)
+          await c.query(`update ${K}_rf set v = 1 where id = 1`)
+          await c.query(`delete from ${K}_rf where id = 1`)
+          const warnings: ReplicationWarning[] = []
+          await collectUntil(
+            repl.start({ slot: slot.slot, publications: [`${K}_rfpub`], onWarning: (w) => warnings.push(w) }),
+            (es) => es.filter((e) => e.kind === 'commit').length >= 3)
+          expect(warnings.length).toBe(0)
+        } finally { repl.end() }
+      } finally {
+        await c.query(`drop publication ${K}_rfpub`)
+        await c.query(`drop table ${K}_rf`)
+      }
+    })
+  }, TEST_TIMEOUT)
+
+  // The stale-callback case ("replica identity warning: a finished stream's callback never fires
+  // for a later stream") needs two start() calls on the SAME ReplicationConnection — that is what
+  // exercises this.warn's clearing in the finally. Restarting START_REPLICATION on one physical
+  // connection hangs against this live cluster for reasons unrelated to warnings (reproduced with
+  // a bare insert-only stream, no onWarning at all — a fresh connection on the same slot works
+  // fine), so that case is proven instead in test/unit/replication-lifecycle.test.ts against the
+  // fake backend, which does not hit whatever the live cluster's restart limitation is.
+
+  test('partition warning: publish_via_partition_root off warns naming the leaf and the publication', async () => {
+    await withConn(async (c) => {
+      await c.query(`create table ${K}_pt_parent(id int4, ts timestamptz, v int4, primary key (id, ts)) partition by range (ts)`)
+      await c.query(`create table ${K}_pt_leaf partition of ${K}_pt_parent for values from ('2020-01-01') to ('2030-01-01')`)
+      await c.query(`create publication ${K}_ptpub for table ${K}_pt_parent`)
+      try {
+        const repl = await replication(TEST_CONFIG)
+        try {
+          const slot = await repl.createSlot(`${K}_ptslot`, { temporary: true })
+          await c.query(`insert into ${K}_pt_parent values (1, '2025-06-01T00:00:00Z', 0)`) // routed to the leaf
+          await c.query(`update ${K}_pt_parent set v = 1 where id = 1`) // second transaction: old-row-less update
+          const warnings: ReplicationWarning[] = []
+          await collectUntil(
+            repl.start({ slot: slot.slot, publications: [`${K}_ptpub`], onWarning: (w) => warnings.push(w) }),
+            (es) => es.filter((e) => e.kind === 'commit').length >= 2)
+          // per-kind dedupe: the leaf's announce-time partition warning must not swallow its own
+          // replica-identity warning on the follow-up update
+          expect(warnings).toEqual([
+            { kind: 'partition-relation', schema: 'public', table: `${K}_pt_leaf`, publication: `${K}_ptpub`, message: expect.any(String) },
+            { kind: 'replica-identity', schema: 'public', table: `${K}_pt_leaf`, replicaIdentity: 'd', message: expect.any(String) },
+          ])
+        } finally { repl.end() }
+      } finally {
+        await c.query(`drop publication ${K}_ptpub`)
+        await c.query(`drop table ${K}_pt_parent`) // cascades to the leaf
+      }
+    })
+  }, TEST_TIMEOUT)
+
+  test('partition warning: publish_via_partition_root on stays silent (announce arrives under the parent name)', async () => {
+    await withConn(async (c) => {
+      await c.query(`create table ${K}_pt2_parent(id int4, ts timestamptz, v int4, primary key (id, ts)) partition by range (ts)`)
+      await c.query(`create table ${K}_pt2_leaf partition of ${K}_pt2_parent for values from ('2020-01-01') to ('2030-01-01')`)
+      await c.query(`create publication ${K}_pt2pub for table ${K}_pt2_parent with (publish_via_partition_root = true)`)
+      try {
+        const repl = await replication(TEST_CONFIG)
+        try {
+          const slot = await repl.createSlot(`${K}_pt2slot`, { temporary: true })
+          await c.query(`insert into ${K}_pt2_parent values (1, '2025-06-01T00:00:00Z', 0)`)
+          const warnings: ReplicationWarning[] = []
+          const events = await collectUntil(
+            repl.start({ slot: slot.slot, publications: [`${K}_pt2pub`], onWarning: (w) => warnings.push(w) }),
+            (es) => es.some((e) => e.kind === 'insert'))
+          const ins = events.find((e) => e.kind === 'insert') as Extract<ReplicationEvent, { kind: 'insert' }>
+          expect(ins.table).toBe(`${K}_pt2_parent`) // announced under the ROOT's name, not the leaf's
+          expect(warnings.filter((w) => w.kind === 'partition-relation').length).toBe(0)
+        } finally { repl.end() }
+      } finally {
+        await c.query(`drop publication ${K}_pt2pub`)
+        await c.query(`drop table ${K}_pt2_parent`)
+      }
+    })
+  }, TEST_TIMEOUT)
+
+  test('batchTransactions: a real empty DDL transaction is yielded, and break after a batch leaves the connection commandable', async () => {
+    await withConn(async (c) => {
+      await c.query(`create table ${K}_bt(id int4 primary key, v int4)`)
+      await c.query(`create publication ${K}_btpub for table ${K}_bt`)
+      try {
+        const repl = await replication(TEST_CONFIG)
+        try {
+          const slot = await repl.createSlot(`${K}_btslot`, { temporary: true })
+          await c.query(`alter table ${K}_bt add column extra int4`) // its own begin/commit, zero events
+          await c.query(`insert into ${K}_bt(id, v) values (1, 1)`)  // separate transaction
+
+          const batches: TransactionBatch[] = []
+          for await (const b of batchTransactions(repl.start({ slot: slot.slot, publications: [`${K}_btpub`] }))) {
+            batches.push(b)
+            if (b.done && b.events.some((e) => e.kind === 'insert')) break
+          }
+
+          const insertBatch = batches.find((b) => b.done && b.events.some((e) => e.kind === 'insert'))
+          expect(insertBatch).toBeDefined()
+          expect(insertBatch!.done).toBe(true)
+          if (insertBatch!.done) expect(insertBatch!.endLsn.length).toBeGreaterThan(0)
+          expect(insertBatch!.events.some((e) => e.kind === 'relation')).toBe(true)
+
+          const ddlBatch = batches.find((b) => b.done && b.events.length === 0)
+          expect(ddlBatch).toBeDefined()
+
+          const sys = await repl.identify() // break propagated return() through batchTransactions into start()'s finally
+          expect(sys.systemId).toBeTruthy()
+        } finally { repl.end() }
+      } finally {
+        await c.query(`drop publication ${K}_btpub`)
+        await c.query(`drop table ${K}_bt`)
       }
     })
   }, TEST_TIMEOUT)
