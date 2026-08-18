@@ -32,14 +32,16 @@ export interface ReplicateOptions {
   /** 'temporary': a random-suffixed temporary slot is created fresh every session, with an
    *  exported snapshot for backfill — changes made while disconnected are LOST, because the slot
    *  and the WAL it retained die with the connection (CDC-06). { name }: a durable slot,
-   *  health-checked over command() on every connect. Absent on the FIRST observation creates it
-   *  (exported snapshot, backfill runs); absent on any LATER connect raises
-   *  SlotInvalidatedError instead of silently recreating it — the driver never performs that
-   *  data-loss decision on the consumer's behalf. It retains WAL until dropped, so a
-   *  disconnected consumer resumes exactly where it left off. */
+   *  health-checked over command() on every connect — the name is validated synchronously and
+   *  replicate() throws InvalidSlotName immediately if it is malformed, before any session ever
+   *  starts. Absent on the FIRST observation creates it (exported snapshot, backfill runs);
+   *  absent on any LATER connect raises SlotInvalidatedError instead of silently recreating it —
+   *  the driver never performs that data-loss decision on the consumer's behalf. It retains WAL
+   *  until dropped, so a disconnected consumer resumes exactly where it left off. */
   slot: 'temporary' | { name: string }
-  /** Publications to subscribe — forwarded to start(), whose PublicationMissing/PublicationEmpty
-   *  probes apply unchanged. */
+  /** Publications to subscribe — forwarded to start(), whose PublicationMissing probe applies
+   *  unchanged. An empty array is validated synchronously and replicate() throws
+   *  PublicationEmpty immediately, before any session ever starts. */
   publications: string[]
   /** Per-table decode shapes, forwarded to start() unchanged. */
   shapes?: TableShape[]
@@ -276,6 +278,13 @@ function withDerivedKeepAlive(url: string | ReplicationConfig, forceKeepAlive: b
  *  SYNCHRONOUSLY — the loop itself starts on a microtask, so a stop() called immediately after
  *  replicate() wins before the first connect. */
 export function replicate(opts: ReplicateOptions): ReplicateHandle {
+  // Consumer misuse (a malformed durable slot name, an empty publications array) is knowable
+  // synchronously and has nothing to do with the async session — validate and throw here, before
+  // the handle exists, rather than let it surface through fireFatal where a consumer who omitted
+  // onFatalError would never see it at all.
+  if (typeof opts.slot !== 'string') validateDurableSlotName(opts.slot.name)
+  if (opts.publications.length === 0) throw new PublicationEmpty()
+
   let state: SessionState = 'idle'
   let stopping = false
   let fatalFired = false // onFatalError's own guard — S8 must never fire it twice (CDC-05)
@@ -310,10 +319,11 @@ export function replicate(opts: ReplicateOptions): ReplicateHandle {
     fatalFired = true
     repl?.end()
     state = 'dead'
+    if (!opts.onFatalError) { console.error('minipg: replicate() session ended fatally with no onFatalError callback wired up —', err); return }
     // The terminal callback: nothing downstream of this catches a throw, so one is caught and
     // reported here, exactly like deliverWarning does for onWarning — a throwing onFatalError
     // must not itself become an unhandled rejection through run()'s own promise.
-    try { opts.onFatalError?.(err) } catch (e) { console.error('minipg: onFatalError callback threw', e) }
+    try { opts.onFatalError(err) } catch (e) { console.error('minipg: onFatalError callback threw', e) }
   }
 
   async function run(): Promise<void> {

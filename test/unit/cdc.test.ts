@@ -6,7 +6,7 @@
 import { test, expect } from 'bun:test'
 import { Duplex } from 'node:stream'
 import { frame, rowDescription, dataRow as dataRowBody, type WireCol, type Cell } from '../helpers/wire.ts'
-import { replication as rawReplication, batchTransactions as rawBatchTransactions, PgError, type ReplicationConfig, type TransactionBatch } from '../../src/index.ts'
+import { replication as rawReplication, batchTransactions as rawBatchTransactions, PgError, InvalidSlotName, PublicationEmpty, type ReplicationConfig, type TransactionBatch } from '../../src/index.ts'
 import { replicate, SlotInvalidatedError, BackfillTimeoutError, SlotBusyError, type CdcWarning } from '../../src/cdc.ts'
 
 const i32 = (n: number) => { const b = Buffer.allocUnsafe(4); b.writeInt32BE(n); return b }
@@ -1385,4 +1385,54 @@ test('cdc WR-02: eviction rounds are capped — a rival that keeps re-acquiring 
   expect(retryCalled).toBe(false) // SlotBusyError is permanent — no retry budget spent
   expect(backend.sessions.length).toBe(1) // never reconnected — this is entirely S2 -> S2
   await handle.stop()
+})
+
+test('cdc WR-03: an invalid durable slot name throws synchronously, without ever needing onFatalError', () => {
+  const backend = cdcBackend()
+  expect(() => replicate({
+    url: cfg({ socket: backend.socket }),
+    slot: { name: 'Bad-Name' },
+    publications: ['pub'],
+    backfill: async () => {},
+    onTransaction: () => {},
+    // deliberately no onFatalError — the whole point is that this must not need one
+  })).toThrow(InvalidSlotName)
+  expect(backend.sessions.length).toBe(0) // never even attempted to connect
+})
+
+test('cdc WR-03: an empty publications array throws synchronously, without ever needing onFatalError', () => {
+  const backend = cdcBackend()
+  expect(() => replicate({
+    url: cfg({ socket: backend.socket }),
+    slot: 'temporary',
+    publications: [],
+    backfill: async () => {},
+    onTransaction: () => {},
+  })).toThrow(PublicationEmpty)
+  expect(backend.sessions.length).toBe(0)
+})
+
+test('cdc WR-03: a genuinely async fatal error with no onFatalError is reported to stderr instead of vanishing', async () => {
+  const backend = cdcBackend()
+  const originalError = console.error
+  const errors: unknown[][] = []
+  console.error = (...args: unknown[]) => { errors.push(args) }
+  try {
+    const handle = replicate({
+      url: cfg({ socket: backend.socket }),
+      slot: 'temporary',
+      publications: ['pub'],
+      backfill: async () => {},
+      onTransaction: () => {},
+      retryDelayMs: () => null, // fatal on the very first failure
+      // deliberately no onFatalError
+    })
+    await until(() => !!backend.latest?.queries.some((q) => q.startsWith('START_REPLICATION')))
+    backend.latest!.dx.destroy()
+    await until(() => errors.length > 0)
+    expect(errors.some((args) => args.some((a) => typeof a === 'string' && a.includes('no onFatalError')))).toBe(true)
+    await handle.stop()
+  } finally {
+    console.error = originalError
+  }
 })
