@@ -1139,6 +1139,42 @@ describe('replication()', () => {
       }
     })
   }, 20_000)
+
+  // D-07's regression at the real walsender clock (Pitfall 2): the fixed 60s receiveTimeoutMs this
+  // phase almost shipped false-fires a healthy idle stream at ~70s, measured. The window here can't
+  // compress below ~75s — the locked 60s receiveTimeoutMs floor and the server's own 60s default
+  // wal_sender_timeout both require a real elapsed silence, not a scaled-down one, to observe
+  // honestly. Gated out of the default run: `bun run test` never pays this cost; `bun run test:slow`
+  // is the one command that does.
+  test.skipIf(!process.env.SLOW_TESTS)('cdc idle managed: derived defaults survive 75 seconds of idle with zero spurious reconnects', async () => {
+    await withConn(async (c) => {
+      await c.query(`create table ${K}_cdcidle(id int4 primary key)`)
+      await c.query(`create publication ${K}_cdcidlepub for table ${K}_cdcidle`)
+      try {
+        const reconnectWarnings: string[] = []
+        let backfillCalls = 0
+        // deliberately no statusIntervalMs / receiveTimeoutMs — the derived values are the subject
+        const handle = replicate({
+          url: TEST_CONFIG,
+          slot: 'temporary',
+          publications: [`${K}_cdcidlepub`],
+          backfill: async () => { backfillCalls++ },
+          onWarning: (w) => { if (w.kind === 'reconnect-attempt') reconnectWarnings.push(w.message) },
+          onTransaction: () => {},
+        })
+        try {
+          await Bun.sleep(75_000)
+        } finally {
+          await handle.stop()
+        }
+        expect(reconnectWarnings).toEqual([])
+        expect(backfillCalls).toBe(1)
+      } finally {
+        await c.query(`drop publication ${K}_cdcidlepub`)
+        await c.query(`drop table ${K}_cdcidle`)
+      }
+    })
+  }, 90_000)
 })
 
 // keep the import used even if helpers change

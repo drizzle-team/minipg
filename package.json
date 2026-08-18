@@ -103,6 +103,7 @@
     "test": "bun test test/unit test/integration",
     "test:unit": "bun test test/unit",
     "test:integration": "bun test test/integration",
+    "test:slow": "SLOW_TESTS=1 bun test test/integration/replication.test.ts -t 'idle managed'",
     "test:cf": "vitest run --config test/cf/vitest.config.ts",
     "test:neon-ws": "bun test test/integration/neon-ws.test.ts",
     "test:neon-http": "bun test test/integration/neon-http.test.ts test/integration/neon-http-parity.test.ts",
