@@ -31,10 +31,13 @@ export interface ReplicateOptions {
   url: string | ReplicationConfig
   /** 'temporary': a random-suffixed temporary slot is created fresh every session, with an
    *  exported snapshot for backfill — changes made while disconnected are LOST, because the slot
-   *  and the WAL it retained die with the connection (CDC-06). { name }: a durable slot,
-   *  health-checked over command() on every connect — the name is validated synchronously and
-   *  replicate() throws InvalidSlotName immediately if it is malformed, before any session ever
-   *  starts. Absent on the FIRST observation creates it (exported snapshot, backfill runs);
+   *  and the WAL it retained die with the connection (CDC-06). Works against any server the raw
+   *  layer supports (PG 10-17). { name }: a durable slot, health-checked over command() on every
+   *  connect — the name is validated synchronously and replicate() throws InvalidSlotName
+   *  immediately if it is malformed, before any session ever starts. Requires PostgreSQL 13+ (the
+   *  health check reads pg_replication_slots.wal_status); an older server fails fast with
+   *  UnsupportedServerVersionError instead of retrying a bare column-does-not-exist error to the
+   *  ceiling. Absent on the FIRST observation creates it (exported snapshot, backfill runs);
    *  absent on any LATER connect raises SlotInvalidatedError instead of silently recreating it —
    *  the driver never performs that data-loss decision on the consumer's behalf. It retains WAL
    *  until dropped, so a disconnected consumer resumes exactly where it left off. */
@@ -165,6 +168,16 @@ export class SlotBusyError extends Error {
   constructor(readonly slot: string, readonly pid: number) { super(`minipg: replication slot ${JSON.stringify(slot)} is active for PID ${pid} — pass onSlotBusy: 'evict' to terminate it, or wait for the other consumer to release it`) }
 }
 
+/** A durable slot's health check reads `pg_replication_slots.wal_status`, added in PostgreSQL
+ *  13 — this server does not have it (42703 undefined_column). This never heals with time, so it
+ *  skips the retry loop entirely rather than burning the whole budget on a bare column-does-not-
+ *  exist error. `slot: 'temporary'` has no such floor and works on any server the raw layer
+ *  supports. */
+export class UnsupportedServerVersionError extends Error {
+  readonly reason = 'unsupported-server-version' as const
+  constructor() { super("minipg: durable slots need PostgreSQL 13+ (pg_replication_slots.wal_status is not available on this server) — use slot: 'temporary' instead, or upgrade the server") }
+}
+
 /** Lifecycle warnings the managed layer itself emits, through the same channel raw
  *  ReplicationWarning values already use — replicate()'s onWarning takes this wider union and
  *  forwards raw warnings through untouched, so a consumer has exactly one warning channel
@@ -229,7 +242,7 @@ function isPermanentFailure(err: unknown): boolean {
   const code = (err as { code?: string } | null)?.code
   if (code === '28P01' || code === '28000' || code === '3D000' || code === '42501') return true
   return err instanceof PublicationMissing || err instanceof PublicationEmpty || err instanceof InvalidSlotName ||
-    err instanceof SlotInvalidatedError || err instanceof SlotBusyError
+    err instanceof SlotInvalidatedError || err instanceof SlotBusyError || err instanceof UnsupportedServerVersionError
 }
 
 interface SlotHealthRow { active: string; active_pid: string | null; wal_status: string; confirmed_flush_lsn: string | null; restart_lsn: string | null }
@@ -238,7 +251,16 @@ interface SlotHealthRow { active: string; active_pid: string | null; wal_status:
 // columns come back as TEXT (Pitfall 3: 't'/'f', never true/false). slot_type = 'logical' makes a
 // physical slot squatting this name degenerate to zero rows rather than a row with null LSNs.
 async function readSlotHealth(conn: ReplicationConnection, name: string): Promise<SlotHealthRow | null> {
-  const r = await conn.command(`select active, active_pid, wal_status, confirmed_flush_lsn, restart_lsn from pg_replication_slots where slot_name = '${name}' and slot_type = 'logical'`)
+  let r
+  try {
+    r = await conn.command(`select active, active_pid, wal_status, confirmed_flush_lsn, restart_lsn from pg_replication_slots where slot_name = '${name}' and slot_type = 'logical'`)
+  } catch (e) {
+    // wal_status is a PG13+ column — an older server raises 42703 here, on every connect,
+    // forever. Name the real cause instead of retrying a bare column-does-not-exist error to
+    // the ceiling.
+    if (e instanceof PgError && e.code === '42703') throw new UnsupportedServerVersionError()
+    throw e
+  }
   if (r.rows.length === 0) return null
   return Object.fromEntries(r.columns.map((c, i) => [c, r.rows[0]![i]])) as unknown as SlotHealthRow
 }

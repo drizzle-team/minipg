@@ -7,7 +7,7 @@ import { test, expect } from 'bun:test'
 import { Duplex } from 'node:stream'
 import { frame, rowDescription, dataRow as dataRowBody, type WireCol, type Cell } from '../helpers/wire.ts'
 import { replication as rawReplication, batchTransactions as rawBatchTransactions, PgError, InvalidSlotName, PublicationEmpty, type ReplicationConfig, type TransactionBatch } from '../../src/index.ts'
-import { replicate, SlotInvalidatedError, BackfillTimeoutError, SlotBusyError, type CdcWarning } from '../../src/cdc.ts'
+import { replicate, SlotInvalidatedError, BackfillTimeoutError, SlotBusyError, UnsupportedServerVersionError, type CdcWarning } from '../../src/cdc.ts'
 
 const i32 = (n: number) => { const b = Buffer.allocUnsafe(4); b.writeInt32BE(n); return b }
 const u16 = (n: number) => { const b = Buffer.allocUnsafe(2); b.writeUInt16BE(n); return b }
@@ -1435,4 +1435,27 @@ test('cdc WR-03: a genuinely async fatal error with no onFatalError is reported 
   } finally {
     console.error = originalError
   }
+})
+
+test('cdc WR-04: a pre-PG13 server (wal_status missing, 42703) fails fast instead of burning the retry budget', async () => {
+  const backend = cdcBackend({
+    onQuery: (sql) => sql.startsWith('select active,') ? [errFrame('42703', 'column "wal_status" does not exist'), ready()] : undefined,
+  })
+  let fatalErr: Error | undefined
+  let retryCalled = false
+  const handle = replicate({
+    url: cfg({ socket: backend.socket }),
+    slot: { name: 'durable_old_server' },
+    publications: ['pub'],
+    backfill: async () => {},
+    onTransaction: () => {},
+    retryDelayMs: (attempt) => { retryCalled = true; return attempt < 3 ? 1 : null }, // converge fast if this DOES retry
+    onFatalError: (err) => { fatalErr = err },
+  })
+  await until(() => fatalErr !== undefined)
+  expect(fatalErr).toBeInstanceOf(UnsupportedServerVersionError)
+  expect((fatalErr as Error).message).toContain('PostgreSQL 13+')
+  expect(retryCalled).toBe(false) // permanent — skips the retry loop entirely
+  expect(backend.sessions.length).toBe(1) // never reconnected to retry the same doomed query
+  await handle.stop()
 })
