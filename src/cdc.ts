@@ -13,9 +13,10 @@
 // backfilling -> S4 streaming -> S5 handling -> S6 backoff -> S7 stopped / S8 dead). A transient
 // failure anywhere in S1-S5 (including a server CopyDone, which cannot resume on the same
 // session — see the CDC-04 note below) drives S6: back off, then loop to S1 for a fresh session.
-// A handler throw (S5) retries in place instead, with zero reconnects. The durable-slot health
-// check (CDC-07/CDC-08) lands in plan 04-03.
+// A handler throw (S5) retries in place instead, with zero reconnects. A durable slot is
+// health-checked over command() on every connect, still inside S2 — see ReplicateOptions.slot.
 import { replication, batchTransactions, PublicationMissing, PublicationEmpty, InvalidSlotName, type ReplicationConnection, type ReplicationConfig, type ReplicationWarning, type TransactionBatch, type TableShape } from './replication.ts'
+import { PgError } from './errors.ts'
 import { randomBytes } from 'node:crypto'
 
 /** One session's lifecycle stage, tracked on the handle's own closure (never module-level) so two
@@ -30,9 +31,12 @@ export interface ReplicateOptions {
   url: string | ReplicationConfig
   /** 'temporary': a random-suffixed temporary slot is created fresh every session, with an
    *  exported snapshot for backfill — changes made while disconnected are LOST, because the slot
-   *  and the WAL it retained die with the connection (CDC-06). { name }: a durable slot, created
-   *  once and health-checked on every connect (lands plan 04-03); it retains WAL until dropped,
-   *  so a disconnected consumer resumes exactly where it left off. */
+   *  and the WAL it retained die with the connection (CDC-06). { name }: a durable slot,
+   *  health-checked over command() on every connect. Absent on the FIRST observation creates it
+   *  (exported snapshot, backfill runs); absent on any LATER connect raises
+   *  SlotInvalidatedError instead of silently recreating it — the driver never performs that
+   *  data-loss decision on the consumer's behalf. It retains WAL until dropped, so a
+   *  disconnected consumer resumes exactly where it left off. */
   slot: 'temporary' | { name: string }
   /** Publications to subscribe — forwarded to start(), whose PublicationMissing/PublicationEmpty
    *  probes apply unchanged. */
@@ -45,16 +49,17 @@ export interface ReplicateOptions {
   /** Runs once per session that just created a slot with an exported snapshot, awaited strictly
    *  between CREATE_REPLICATION_SLOT and START_REPLICATION — the layer issues zero commands on
    *  the replication connection during this window (the snapshot dies on the connection's next
-   *  command, measured as SQLSTATE 22023). Absent under a durable slot that already existed
-   *  (onResume fires instead, lands plan 04-03). The callback adopts the snapshot on its OWN
-   *  normal connection — a raw minipg connection is useless to drizzle/kysely/prisma, so the
-   *  layer hands over names, never connections: `begin isolation level repeatable read`, `set
-   *  transaction snapshot '<snapshot>'` (outside REPEATABLE READ or SERIALIZABLE the server
-   *  raises 0A000), read the baseline, then commit. isReconnect is false on the handle's first
-   *  invocation and true when a dropped connection forced a new session (CDC-13). A throw here
-   *  retries like a connection failure, bounded by retryDelayMs — backfill has no cheap path
-   *  (it only ever runs on a session that just created a slot), so the retry rebuilds the whole
-   *  session: new slot, new snapshot, backfill again with isReconnect true (D-03). */
+   *  command, measured as SQLSTATE 22023). Absent under a durable slot that already existed and
+   *  passed its health check — onResume fires instead, with nothing to backfill. The callback
+   *  adopts the snapshot on its OWN normal connection — a raw minipg connection is useless to
+   *  drizzle/kysely/prisma, so the layer hands over names, never connections: `begin isolation
+   *  level repeatable read`, `set transaction snapshot '<snapshot>'` (outside REPEATABLE READ or
+   *  SERIALIZABLE the server raises 0A000), read the baseline, then commit. isReconnect is false
+   *  on the handle's first invocation and true when a dropped connection forced a new session
+   *  (CDC-13). A throw here retries like a connection failure, bounded by retryDelayMs —
+   *  backfill has no cheap path (it only ever runs on a session that just created a slot), so
+   *  the retry rebuilds the whole session: new slot, new snapshot, backfill again with
+   *  isReconnect true (D-03). */
   backfill?: (info: { snapshot: string; streamStartLsn: string; isReconnect: boolean; signal: AbortSignal }) => void | Promise<void>
   /** Abandon the session if backfill has not resolved within this many ms (omitted = unbounded).
    *  Fires BackfillTimeoutError and routes through retryDelayMs like a connection failure
@@ -95,7 +100,7 @@ export interface ReplicateOptions {
   onSlotBusy?: 'error' | 'evict'
   /** Fires instead of backfill when a durable slot already existed and passed its health check —
    *  there is nothing to backfill, the slot already carries a resumable position. A throw here
-   *  routes through retryDelayMs exactly like a backfill throw (lands plan 04-03). */
+   *  routes through retryDelayMs exactly like a backfill throw. */
   onResume?: (info: { confirmedFlush: string; restartLsn: string }) => void | Promise<void>
   /** Forwarded to start() unchanged; see StartOptions.messages. */
   messages?: boolean
@@ -129,8 +134,7 @@ export interface ReplicateHandle {
  *  after previously being observed, its wal_status read 'lost', its confirmed_flush_lsn was
  *  null, or the server's systemId/timeline changed since the last connect — none of these heal
  *  with time. Recovery is a decision only the consumer can make: drop the slot and call
- *  replicate() again to start over, or investigate what invalidated it. Thrown starting plan
- *  04-03. */
+ *  replicate() again to start over, or investigate what invalidated it. */
 export class SlotInvalidatedError extends Error {
   readonly reason = 'slot-invalidated' as const
   constructor(readonly slot: string, override readonly cause: 'absent' | 'wal-lost' | 'no-confirmed-flush' | 'system-changed') { super(`minipg: replication slot ${JSON.stringify(slot)} is invalidated (${cause}) — drop it and call replicate() again to start over`) }
@@ -146,8 +150,7 @@ export class BackfillTimeoutError extends Error {
 
 /** A durable slot is already held by another connection and onSlotBusy is 'error' (the default),
  *  or eviction was attempted and denied — retrying a slot someone else legitimately holds never
- *  heals on its own. Names the slot and the holding PID, never the URL. Thrown starting plan
- *  04-03. */
+ *  heals on its own. Names the slot and the holding PID, never the URL. */
 export class SlotBusyError extends Error {
   readonly reason = 'slot-busy' as const
   constructor(readonly slot: string, readonly pid: number) { super(`minipg: replication slot ${JSON.stringify(slot)} is active for PID ${pid} — pass onSlotBusy: 'evict' to terminate it, or wait for the other consumer to release it`) }
@@ -184,6 +187,12 @@ const deliverWarning = (cb: ((w: CdcWarning) => void) | undefined, w: CdcWarning
 // Always inside [a-z0-9_]{1,63} by construction; createSlot() runs checkSlot() regardless.
 const tempSlotName = (): string => `minipg_cdc_${randomBytes(4).toString('hex')}`
 
+// Mirrors src/replication.ts's own SLOT_NAME (checkSlot is private to that module) — a durable
+// name is interpolated into new SQL sites (health check, eviction) the raw layer does not cover,
+// so it gets validated here before ANY of them ever sees it.
+const DURABLE_SLOT_NAME = /^[a-z0-9_]{1,63}$/
+const validateDurableSlotName = (name: string): void => { if (!DURABLE_SLOT_NAME.test(name)) throw new InvalidSlotName(name) }
+
 // D-01's numbers are the reference consumer's (drizzle-pulse) production defaults, not this
 // driver's own reconnect backoff (src/connection.ts, src/pool.ts, src/aurora.ts all use
 // multiplicative jitter) — the additive form here is a deliberate divergence, not an oversight.
@@ -206,11 +215,23 @@ const sleep = (ms: number, signal: AbortSignal): Promise<void> =>
 
 // Mirrors isFatalAuth's shape (src/connection.ts:167-171): these never heal with time, so retrying
 // them identically ten times just delays onFatalError. SlotInvalidatedError and SlotBusyError join
-// this set in plan 04-03.
+// the auth/publication/slot-name set: neither heals by waiting.
 function isPermanentFailure(err: unknown): boolean {
   const code = (err as { code?: string } | null)?.code
   if (code === '28P01' || code === '28000' || code === '3D000') return true
-  return err instanceof PublicationMissing || err instanceof PublicationEmpty || err instanceof InvalidSlotName
+  return err instanceof PublicationMissing || err instanceof PublicationEmpty || err instanceof InvalidSlotName ||
+    err instanceof SlotInvalidatedError || err instanceof SlotBusyError
+}
+
+interface SlotHealthRow { active: string; active_pid: string | null; wal_status: string; confirmed_flush_lsn: string | null; restart_lsn: string | null }
+
+// CDC-07's health check, one round trip over command() — no second connection (CDC-15). All five
+// columns come back as TEXT (Pitfall 3: 't'/'f', never true/false). slot_type = 'logical' makes a
+// physical slot squatting this name degenerate to zero rows rather than a row with null LSNs.
+async function readSlotHealth(conn: ReplicationConnection, name: string): Promise<SlotHealthRow | null> {
+  const r = await conn.command(`select active, active_pid, wal_status, confirmed_flush_lsn, restart_lsn from pg_replication_slots where slot_name = '${name}' and slot_type = 'logical'`)
+  if (r.rows.length === 0) return null
+  return Object.fromEntries(r.columns.map((c, i) => [c, r.rows[0]![i]])) as unknown as SlotHealthRow
 }
 
 /** Start a managed CDC session: connect, administer the slot, backfill inside the exported-
@@ -228,6 +249,11 @@ export function replicate(opts: ReplicateOptions): ReplicateHandle {
   let pendingAckLsn: string | null = null      // a done:true batch's endLsn once its handler resolves, until acked
   let walSenderTimeoutMs: number | null = null // stashed for plan 04-03's timer derivation; unused here
   let stopPromise: Promise<void> | null = null
+  let sawSlot = false                    // D-08: absent on the FIRST observation creates the durable slot; absent on any LATER one invalidates it
+  let lastSystemId: string | null = null // persisted across connects; a durable slot's systemId/timeline must never move under it
+  let lastTimeline: number | null = null
+  let currentSlotName: string | null = null // durable-session bookkeeping for the catch block's 42704 -> SlotInvalidatedError mapping below
+  let currentIsDurable = false
   const controller = new AbortController() // internal signal: reaches start()'s own signal, so stop() wakes a parked next()
   const effectiveRetryDelayMs = opts.retryDelayMs ?? defaultRetryDelayMs
   // CDC-02: the consumer's own signal behaves exactly like calling stop() — same teardown, same
@@ -251,6 +277,8 @@ export function replicate(opts: ReplicateOptions): ReplicateHandle {
   async function run(): Promise<void> {
     if (stopping) { state = 'stopped'; return }
     for (;;) { // one iteration = one session: S1 connecting through S4/S5, or a failure into S6
+      currentIsDurable = false // reset every iteration — stale from a prior session must never drive the 42704 mapping below
+      currentSlotName = null
       try {
         state = 'connecting'
         repl = await replication(opts.url)
@@ -264,41 +292,92 @@ export function replicate(opts: ReplicateOptions): ReplicateHandle {
         walSenderTimeoutMs = raw == null ? null : Number(raw)
         if (stopping) { repl.end(); state = 'stopped'; return }
 
+        const isDurable = typeof opts.slot !== 'string'
         const name = typeof opts.slot === 'string' ? tempSlotName() : opts.slot.name
-        const created = await repl.createSlot(name, { temporary: typeof opts.slot === 'string', snapshot: 'export' })
-        // Pitfall 4: stop() landing exactly here still leaves the temporary slot dying with the
-        // connection, and a durable name as the slot the consumer asked for — never a compensating
-        // dropSlot, which would be the silent-data-loss recreate D-02 refuses to perform.
+        if (isDurable) validateDurableSlotName(name) // a consumer bug, not slot invalidation — checked before ANY interpolation site below sees it
+        currentIsDurable = isDurable
+        currentSlotName = name
+
+        let resumed: { confirmedFlush: string; restartLsn: string } | null = null
+
+        if (isDurable) {
+          // Fixed order on every durable connect: the wst probe above, then identify(), then the
+          // health check — mirrors the state-machine table in RESEARCH.md.
+          const identity = await repl.identify()
+          if (lastSystemId !== null && (identity.systemId !== lastSystemId || identity.timeline !== lastTimeline)) {
+            throw new SlotInvalidatedError(name, 'system-changed') // a promoted standby voids every prior LSN assumption
+          }
+          lastSystemId = identity.systemId
+          lastTimeline = identity.timeline
+          if (stopping) { repl.end(); state = 'stopped'; return }
+
+          const row = await readSlotHealth(repl, name)
+          if (stopping) { repl.end(); state = 'stopped'; return }
+          if (!row) {
+            if (sawSlot) throw new SlotInvalidatedError(name, 'absent') // was there, now gone — D-02: never silently recreated
+            // else: first observation ever — fall through to createSlot below (D-08)
+          } else {
+            sawSlot = true
+            if (row.wal_status === 'lost') throw new SlotInvalidatedError(name, 'wal-lost')
+            if (row.confirmed_flush_lsn == null) throw new SlotInvalidatedError(name, 'no-confirmed-flush') // guards every LSN use below — this check must run first
+            if (row.active === 't' && row.active_pid != null) {
+              // The full onSlotBusy branch (eviction) lands separately; for now the slot is
+              // simply busy, permanently, exactly like the 'error' mode of that option.
+              throw new SlotBusyError(name, Number(row.active_pid))
+            }
+            resumed = { confirmedFlush: row.confirmed_flush_lsn, restartLsn: row.restart_lsn! }
+          }
+        }
         if (stopping) { repl.end(); state = 'stopped'; return }
 
-        state = 'backfilling'
-        const window = new AbortController()
-        const onWindowAbort = (): void => window.abort()
-        controller.signal.addEventListener('abort', onWindowAbort, { once: true })
-        const deadline = opts.backfillTimeoutMs
-          ? setTimeout(() => {
-              window.abort(new BackfillTimeoutError(opts.backfillTimeoutMs!))
-              deliverWarning(opts.onWarning, { kind: 'backfill-timeout', ms: opts.backfillTimeoutMs!, message: `minipg: backfill did not resolve within ${opts.backfillTimeoutMs}ms (backfillTimeoutMs) — the session is abandoned and will retry` })
-            }, opts.backfillTimeoutMs)
-          : undefined
-        const isReconnect = !firstBackfill
-        firstBackfill = false
-        try {
-          // ZERO commands run on this connection inside the window: the very next thing sent
-          // below is START_REPLICATION.
-          const p = Promise.resolve(opts.backfill?.({ snapshot: created.snapshot, streamStartLsn: created.consistentPoint, isReconnect, signal: window.signal }))
-          current = p
-          await p
-          window.signal.throwIfAborted() // a backfill that ignored the signal still fails the window
-        } finally {
-          clearTimeout(deadline)
-          controller.signal.removeEventListener('abort', onWindowAbort)
-          current = null
+        let slotForStream: string
+        if (resumed) {
+          slotForStream = name
+          if (opts.onResume) {
+            // A throw here routes through retryDelayMs exactly like a backfill throw (D-03) — it
+            // shares this try block's outer catch, so nothing special is needed to wire that up.
+            const p = Promise.resolve(opts.onResume(resumed))
+            current = p
+            try { await p } finally { current = null }
+          }
+        } else {
+          const created = await repl.createSlot(name, { temporary: !isDurable, snapshot: 'export' })
+          if (isDurable) sawSlot = true
+          slotForStream = created.slot
+          // Pitfall 4: stop() landing exactly here still leaves the temporary slot dying with the
+          // connection, and a durable name as the slot the consumer asked for — never a compensating
+          // dropSlot, which would be the silent-data-loss recreate D-02 refuses to perform.
+          if (stopping) { repl.end(); state = 'stopped'; return }
+
+          state = 'backfilling'
+          const window = new AbortController()
+          const onWindowAbort = (): void => window.abort()
+          controller.signal.addEventListener('abort', onWindowAbort, { once: true })
+          const deadline = opts.backfillTimeoutMs
+            ? setTimeout(() => {
+                window.abort(new BackfillTimeoutError(opts.backfillTimeoutMs!))
+                deliverWarning(opts.onWarning, { kind: 'backfill-timeout', ms: opts.backfillTimeoutMs!, message: `minipg: backfill did not resolve within ${opts.backfillTimeoutMs}ms (backfillTimeoutMs) — the session is abandoned and will retry` })
+              }, opts.backfillTimeoutMs)
+            : undefined
+          const isReconnect = !firstBackfill
+          firstBackfill = false
+          try {
+            // ZERO commands run on this connection inside the window: the very next thing sent
+            // below is START_REPLICATION.
+            const p = Promise.resolve(opts.backfill?.({ snapshot: created.snapshot, streamStartLsn: created.consistentPoint, isReconnect, signal: window.signal }))
+            current = p
+            await p
+            window.signal.throwIfAborted() // a backfill that ignored the signal still fails the window
+          } finally {
+            clearTimeout(deadline)
+            controller.signal.removeEventListener('abort', onWindowAbort)
+            current = null
+          }
         }
 
         state = 'streaming'
         const stream = repl.start({
-          slot: created.slot,
+          slot: slotForStream,
           publications: opts.publications,
           shapes: opts.shapes,
           signal: controller.signal,
@@ -351,19 +430,24 @@ export function replicate(opts: ReplicateOptions): ReplicateHandle {
         state = 'stopped'
         repl.end()
         return
-      } catch (err) {
+      } catch (rawErr) {
         // A server CopyDone (ReplicationStreamEnded) lands here exactly like a dead socket: the
         // walsender accepts exactly one START_REPLICATION per connection (BUG #18754), so the
         // spent session cannot stream again either way — there is no separate CopyDone branch to
         // write. CDC-04 is satisfied by equivalence (D-06): both trigger the same full reconnect.
         repl?.end()
         if (stopping) { state = 'stopped'; return }
-        if (isPermanentFailure(err)) { fireFatal(err as Error); return }
+        // CDC-09's correction: 42704 belongs to slot ACQUISITION (e.g. start() racing a manual
+        // drop on a durable slot), never to pg_terminate_backend.
+        const err: Error = currentIsDurable && rawErr instanceof PgError && rawErr.code === '42704'
+          ? new SlotInvalidatedError(currentSlotName!, 'absent')
+          : (rawErr as Error)
+        if (isPermanentFailure(err)) { fireFatal(err); return }
         attempt++
-        const delay = effectiveRetryDelayMs(attempt, err as Error)
-        if (delay == null) { fireFatal(err as Error); return }
+        const delay = effectiveRetryDelayMs(attempt, err)
+        if (delay == null) { fireFatal(err); return }
         state = 'backoff'
-        deliverWarning(opts.onWarning, { kind: 'reconnect-attempt', attempt, delayMs: delay, message: `minipg: session failed (${(err as Error).message}) — reconnecting in ${delay}ms (attempt ${attempt})` })
+        deliverWarning(opts.onWarning, { kind: 'reconnect-attempt', attempt, delayMs: delay, message: `minipg: session failed (${err.message}) — reconnecting in ${delay}ms (attempt ${attempt})` })
         await sleep(delay, controller.signal)
         if (stopping) { state = 'stopped'; return }
         // loop back to S1 for a fresh session

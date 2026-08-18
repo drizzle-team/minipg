@@ -6,7 +6,7 @@
 import { test, expect } from 'bun:test'
 import { Duplex } from 'node:stream'
 import { frame, rowDescription, dataRow as dataRowBody, type WireCol, type Cell } from '../helpers/wire.ts'
-import { replication as rawReplication, batchTransactions as rawBatchTransactions, type ReplicationConfig, type TransactionBatch } from '../../src/index.ts'
+import { replication as rawReplication, batchTransactions as rawBatchTransactions, PgError, type ReplicationConfig, type TransactionBatch } from '../../src/index.ts'
 import { replicate, SlotInvalidatedError, BackfillTimeoutError, SlotBusyError, type CdcWarning } from '../../src/cdc.ts'
 
 const i32 = (n: number) => { const b = Buffer.allocUnsafe(4); b.writeInt32BE(n); return b }
@@ -19,6 +19,17 @@ const ready = (s = 'I') => frame('Z', Buffer.from(s, 'latin1'))
 const rowDesc = (cols: WireCol[]) => frame('T', rowDescription(cols))
 const dataRow = (cells: Cell[]) => frame('D', dataRowBody(cells))
 const copyBoth = () => frame('W', Buffer.from([0, 0, 0]))
+const cstrLatin1 = (s: string) => Buffer.concat([Buffer.from(s, 'latin1'), Buffer.from([0])])
+// ErrorResponse ('E'): a run of (field-type-byte + cstring) pairs, terminated by a zero byte —
+// only the three fields command()'s own PgError construction reads (S/C/M).
+const errFrame = (code: string, message: string): Buffer =>
+  frame('E', Buffer.concat([
+    Buffer.from('S', 'latin1'), cstrLatin1('ERROR'),
+    Buffer.from('C', 'latin1'), cstrLatin1(code),
+    Buffer.from('M', 'latin1'), cstrLatin1(message),
+    Buffer.from([0]),
+  ]))
+const healthCols: WireCol[] = [{ name: 'active', oid: 25 }, { name: 'active_pid', oid: 25 }, { name: 'wal_status', oid: 25 }, { name: 'confirmed_flush_lsn', oid: 25 }, { name: 'restart_lsn', oid: 25 }]
 const xlogData = (payload: Buffer) => frame('d', Buffer.concat([Buffer.from('w', 'latin1'), i64zero, i64zero, i64zero, payload]))
 const pgBegin = () => xlogData(Buffer.concat([Buffer.from('B', 'latin1'), i64zero, i64zero, i32(1)]))
 
@@ -62,13 +73,15 @@ async function until(check: () => boolean, timeoutMs = 2000): Promise<void> {
 interface CdcSession { dx: Duplex; queries: string[]; sent: Buffer[] }
 
 /** A multi-session fake walsender: each socket() call authenticates a FRESH Duplex and records
- *  its own queries/sent arrays onto `sessions` — cdc.ts's reconnect tests (later plans) need one
- *  session per connection, so nothing here is shared across sessions. The shared default router
- *  answers exactly the commands the managed layer's happy path issues; opts.onQuery replaces it
- *  entirely for tests that need one branch to answer differently. */
-function cdcBackend(opts: { onQuery?: (sql: string) => Buffer[] } = {}) {
+ *  its own queries/sent arrays onto `sessions` — cdc.ts's reconnect tests need one session per
+ *  connection, so nothing here is shared across sessions. The shared default router answers
+ *  exactly the commands the managed layer's happy path issues; opts.onQuery — given the SQL and
+ *  the 0-based session index it arrived on — intercepts one branch and falls through to the
+ *  default router by returning undefined, so a durable-mode test only has to override the one
+ *  query it cares about. */
+function cdcBackend(opts: { onQuery?: (sql: string, session: number) => Buffer[] | undefined } = {}) {
   const sessions: CdcSession[] = []
-  const onQuery = opts.onQuery ?? ((sql: string): Buffer[] => {
+  const defaultOnQuery = (sql: string): Buffer[] => {
     if (sql.startsWith('START_REPLICATION')) return [copyBoth()]
     // 4-column reply, exactly what src/replication.ts's createSlot() destructures
     if (sql.startsWith('CREATE_REPLICATION_SLOT')) {
@@ -117,9 +130,10 @@ function cdcBackend(opts: { onQuery?: (sql: string) => Buffer[] } = {}) {
       ]
     }
     return [ready()]
-  })
+  }
 
   const socket = (): Duplex => {
+    const sessionIndex = sessions.length // sessions.push() below runs synchronously before any query lands, so this is stable for the whole session
     let authenticated = false
     const queries: string[] = []
     const sent: Buffer[] = []
@@ -142,7 +156,7 @@ function cdcBackend(opts: { onQuery?: (sql: string) => Buffer[] } = {}) {
             let z = 0; while (body[z] !== 0) z++
             const sql = body.toString('utf8', 0, z)
             queries.push(sql)
-            for (const f of onQuery(sql)) dx.push(f)
+            for (const f of opts.onQuery?.(sql, sessionIndex) ?? defaultOnQuery(sql)) dx.push(f)
           } else if (type === 'c') {
             dx.push(ready()) // CopyDone -> CommandComplete/ReadyForQuery, as a real walsender answers
           } else if (type === 'd' || type === 'X') {
@@ -650,4 +664,248 @@ test('cdc signal: aborting the consumer signal behaves like stop()', async () =>
   await Bun.sleep(30)
   expect(fatalCount).toBe(0)
   expect(backend.sessions.length).toBe(1) // no reconnect attempted
+})
+
+test('cdc invalidated: lost, null confirmed_flush, absent after seen, and systemId change go straight to onFatalError', async () => {
+  // D-02's real guarantee is that the INVALIDATION ITSELF never reaches retryDelayMs — not that
+  // zero session churn ever happens getting there. "absent after seen" and "systemId change" are
+  // both, by construction, only observable on a SECOND connect (you can't be "seen before" on the
+  // first one), and the only way run()'s loop opens a second session is through the ordinary
+  // transient-failure path, which legitimately spends one retryDelayMs call. What must never
+  // happen is retryDelayMs being consulted FOR a SlotInvalidatedError — recorded here so a
+  // regression (routing invalidation through the normal retry budget) fails loudly.
+  const noRetryForInvalidation = (calls: { attempt: number; err: Error }[]) =>
+    expect(calls.every((c) => !(c.err instanceof SlotInvalidatedError))).toBe(true)
+
+  // Scenario 1: wal_status = 'lost' — observable on the very first connect.
+  {
+    const backend = cdcBackend({
+      onQuery: (sql) => sql.includes('pg_replication_slots')
+        ? [rowDesc(healthCols), dataRow(['f', null, 'lost', '0/10', '0/8']), ready()]
+        : undefined,
+    })
+    let fatalErr: Error | undefined
+    const calls: { attempt: number; err: Error }[] = []
+    const handle = replicate({
+      url: cfg({ socket: backend.socket }),
+      slot: { name: 'durable_lost' },
+      publications: ['pub'],
+      backfill: async () => {},
+      onTransaction: () => {},
+      retryDelayMs: (attempt, err) => { calls.push({ attempt, err }); return 1 },
+      onFatalError: (err) => { fatalErr = err },
+    })
+    await until(() => fatalErr !== undefined)
+    expect(fatalErr).toBeInstanceOf(SlotInvalidatedError)
+    expect((fatalErr as SlotInvalidatedError).cause).toBe('wal-lost')
+    expect(calls.length).toBe(0) // no session churn was even needed to observe this
+    expect(backend.sessions.length).toBe(1)
+    noRetryForInvalidation(calls)
+    await handle.stop()
+  }
+
+  // Scenario 2: confirmed_flush_lsn null — also observable on the first connect.
+  {
+    const backend = cdcBackend({
+      onQuery: (sql) => sql.includes('pg_replication_slots')
+        ? [rowDesc(healthCols), dataRow(['f', null, 'reserved', null, '0/8']), ready()]
+        : undefined,
+    })
+    let fatalErr: Error | undefined
+    const calls: { attempt: number; err: Error }[] = []
+    const handle = replicate({
+      url: cfg({ socket: backend.socket }),
+      slot: { name: 'durable_nullflush' },
+      publications: ['pub'],
+      backfill: async () => {},
+      onTransaction: () => {},
+      retryDelayMs: (attempt, err) => { calls.push({ attempt, err }); return 1 },
+      onFatalError: (err) => { fatalErr = err },
+    })
+    await until(() => fatalErr !== undefined)
+    expect(fatalErr).toBeInstanceOf(SlotInvalidatedError)
+    expect((fatalErr as SlotInvalidatedError).cause).toBe('no-confirmed-flush')
+    expect(calls.length).toBe(0)
+    expect(backend.sessions.length).toBe(1)
+    noRetryForInvalidation(calls)
+    await handle.stop()
+  }
+
+  // Scenario 3: absent after seen — the first connect sees zero rows (never seen before, so it
+  // CREATES the slot — D-08's first-observation rule, pinned here too), then a server CopyDone
+  // forces the one legitimate reconnect, and the second connect sees zero rows again -> absent
+  // after having been seen -> SlotInvalidatedError, never retried.
+  {
+    const backend = cdcBackend({
+      onQuery: (sql) => sql.includes('pg_replication_slots') ? [rowDesc(healthCols), ready()] : undefined,
+    })
+    let fatalErr: Error | undefined
+    const calls: { attempt: number; err: Error }[] = []
+    const handle = replicate({
+      url: cfg({ socket: backend.socket }),
+      slot: { name: 'durable_absent' },
+      publications: ['pub'],
+      backfill: async () => {},
+      onTransaction: () => {},
+      retryDelayMs: (attempt, err) => { calls.push({ attempt, err }); return 1 },
+      onFatalError: (err) => { fatalErr = err },
+    })
+    await until(() => !!backend.latest?.queries.some((q) => q.startsWith('START_REPLICATION')))
+    expect(backend.latest!.queries.some((q) => q.startsWith('CREATE_REPLICATION_SLOT'))).toBe(true) // first observation created it (D-08)
+    backend.latest!.dx.push(frame('c', Buffer.alloc(0))) // server CopyDone -> the one legitimate reconnect
+    await until(() => fatalErr !== undefined)
+    expect(fatalErr).toBeInstanceOf(SlotInvalidatedError)
+    expect((fatalErr as SlotInvalidatedError).cause).toBe('absent')
+    expect(backend.sessions.length).toBe(2)
+    noRetryForInvalidation(calls)
+    await Bun.sleep(50)
+    expect(backend.sessions.length).toBe(2) // no third session after fatal
+    await handle.stop()
+  }
+
+  // Scenario 4: systemId change — the first connect persists identity on a healthy resume, a
+  // CopyDone forces the one legitimate reconnect, and the second connect's identity differs.
+  {
+    const backend = cdcBackend({
+      onQuery: (sql, session) => sql.startsWith('IDENTIFY_SYSTEM')
+        ? [rowDesc([{ name: 'systemid', oid: 25 }, { name: 'timeline', oid: 25 }, { name: 'xlogpos', oid: 25 }, { name: 'dbname', oid: 25 }]),
+            dataRow([session === 0 ? '7000000000000000001' : '9999999999999999999', '1', '0/10', 'd']), ready()]
+        : undefined,
+    })
+    let fatalErr: Error | undefined
+    const calls: { attempt: number; err: Error }[] = []
+    const handle = replicate({
+      url: cfg({ socket: backend.socket }),
+      slot: { name: 'durable_systemchange' },
+      publications: ['pub'],
+      backfill: async () => {},
+      onTransaction: () => {},
+      retryDelayMs: (attempt, err) => { calls.push({ attempt, err }); return 1 },
+      onFatalError: (err) => { fatalErr = err },
+    })
+    await until(() => !!backend.latest?.queries.some((q) => q.startsWith('START_REPLICATION')))
+    backend.latest!.dx.push(frame('c', Buffer.alloc(0)))
+    await until(() => fatalErr !== undefined)
+    expect(fatalErr).toBeInstanceOf(SlotInvalidatedError)
+    expect((fatalErr as SlotInvalidatedError).cause).toBe('system-changed')
+    expect(backend.sessions.length).toBe(2)
+    noRetryForInvalidation(calls)
+    await handle.stop()
+  }
+})
+
+test('cdc copydone: durable recovery reconnects without createSlot, snapshot, or backfill', async () => {
+  const backend = cdcBackend() // default pg_replication_slots row is healthy: active 'f', confirmed_flush '0/10', restart '0/8'
+  let backfillCalls = 0
+  let queriesAtResume = -1
+  const resumeInfos: { confirmedFlush: string; restartLsn: string }[] = []
+  const handle = replicate({
+    url: cfg({ socket: backend.socket }),
+    slot: { name: 'durable_resume' },
+    publications: ['pub'],
+    backfill: async () => { backfillCalls++ },
+    onResume: async (info) => {
+      queriesAtResume = backend.latest!.queries.length
+      resumeInfos.push(info)
+    },
+    onTransaction: () => {},
+  })
+  await until(() => !!backend.latest?.queries.some((q) => q.startsWith('START_REPLICATION')))
+  const s1 = backend.latest!
+  expect(s1.queries.some((q) => q.startsWith('CREATE_REPLICATION_SLOT'))).toBe(false)
+  expect(s1.queries.some((q) => q.includes('pg_replication_slots'))).toBe(true)
+  expect(resumeInfos.length).toBe(1)
+  expect(resumeInfos[0]).toEqual({ confirmedFlush: '0/10', restartLsn: '0/8' }) // the fake's row
+  const startIdx = s1.queries.findIndex((q) => q.startsWith('START_REPLICATION'))
+  expect(startIdx).toBeGreaterThanOrEqual(queriesAtResume) // onResume ran BEFORE START_REPLICATION appears in queries
+
+  // drive one committed transaction
+  const relId = 30, commitLsn = 0xc0n, endLsn = 0xd0n
+  s1.dx.push(pgBegin())
+  s1.dx.push(pgRelation(relId, 'public', 't', 'd', [{ name: 'id', oid: 23, key: true }]))
+  s1.dx.push(pgInsert(relId, [textCell('1')]))
+  s1.dx.push(pgCommit(commitLsn, endLsn))
+  await until(() => lastFlushed(s1.sent) >= endLsn)
+
+  // force a reconnect via server CopyDone — the only path that must reconnect a durable slot
+  s1.dx.push(frame('c', Buffer.alloc(0)))
+  await until(() => backend.sessions.length >= 2 && !!backend.latest?.queries.some((q) => q.startsWith('START_REPLICATION')))
+  const s2 = backend.latest!
+  expect(s2.queries.some((q) => q.startsWith('CREATE_REPLICATION_SLOT'))).toBe(false)
+  expect(s2.queries.some((q) => q.includes('pg_replication_slots'))).toBe(true)
+  expect(s2.queries.some((q) => q.startsWith('START_REPLICATION'))).toBe(true)
+  expect(backfillCalls).toBe(0)
+  expect(resumeInfos.length).toBe(2) // onResume ran on BOTH sessions
+
+  await handle.stop()
+})
+
+test('cdc onResume: a throw retries through retryDelayMs like a backfill throw (D-03)', async () => {
+  const backend = cdcBackend() // default healthy row -> resumes, never creates
+  let resumeCalls = 0
+  let capturedErr: Error | undefined
+  const handle = replicate({
+    url: cfg({ socket: backend.socket }),
+    slot: { name: 'durable_resume_throw' },
+    publications: ['pub'],
+    backfill: async () => {},
+    onResume: async () => { resumeCalls++; throw new Error('resume rejected') },
+    onTransaction: () => {},
+    retryDelayMs: (_attempt, err) => { capturedErr = err; return null }, // one capture, then stop
+    onFatalError: () => {},
+  })
+  await until(() => capturedErr !== undefined)
+  expect(capturedErr?.message).toBe('resume rejected')
+  expect(resumeCalls).toBeGreaterThanOrEqual(1)
+  expect(backend.latest!.queries.some((q) => q.startsWith('START_REPLICATION'))).toBe(false) // never reached start()
+  await handle.stop()
+})
+
+test('cdc query order: wal_sender_timeout precedes slot creation and start on both slot modes', async () => {
+  const backend = cdcBackend({
+    onQuery: (sql) => sql.includes('pg_replication_slots') ? [rowDesc(healthCols), ready()] : undefined, // zero rows -> durable create path
+  })
+  const handle = replicate({
+    url: cfg({ socket: backend.socket }),
+    slot: { name: 'durable_order' },
+    publications: ['pub'],
+    backfill: async () => {},
+    onTransaction: () => {},
+  })
+  await until(() => !!backend.latest?.queries.some((q) => q.startsWith('START_REPLICATION')))
+  const queries = backend.latest!.queries
+  const settingsIdx = queries.findIndex((q) => q.includes('wal_sender_timeout'))
+  const createIdx = queries.findIndex((q) => q.startsWith('CREATE_REPLICATION_SLOT'))
+  const startIdx = queries.findIndex((q) => q.startsWith('START_REPLICATION'))
+  expect(settingsIdx).toBeGreaterThanOrEqual(0)
+  expect(createIdx).toBeGreaterThan(settingsIdx)
+  expect(startIdx).toBeGreaterThan(createIdx)
+  await handle.stop()
+})
+
+test('cdc 42704: a slot-acquisition error during start() maps to SlotInvalidatedError absent', async () => {
+  let startCalls = 0
+  const backend = cdcBackend({
+    onQuery: (sql) => {
+      if (sql.startsWith('START_REPLICATION')) { startCalls++; return [errFrame('42704', 'replication slot "durable_gone" does not exist'), ready()] }
+      return undefined
+    },
+  })
+  let fatalErr: Error | undefined
+  let retryCalled = false
+  const handle = replicate({
+    url: cfg({ socket: backend.socket }),
+    slot: { name: 'durable_gone' },
+    publications: ['pub'],
+    backfill: async () => {},
+    onTransaction: () => {},
+    retryDelayMs: () => { retryCalled = true; return 1 },
+    onFatalError: (err) => { fatalErr = err },
+  })
+  await until(() => fatalErr !== undefined)
+  expect(fatalErr).toBeInstanceOf(SlotInvalidatedError)
+  expect((fatalErr as SlotInvalidatedError).cause).toBe('absent')
+  expect(startCalls).toBe(1)
+  expect(retryCalled).toBe(false)
+  await handle.stop()
 })
