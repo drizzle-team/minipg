@@ -535,3 +535,119 @@ test('cdc backfill timeout: the deadline aborts the signal and routes through re
   expect(warnings.some((w) => w.kind === 'backfill-timeout')).toBe(true)
   await handle.stop()
 })
+
+test('cdc stop: idempotent, settles the in-flight handler, acks what completed', async () => {
+  const backend = cdcBackend()
+  let fatalCount = 0
+  let release: (() => void) | undefined
+  const handle = replicate({
+    url: cfg({ socket: backend.socket }),
+    slot: 'temporary',
+    publications: ['pub'],
+    backfill: async () => {},
+    onTransaction: async () => { await new Promise<void>((resolve) => { release = resolve }) },
+    onFatalError: () => { fatalCount++ },
+  })
+  await until(() => !!backend.latest?.queries.some((q) => q.startsWith('START_REPLICATION')))
+  const session = backend.latest!
+  const relId = 20, commitLsn = 0xa0n, endLsn = 0xb0n
+  session.dx.push(pgBegin())
+  session.dx.push(pgRelation(relId, 'public', 't', 'd', [{ name: 'id', oid: 23, key: true }]))
+  session.dx.push(pgInsert(relId, [textCell('1')]))
+  session.dx.push(pgCommit(commitLsn, endLsn))
+  await until(() => !!release) // handler is now parked, in flight
+
+  const p1 = handle.stop()
+  const p2 = handle.stop()
+  expect(p1).toBe(p2) // idempotent: the second call returns the exact first promise
+
+  let resolved = false
+  p1.then(() => { resolved = true })
+  await Bun.sleep(30)
+  expect(resolved).toBe(false) // stop() must not resolve while the handler is still pending
+  expect(lastFlushed(session.sent)).toBeLessThan(endLsn) // not acked yet either
+
+  release!() // let the handler resolve
+  await p1
+  expect(resolved).toBe(true)
+  expect(lastFlushed(session.sent)).toBeGreaterThanOrEqual(endLsn) // settled work got acked
+  expect(fatalCount).toBe(0)
+
+  const t0 = Date.now()
+  await handle.stop() // a third call, after resolution
+  expect(Date.now() - t0).toBeLessThan(50)
+})
+
+test('cdc stop: before the first connect, the socket factory is never invoked', async () => {
+  let socketCalls = 0
+  const handle = replicate({
+    url: cfg({ socket: () => { socketCalls++; throw new Error('should never be called') } }),
+    slot: 'temporary',
+    publications: ['pub'],
+    backfill: async () => {},
+    onTransaction: () => {},
+  })
+  await handle.stop() // synchronous stop, before run()'s own microtask ever executes
+  await Bun.sleep(20)
+  expect(socketCalls).toBe(0)
+})
+
+test('cdc stop: during backoff aborts the sleep and resolves without a new session', async () => {
+  const backend = cdcBackend()
+  const handle = replicate({
+    url: cfg({ socket: backend.socket }),
+    slot: 'temporary',
+    publications: ['pub'],
+    backfill: async () => {},
+    onTransaction: () => {},
+    retryDelayMs: () => 5000, // large — stop() must not wait anywhere near this
+  })
+  await until(() => !!backend.latest?.queries.some((q) => q.startsWith('START_REPLICATION')))
+  backend.latest!.dx.destroy() // transient failure -> S6 backoff with a 5s delay
+  await Bun.sleep(20) // land stop() mid-backoff
+  const t0 = Date.now()
+  await handle.stop()
+  expect(Date.now() - t0).toBeLessThan(1000)
+  expect(backend.sessions.length).toBe(1) // no reconnect attempted
+})
+
+test('cdc stop: during backfill waits for the backfill promise to settle', async () => {
+  const backend = cdcBackend()
+  let fatalCount = 0
+  const handle = replicate({
+    url: cfg({ socket: backend.socket }),
+    slot: 'temporary',
+    publications: ['pub'],
+    backfill: async ({ signal }) => {
+      await new Promise<void>((resolve) => { signal.addEventListener('abort', () => resolve(), { once: true }) })
+    },
+    onTransaction: () => {},
+    onFatalError: () => { fatalCount++ },
+  })
+  // land stop() while backfill is in flight, before START_REPLICATION is ever sent
+  await until(() => !!backend.latest?.queries.some((q) => q.startsWith('CREATE_REPLICATION_SLOT')))
+  await handle.stop()
+  await Bun.sleep(20)
+  expect(backend.latest!.queries.some((q) => q.startsWith('START_REPLICATION'))).toBe(false)
+  expect(fatalCount).toBe(0)
+})
+
+test('cdc signal: aborting the consumer signal behaves like stop()', async () => {
+  const backend = cdcBackend()
+  let fatalCount = 0
+  const ac = new AbortController()
+  replicate({
+    url: cfg({ socket: backend.socket }),
+    slot: 'temporary',
+    publications: ['pub'],
+    signal: ac.signal,
+    backfill: async () => {},
+    onTransaction: () => {},
+    onFatalError: () => { fatalCount++ },
+  })
+  await until(() => !!backend.latest?.queries.some((q) => q.startsWith('START_REPLICATION')))
+  ac.abort()
+  await Bun.sleep(30)
+  expect(fatalCount).toBe(0)
+  expect(backend.sessions.length).toBe(1) // no reconnect attempted
+})

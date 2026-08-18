@@ -230,6 +230,12 @@ export function replicate(opts: ReplicateOptions): ReplicateHandle {
   let stopPromise: Promise<void> | null = null
   const controller = new AbortController() // internal signal: reaches start()'s own signal, so stop() wakes a parked next()
   const effectiveRetryDelayMs = opts.retryDelayMs ?? defaultRetryDelayMs
+  // CDC-02: the consumer's own signal behaves exactly like calling stop() — same teardown, same
+  // idempotency, never onFatalError. Removed in doStop() so a handle that stopped via stop()
+  // itself doesn't leak this listener on opts.signal for the rest of its lifetime.
+  const onConsumerAbort = (): void => { stop() }
+  opts.signal?.addEventListener('abort', onConsumerAbort, { once: true })
+  if (opts.signal?.aborted) stop() // already aborted before replicate() was even called
 
   // S8: tear down (if a session is open) and fire onFatalError exactly once. Every path that
   // gives up — a permanent error, retryDelayMs returning null on a session failure, or on a
@@ -372,15 +378,26 @@ export function replicate(opts: ReplicateOptions): ReplicateHandle {
 
   async function doStop(): Promise<void> {
     stopping = true
-    controller.abort() // wakes S6's sleep, aborts S3's window, reaches start()'s own signal — MUST precede any await (Pitfall 5)
-    if (current) {
-      // Await whatever is in flight (a backfill or a handler promise) so stop() never returns
-      // mid-work. Only ack on the resolve path: a rejection means the handler threw and did not
-      // complete, so run()'s own retry loop (or its final failure) owns that batch, not stop().
-      try {
-        await current
-        if (pendingAckLsn) { repl?.ack(pendingAckLsn); pendingAckLsn = null }
-      } catch { /* run()'s own catch/retry loop handles a rejected in-flight promise */ }
+    opts.signal?.removeEventListener('abort', onConsumerAbort)
+    if (state === 'handling') {
+      // A handler's own promise resolves on ITS OWN schedule, not the abort's — so await it
+      // FIRST and ack what it completed BEFORE aborting. Aborting first would reach start()'s
+      // onAbort, which end()s the raw connection immediately (Pitfall 5) — a socket already
+      // being torn down can't carry the ack out, so "acks what completed" (CDC-02) would
+      // silently lose the write. The backfilling/idle branch below has the opposite requirement.
+      if (current) {
+        try {
+          await current
+          if (pendingAckLsn) { repl?.ack(pendingAckLsn); pendingAckLsn = null }
+        } catch { /* run()'s own retry loop or its final failure owns a rejected handler promise */ }
+      }
+      controller.abort()
+    } else {
+      // Backfilling: the in-flight promise only resolves once ITS OWN signal (derived from this
+      // controller) fires, so abort MUST precede the await here or it never settles. Idle/parked:
+      // a generator suspended at next() only wakes via abort -> onAbort -> end() (Pitfall 5).
+      controller.abort() // wakes S6's sleep, aborts S3's window, reaches start()'s own signal
+      if (current) { try { await current } catch { /* run()'s own catch handles a rejected backfill */ } }
     }
     repl?.end()
     state = 'stopped'
