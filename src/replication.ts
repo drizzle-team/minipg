@@ -886,10 +886,15 @@ export type TransactionBatch =
     }
 
 /** The flat event stream -> per-transaction batches. begin/commit are consumed onto the envelope
- *  (never placed in events[]); commit fields land only on the done:true chunk. Unbounded unless
- *  opts.maxEvents is set, in which case an oversized transaction chunks into done:false pieces
- *  then a final done:true chunk carrying the commit fields; a throw mid-transaction discards
- *  buffered events, so nothing partial is ackable. */
+ *  (never placed in events[]); commit fields land only on the done:true chunk. A throw
+ *  mid-transaction discards buffered events, so nothing partial is ackable.
+ *
+ *  A non-transactional pg_logical_emit_message arrives outside any begin/commit pair, so there is
+ *  no batch to hold it and it is DROPPED; a transactional one stays in events[]. maxQueueBytes
+ *  bounds the socket's undelivered queue, NOT the assembled batch, so it is not batch memory
+ *  safety. Unbounded unless opts.maxEvents is set, which chunks an oversized transaction into
+ *  done:false pieces then a final done:true chunk carrying the commit fields — a transaction that
+ *  is an exact multiple of maxEvents still ends in an empty done:true chunk to deliver them. */
 export async function* batchTransactions(
   stream: AsyncIterable<ReplicationEvent>,
   opts: { maxEvents?: number } = {},
