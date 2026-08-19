@@ -981,6 +981,40 @@ test('cdc already gone: pg_terminate_backend returning f continues the eviction 
   await handle.stop()
 })
 
+test('cdc eviction poll absent: the slot vanishing mid-poll raises SlotInvalidatedError, not a busy timeout', async () => {
+  let terminateCalls = 0
+  const backend = cdcBackend({
+    onQuery: (sql) => {
+      if (sql.startsWith('select pg_terminate_backend')) {
+        terminateCalls++
+        return [rowDesc([{ name: 'pg_terminate_backend', oid: 25 }]), dataRow(['t']), ready()]
+      }
+      if (sql.startsWith('select active from pg_replication_slots')) {
+        return [rowDesc([{ name: 'active', oid: 25 }]), ready()] // zero rows: someone dropped it mid-poll
+      }
+      if (sql.startsWith('select active,')) {
+        return [rowDesc(healthCols), dataRow(['t', '99001', 'reserved', '0/10', '0/8']), ready()]
+      }
+      return undefined
+    },
+  })
+  let fatalErr: Error | undefined
+  const handle = replicate({
+    url: cfg({ socket: backend.socket }),
+    slot: { name: 'durable_dropped_midpoll' },
+    publications: ['pub'],
+    onSlotBusy: 'evict',
+    backfill: async () => {},
+    onTransaction: () => {},
+    onFatalError: (err) => { fatalErr = err },
+  })
+  await until(() => fatalErr !== undefined)
+  expect(fatalErr).toBeInstanceOf(SlotInvalidatedError)
+  expect((fatalErr as SlotInvalidatedError).cause).toBe('absent')
+  expect(terminateCalls).toBe(1) // eviction still ran once — the poll after it is what finds the row gone
+  await handle.stop()
+})
+
 test('cdc eviction denied: 42501 goes fatal without a retry or a further poll', async () => {
   let terminateCalls = 0
   let pollCalls = 0

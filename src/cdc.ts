@@ -288,7 +288,8 @@ async function evictAndAwaitClear(conn: ReplicationConnection, name: string, pid
   const deadline = Date.now() + 3000
   for (;;) {
     const poll = await conn.command(`select active from pg_replication_slots where slot_name = '${name}'`)
-    if (poll.rows[0]?.[0] === 'f') {
+    if (poll.rows.length === 0) throw new SlotInvalidatedError(name, 'absent') // dropped mid-poll — never the same as still busy
+    if (poll.rows[0]![0] === 'f') {
       deliverWarning(opts.onWarning, { kind: 'slot-evicted', slot: name, pid, message: `minipg: evicted PID ${pid} holding replication slot ${JSON.stringify(name)}` })
       return
     }
