@@ -73,7 +73,10 @@ export interface ReplicateOptions {
    *  retry budget entirely — the same way a failed durable-slot health check does. A session that
    *  timed out here already created the slot; retrying would rebuild it, and the next session's
    *  health check would find that slot healthy and silently resume streaming with the baseline
-   *  never read. Failing here instead of retrying is what keeps that from happening. */
+   *  never read. Failing here instead of retrying is what keeps that from happening. Must be a
+   *  positive number when set — replicate() throws RangeError synchronously for 0 or negative
+   *  values rather than let either mean something. There is no "unbounded" spelling other than
+   *  omitting the option entirely. */
   backfillTimeoutMs?: number
   /** Forwarded to batchTransactions() as maxEvents — omitted or non-positive means unbounded,
    *  matching that helper's own default; the managed layer does not invent a ceiling the helper
@@ -314,6 +317,11 @@ export function replicate(opts: ReplicateOptions): ReplicateHandle {
   // onFatalError would never see it at all.
   if (typeof opts.slot !== 'string') validateDurableSlotName(opts.slot.name)
   if (opts.publications.length === 0) throw new PublicationEmpty()
+  // !(x > 0) catches negative, zero, and NaN in one comparison — a negative value would otherwise
+  // arm a setTimeout that fires immediately, aborting every backfill on entry.
+  if (opts.backfillTimeoutMs !== undefined && !(opts.backfillTimeoutMs > 0)) {
+    throw new RangeError(`minipg: backfillTimeoutMs must be a positive number when set (omit it entirely for unbounded) — got ${opts.backfillTimeoutMs}`)
+  }
 
   let state: SessionState = 'idle'
   let stopping = false

@@ -1439,6 +1439,22 @@ test('cdc an invalid durable slot name throws synchronously, without ever needin
   expect(backend.sessions.length).toBe(0) // never even attempted to connect
 })
 
+test('cdc a non-positive backfillTimeoutMs throws synchronously instead of firing an instant timeout', () => {
+  const backend = cdcBackend()
+  for (const bad of [0, -100, -1]) {
+    expect(() => replicate({
+      url: cfg({ socket: backend.socket }),
+      slot: 'temporary',
+      publications: ['pub'],
+      backfillTimeoutMs: bad,
+      backfill: async () => {},
+      onTransaction: () => {},
+      // deliberately no onFatalError — the whole point is that this must not need one
+    })).toThrow(RangeError)
+  }
+  expect(backend.sessions.length).toBe(0) // never even attempted to connect
+})
+
 test('cdc an empty publications array throws synchronously, without ever needing onFatalError', () => {
   const backend = cdcBackend()
   expect(() => replicate({
