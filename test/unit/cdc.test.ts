@@ -840,7 +840,7 @@ test('cdc copydone: durable recovery reconnects without createSlot, snapshot, or
   await handle.stop()
 })
 
-test('cdc onResume: a throw retries through retryDelayMs like a backfill throw (D-03)', async () => {
+test('cdc onResume: a throw retries through retryDelayMs like a backfill throw', async () => {
   const backend = cdcBackend() // default healthy row -> resumes, never creates
   let resumeCalls = 0
   let capturedErr: Error | undefined

@@ -1140,8 +1140,9 @@ describe('replication()', () => {
     })
   }, 20_000)
 
-  // D-07's regression at the real walsender clock (Pitfall 2): the fixed 60s receiveTimeoutMs this
-  // phase almost shipped false-fires a healthy idle stream at ~70s, measured. The window here can't
+  // A fixed 60s receiveTimeoutMs false-fires a healthy idle stream at ~70s, measured: the server
+  // pings only once the client has been silent for wal_sender_timeout/2, and a 10s status cadence
+  // keeps resetting that clock, so no keepalive ever arrives. The window here can't
   // compress below ~75s — the locked 60s receiveTimeoutMs floor and the server's own 60s default
   // wal_sender_timeout both require a real elapsed silence, not a scaled-down one, to observe
   // honestly. Gated out of the default run: `bun run test` never pays this cost; `bun run test:slow`
