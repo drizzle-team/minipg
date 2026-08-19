@@ -341,6 +341,7 @@ export function replicate(opts: ReplicateOptions): ReplicateHandle {
   let currentSlotName: string | null = null // durable-session bookkeeping for the catch block's 42704 -> SlotInvalidatedError mapping below
   let currentIsDurable = false
   const consumerSetKeepAlive = typeof opts.url !== 'string' && opts.url.keepAlive !== undefined
+  const consumerKeepAliveValue = typeof opts.url !== 'string' ? opts.url.keepAlive : undefined
   const controller = new AbortController() // internal signal: reaches start()'s own signal, so stop() wakes a parked next()
   const effectiveRetryDelayMs = opts.retryDelayMs ?? defaultRetryDelayMs
   // The consumer's own signal behaves exactly like calling stop() — same teardown, same
@@ -407,7 +408,15 @@ export function replicate(opts: ReplicateOptions): ReplicateHandle {
         const derivedReceiveTimeoutMs = walSenderTimeoutMs == null || walSenderTimeoutMs === 0 ? undefined : Math.max(60_000, walSenderTimeoutMs * 2)
         derivedKeepAlive = walSenderTimeoutMs === 0 && !consumerSetKeepAlive
         if (walSenderTimeoutMs === 0) {
-          deliverWarning(opts.onWarning, { kind: 'wal-sender-timeout-disabled', message: "minipg: the server's wal_sender_timeout is 0 (disabled) — it will never ping this connection, so receiveTimeoutMs is left off and keepAlive is enabled instead" })
+          // "keepAlive is enabled instead" is only true when the layer itself turns it on
+          // (derivedKeepAlive above) — a consumer who explicitly pinned keepAlive: false gets
+          // nothing enabled at all, and the warning has to say that plainly instead.
+          const message = !consumerSetKeepAlive
+            ? "minipg: the server's wal_sender_timeout is 0 (disabled) — it will never ping this connection, so receiveTimeoutMs is left off and keepAlive is enabled instead"
+            : consumerKeepAliveValue
+              ? "minipg: the server's wal_sender_timeout is 0 (disabled) — it will never ping this connection, so receiveTimeoutMs is left off; keepAlive is already enabled on this connection"
+              : "minipg: the server's wal_sender_timeout is 0 (disabled) — it will never ping this connection, receiveTimeoutMs is left off, and keepAlive is explicitly disabled on this connection: there is no liveness detection at all"
+          deliverWarning(opts.onWarning, { kind: 'wal-sender-timeout-disabled', message })
         }
 
         const isDurable = typeof opts.slot !== 'string'

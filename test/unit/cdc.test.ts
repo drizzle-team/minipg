@@ -1119,6 +1119,27 @@ test('cdc wal_sender_timeout zero: receive timeout stays off, keepAlive on from 
   }
 })
 
+test('cdc wal_sender_timeout zero with keepAlive pinned false: the warning says nothing was enabled', async () => {
+  const backend = cdcBackend({
+    onQuery: (sql) => sql.includes('wal_sender_timeout') ? [rowDesc([{ name: 'setting', oid: 25 }]), dataRow(['0']), ready()] : undefined,
+  })
+  const warnings: CdcWarning[] = []
+  const handle = replicate({
+    url: cfg({ socket: backend.socket, keepAlive: false }),
+    slot: 'temporary',
+    publications: ['pub'],
+    backfill: async () => {},
+    onTransaction: () => {},
+    onWarning: (w) => { warnings.push(w) },
+  })
+  await until(() => !!backend.latest?.queries.some((q) => q.startsWith('START_REPLICATION')))
+  const w = warnings.find((x) => x.kind === 'wal-sender-timeout-disabled') as { message: string } | undefined
+  expect(w).toBeDefined()
+  expect(w!.message).not.toContain('keepAlive is enabled instead')
+  expect(w!.message).toContain('no liveness detection at all')
+  await handle.stop()
+})
+
 test('cdc 55006: object_in_use after eviction retries the session instead of failing permanently', async () => {
   // Contrast with 'cdc eviction denied' above: 42501 (missing pg_signal_backend) is permanent,
   // 55006 (the slot briefly still active server-side right after termination) is not — it has no
