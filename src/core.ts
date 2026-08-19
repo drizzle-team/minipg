@@ -18,7 +18,7 @@ export function createPool(config: string | PoolConfig = {}): Pool {
 }
 
 export { Connection, Pool }
-export { replication, ReplicationConnection, ReplicationStreamEnded, ReplicationSessionSpent, ReplicationReceiveTimeout, InvalidSlotName, ReplicationBusy, PublicationMissing, PublicationEmpty, lsnToString, lsnFromString, batchTransactions } from './replication.ts'
+export { replication, ReplicationConnection, ReplicationStreamEnded, ReplicationSessionSpent, ReplicationReceiveTimeout, InvalidSlotName, ReplicationBusy, PublicationMissing, PublicationEmpty, InvalidReplicationShape, lsnToString, lsnFromString, batchTransactions } from './replication.ts'
 export { Cursor } from './cursor.ts'
 export type { CursorOptions } from './cursor.ts'
 export type { ReplicationConfig, ReplicationEvent, ReplicationRelation, ReplicationWarning, StartOptions, TableShape, Row, TransactionBatch } from './replication.ts'

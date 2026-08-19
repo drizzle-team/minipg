@@ -296,6 +296,16 @@ export class PublicationEmpty extends Error {
   constructor() { super('minipg: publications is empty — pgoutput needs at least one publication to stream') }
 }
 
+/** A `start({ shapes })` entry could not be resolved: a duplicate schema.table, a type or decode
+ *  target `shapeCols()` rejected, or a `Collect()` group (which flattens into several SELECT
+ *  columns and can't apply to a single replication row). Thrown from inside the shapes-validation
+ *  loop, before CREATE_REPLICATION_SLOT is ever sent — a deterministic consumer bug, never one
+ *  that heals by retrying. */
+export class InvalidReplicationShape extends Error {
+  readonly reason = 'invalid-shape' as const
+  constructor(message: string) { super(message) }
+}
+
 /** A non-fatal condition detected before or during the stream — the library's only warning
  *  channel (see StartOptions.onWarning). `publication-empty`: a named publication exists but
  *  publishes no tables right now, so the stream starts and delivers nothing until tables are
@@ -615,9 +625,13 @@ export class ReplicationConnection {
       this.warned.clear() // per-stream warning dedupe; a re-start() after a reconnect warns again
       for (const s of opts.shapes ?? []) {
         const schema = s.schema ?? 'public'
-        if (this.shaped.has(schema + '\0' + s.table)) throw new Error(`minipg: duplicate replication shape for ${schema}.${s.table}`)
-        const cols = shapeCols(s.shape) // resolves + validates specs NOW (unknown types/targets fail before streaming)
-        for (const c of cols) if (c.path) throw new Error(`minipg: replication shape for ${schema}.${s.table}: Collect() groups several result columns and can't apply to a replication row (group ${JSON.stringify(c.path[0])})`)
+        if (this.shaped.has(schema + '\0' + s.table)) throw new InvalidReplicationShape(`minipg: duplicate replication shape for ${schema}.${s.table}`)
+        // shapeCols() is shared with plain query .shape() (src/shape.ts, connection.ts, http.ts,
+        // neon-http.ts), where a bare Error is correct — re-thrown here as InvalidReplicationShape
+        // so ONLY the replication path gets the isPermanentFailure() classification in cdc.ts.
+        let cols: CodegenCol[]
+        try { cols = shapeCols(s.shape) } catch (e) { throw e instanceof Error ? new InvalidReplicationShape(e.message) : e } // resolves + validates specs NOW (unknown types/targets fail before streaming)
+        for (const c of cols) if (c.path) throw new InvalidReplicationShape(`minipg: replication shape for ${schema}.${s.table}: Collect() groups several result columns and can't apply to a replication row (group ${JSON.stringify(c.path[0])})`)
         const keys = new Set(cols.map((c) => c.name))
         for (const k of Object.keys(s.columns ?? {})) if (!keys.has(k)) throw new Error(`minipg: replication shape for ${schema}.${s.table}: columns maps ${JSON.stringify(k)} but the shape has no such key`)
         if (s.key && s.key.length === 0) throw new Error(`minipg: replication shape for ${schema}.${s.table}: key is an empty array — declare at least one shape key or omit key`)

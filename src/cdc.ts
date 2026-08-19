@@ -15,7 +15,7 @@
 // session) drives S6: back off, then loop to S1 for a fresh session.
 // A handler throw (S5) retries in place instead, with zero reconnects. A durable slot is
 // health-checked over command() on every connect, still inside S2 — see ReplicateOptions.slot.
-import { replication, batchTransactions, PublicationMissing, PublicationEmpty, InvalidSlotName, type ReplicationConnection, type ReplicationConfig, type ReplicationWarning, type TransactionBatch, type TableShape } from './replication.ts'
+import { replication, batchTransactions, PublicationMissing, PublicationEmpty, InvalidSlotName, InvalidReplicationShape, type ReplicationConnection, type ReplicationConfig, type ReplicationWarning, type TransactionBatch, type TableShape } from './replication.ts'
 import { PgError } from './errors.ts'
 import { randomBytes } from 'node:crypto'
 
@@ -248,10 +248,15 @@ const sleep = (ms: number, signal: AbortSignal): Promise<void> =>
 // none of them heal by waiting. BackfillTimeoutError joins for a different reason: a session that
 // hit the deadline already created the slot, and retrying it would let the next session's health
 // check find that slot healthy and resume streaming past a baseline that was never read.
+// InvalidReplicationShape joins for the same reason as InvalidSlotName: a malformed shapes entry is
+// a consumer typo, not a transient condition — and shape validation runs inside start(), AFTER
+// createSlot and the backfill window, so retrying it burns a fresh temporary slot and a full
+// backfill on every attempt before ever naming the real problem.
 function isPermanentFailure(err: unknown): boolean {
   const code = (err as { code?: string } | null)?.code
   if (code === '28P01' || code === '28000' || code === '3D000' || code === '42501') return true
   return err instanceof PublicationMissing || err instanceof PublicationEmpty || err instanceof InvalidSlotName ||
+    err instanceof InvalidReplicationShape ||
     err instanceof SlotInvalidatedError || err instanceof SlotBusyError || err instanceof UnsupportedServerVersionError ||
     err instanceof BackfillTimeoutError
 }

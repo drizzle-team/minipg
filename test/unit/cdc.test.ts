@@ -6,7 +6,7 @@
 import { test, expect } from 'bun:test'
 import { Duplex } from 'node:stream'
 import { frame, rowDescription, dataRow as dataRowBody, type WireCol, type Cell } from '../helpers/wire.ts'
-import { replication as rawReplication, batchTransactions as rawBatchTransactions, PgError, InvalidSlotName, PublicationEmpty, type ReplicationConfig, type TransactionBatch } from '../../src/index.ts'
+import { replication as rawReplication, batchTransactions as rawBatchTransactions, PgError, InvalidSlotName, InvalidReplicationShape, PublicationEmpty, type ReplicationConfig, type TransactionBatch } from '../../src/index.ts'
 import { replicate, SlotInvalidatedError, BackfillTimeoutError, SlotBusyError, UnsupportedServerVersionError, type CdcWarning } from '../../src/cdc.ts'
 
 const i32 = (n: number) => { const b = Buffer.allocUnsafe(4); b.writeInt32BE(n); return b }
@@ -1606,5 +1606,33 @@ test('cdc a pre-PG13 server (wal_status missing, 42703) fails fast instead of bu
   expect((fatalErr as Error).message).toContain('PostgreSQL 13+')
   expect(retryCalled).toBe(false) // permanent — skips the retry loop entirely
   expect(backend.sessions.length).toBe(1) // never reconnected to retry the same doomed query
+  await handle.stop()
+})
+
+test('cdc malformed shape: a duplicate shapes entry is fatal on the first attempt, not retried through the budget', async () => {
+  const backend = cdcBackend()
+  let backfillCalls = 0
+  let fatalErr: Error | undefined
+  let retryCalled = false
+  const handle = replicate({
+    url: cfg({ socket: backend.socket }),
+    slot: 'temporary',
+    publications: ['pub'],
+    shapes: [
+      { table: 'orders', shape: { id: 'int4' } },
+      { table: 'orders', shape: { id: 'int4' } }, // duplicate schema.table — a deterministic typo, never a transient failure
+    ],
+    backfill: async () => { backfillCalls++ },
+    onTransaction: () => {},
+    retryDelayMs: (attempt) => { retryCalled = true; return attempt < 3 ? 1 : null }, // converge fast if this DOES retry
+    onFatalError: (err) => { fatalErr = err },
+  })
+  await until(() => fatalErr !== undefined)
+
+  expect(fatalErr).toBeInstanceOf(InvalidReplicationShape)
+  expect((fatalErr as Error).message).toContain('duplicate replication shape for public.orders')
+  expect(retryCalled).toBe(false) // permanent — skips the retry loop entirely
+  expect(backfillCalls).toBe(1)   // exactly one backfill spent, not ten
+  expect(backend.sessions.length).toBe(1) // exactly one session opened, not ten
   await handle.stop()
 })
