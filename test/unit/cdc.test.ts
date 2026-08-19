@@ -1636,3 +1636,56 @@ test('cdc malformed shape: a duplicate shapes entry is fatal on the first attemp
   expect(backend.sessions.length).toBe(1) // exactly one session opened, not ten
   await handle.stop()
 })
+
+test('cdc and raw slot-name validation reject and accept identically at every boundary', async () => {
+  const cases: { label: string; name: string }[] = [
+    { label: '63 chars', name: 'a'.repeat(63) },
+    { label: '64 chars', name: 'a'.repeat(64) },
+    { label: 'uppercase', name: 'UpperCase' },
+    { label: 'hyphen', name: 'has-hyphen' },
+    { label: 'leading digit', name: '1leading' },
+    { label: 'empty string', name: '' },
+  ]
+
+  // Raw surface: repl.createSlot() runs checkSlot() before any command is sent.
+  const rawBackend = cdcBackend()
+  const repl = await rawReplication(cfg({ socket: rawBackend.socket }))
+  const rawAccepts = new Map<string, boolean>()
+  try {
+    for (const c of cases) {
+      try { await repl.createSlot(c.name); rawAccepts.set(c.name, true) }
+      catch (e) { if (e instanceof InvalidSlotName) rawAccepts.set(c.name, false); else throw e }
+    }
+  } finally { repl.end() }
+
+  // Managed surface: replicate({ slot: { name } }) validates synchronously, before the handle's
+  // session loop ever runs — a fresh backend per name keeps sessions from one call bleeding into
+  // the next, though a rejected name never opens one anyway.
+  const managedAccepts = new Map<string, boolean>()
+  for (const c of cases) {
+    const backend = cdcBackend()
+    try {
+      const handle = replicate({
+        url: cfg({ socket: backend.socket }),
+        slot: { name: c.name },
+        publications: ['pub'],
+        backfill: async () => {},
+        onTransaction: () => {},
+      })
+      managedAccepts.set(c.name, true)
+      await handle.stop()
+    } catch (e) {
+      if (e instanceof InvalidSlotName) managedAccepts.set(c.name, false)
+      else throw e
+    }
+  }
+
+  // The drift guard: whatever either surface decides for a given name, the OTHER surface must
+  // decide the same thing — not a comparison against the shared regex, which is exactly the
+  // "looks like itself" check that misses real drift between the two independent copies.
+  for (const c of cases) expect(managedAccepts.get(c.name)).toBe(rawAccepts.get(c.name))
+  // Ground truth on the two length boundaries, so the parity loop above can't pass by both
+  // surfaces trivially agreeing to reject (or accept) everything.
+  expect(rawAccepts.get('a'.repeat(63))).toBe(true)
+  expect(rawAccepts.get('a'.repeat(64))).toBe(false)
+})
