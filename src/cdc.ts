@@ -1,134 +1,79 @@
-// Managed CDC session (`replicate()`): a CONSUMER of the raw replication() API, not a rewrite of
-// it — owns the reconnect loop, slot lifecycle, the exported-snapshot backfill window, and
-// ack-on-handler-resolve, so a caller never issues walsender grammar directly.
-//
-//   const handle = replicate({
-//     url, slot: 'temporary', publications: ['pub'],
-//     backfill: async ({ snapshot }) => { … adopt the snapshot on your own connection … },
-//     onTransaction: async (batch) => { … persist batch.events, then it acks automatically … },
-//   })
-//   // later: await handle.stop()
-//
-// The session loop is an explicit state machine (S0 idle -> S1 connecting -> S2 preparing -> S3
-// backfilling -> S4 streaming -> S5 handling -> S6 backoff -> S7 stopped / S8 dead). A transient
-// failure anywhere in S1-S5 (including a server CopyDone, which cannot resume on the same
-// session) drives S6: back off, then loop to S1 for a fresh session.
-// A handler throw (S5) retries in place instead, with zero reconnects. A durable slot is
-// health-checked over command() on every connect, still inside S2 — see ReplicateOptions.slot.
+// replicate() is a consumer of the raw replication() API, not a rewrite of it — it owns the
+// reconnect loop, slot lifecycle, backfill window, and ack-on-handler-resolve.
+// Session states: S0 idle -> S1 connecting -> S2 preparing -> S3 backfilling -> S4 streaming ->
+// S5 handling -> S6 backoff -> S7 stopped / S8 dead. A transient failure in S1-S5 drives S6; a handler throw (S5) retries in place instead, zero reconnects.
 import { replication, batchTransactions, PublicationMissing, PublicationEmpty, InvalidSlotName, InvalidReplicationShape, type ReplicationConnection, type ReplicationConfig, type ReplicationWarning, type TransactionBatch, type TableShape } from './replication.ts'
 import { PgError } from './errors.ts'
 import { randomBytes } from 'node:crypto'
 
-/** One session's lifecycle stage, tracked on the handle's own closure (never module-level) so two
- *  concurrent replicate() calls never share state. */
+/** One session's lifecycle stage, tracked on the handle's own closure so two concurrent
+ *  replicate() calls never share state. */
 type SessionState = 'idle' | 'connecting' | 'preparing' | 'backfilling' | 'streaming' | 'handling' | 'backoff' | 'stopped' | 'dead'
 
 export interface ReplicateOptions {
-  /** Connection target, forwarded verbatim to replication() on every (re)connect — a connection
-   *  string, or the same config object replication() accepts (including a socket factory, which
-   *  is how tests inject a fake transport). */
+  /** Connection target, forwarded verbatim to replication() on every (re)connect — a string, or
+   *  the same config object replication() accepts. */
   url: string | ReplicationConfig
-  /** 'temporary': a random-suffixed temporary slot is created fresh every session, with an
-   *  exported snapshot for backfill — changes made while disconnected are LOST, because the slot
-   *  and the WAL it retained die with the connection. Works against any server the raw
-   *  layer supports (PG 10-17). { name }: a durable slot, health-checked over command() on every
-   *  connect — the name is validated synchronously and replicate() throws InvalidSlotName
-   *  immediately if it is malformed, before any session ever starts. Requires PostgreSQL 13+ (the
-   *  health check reads pg_replication_slots.wal_status); an older server fails fast with
-   *  UnsupportedServerVersionError instead of retrying a bare column-does-not-exist error to the
-   *  ceiling. Absent on the FIRST observation creates it (exported snapshot, backfill runs);
-   *  absent on any LATER connect raises SlotInvalidatedError instead of silently recreating it —
-   *  the driver never performs that data-loss decision on the consumer's behalf. It retains WAL
-   *  until dropped, so a disconnected consumer resumes exactly where it left off. */
+  /** 'temporary': fresh random-suffixed slot each session, exported-snapshot backfill —
+   *  disconnects LOSE queued changes (PG 10-17). { name }: durable slot, health-checked via
+   *  command() each connect (needs PG13+, else UnsupportedServerVersionError); malformed names
+   *  throw InvalidSlotName synchronously, and a later absence raises SlotInvalidatedError instead
+   *  of recreating it. Retains WAL so a disconnected consumer resumes where it left off. */
   slot: 'temporary' | { name: string }
   /** Publications to subscribe — forwarded to start(), whose PublicationMissing probe applies
-   *  unchanged. An empty array is validated synchronously and replicate() throws
-   *  PublicationEmpty immediately, before any session ever starts. */
+   *  unchanged. An empty array throws PublicationEmpty synchronously, before any session starts. */
   publications: string[]
   /** Per-table decode shapes, forwarded to start() unchanged. */
   shapes?: TableShape[]
   /** Aborting stops the session the same way stop() does: settle in-flight work, ack what
    *  completed, close, resolve — never fires onFatalError. */
   signal?: AbortSignal
-  /** Runs once per session that just created a slot with an exported snapshot, awaited strictly
-   *  between CREATE_REPLICATION_SLOT and START_REPLICATION — the layer issues zero commands on
-   *  the replication connection during this window (the snapshot dies on the connection's next
-   *  command, measured as SQLSTATE 22023). Absent under a durable slot that already existed and
-   *  passed its health check — onResume fires instead, with nothing to backfill. The callback
-   *  adopts the snapshot on its OWN normal connection — a raw minipg connection is useless to
-   *  drizzle/kysely/prisma, so the layer hands over names, never connections: `begin isolation
-   *  level repeatable read`, `set transaction snapshot '<snapshot>'` (outside REPEATABLE READ or
-   *  SERIALIZABLE the server raises 0A000), read the baseline, then commit. isReconnect is false
-   *  on the handle's first invocation and true when a dropped connection forced a new session
-   *  A throw here retries IN PLACE, bounded by retryDelayMs: the same slot, the same
-   *  exported snapshot, and the same isReconnect value are handed to another call to backfill —
-   *  no new slot, no new snapshot, no reconnect. The snapshot survives an in-place retry because
-   *  the layer still issues zero commands on the replication connection between attempts; it
-   *  only dies once one runs (SQLSTATE 22023), which START_REPLICATION is. A
-   *  backfillTimeoutMs timeout is the one exception: it fires onFatalError immediately instead,
-   *  with no retry at all — see backfillTimeoutMs. */
+  /** Runs once per session that just created a slot, strictly between CREATE_REPLICATION_SLOT
+   *  and START_REPLICATION — the snapshot dies on the connection's next command (SQLSTATE
+   *  22023). Adopt it on your OWN connection inside REPEATABLE READ or SERIALIZABLE (else 0A000).
+   *  A throw retries IN PLACE on the same slot/snapshot; a backfillTimeoutMs timeout instead goes
+   *  straight to onFatalError, no retry. */
   backfill?: (info: { snapshot: string; streamStartLsn: string; isReconnect: boolean; signal: AbortSignal }) => void | Promise<void>
-  /** Abandon the session if backfill has not resolved within this many ms (omitted = unbounded).
-   *  Terminal: fires BackfillTimeoutError straight to onFatalError, skipping retryDelayMs and the
-   *  retry budget entirely — the same way a failed durable-slot health check does. A session that
-   *  timed out here already created the slot; retrying would rebuild it, and the next session's
-   *  health check would find that slot healthy and silently resume streaming with the baseline
-   *  never read. Failing here instead of retrying is what keeps that from happening. Must be a
-   *  positive number when set — replicate() throws RangeError synchronously for 0 or negative
-   *  values rather than let either mean something. There is no "unbounded" spelling other than
-   *  omitting the option entirely. */
+  /** Abandon the session if backfill hasn't resolved within this many ms (omitted = unbounded).
+   *  Fires BackfillTimeoutError straight to onFatalError, skipping the retry budget — retrying
+   *  would rebuild the slot and let the next session's health check silently resume past an
+   *  unread baseline. Must be positive when set; replicate() throws RangeError otherwise. */
   backfillTimeoutMs?: number
   /** Forwarded to batchTransactions() as maxEvents — omitted or non-positive means unbounded,
-   *  matching that helper's own default; the managed layer does not invent a ceiling the helper
-   *  it wraps does not have. */
+   *  matching that helper's own default. */
   maxTransactionEvents?: number
-  /** Called with each assembled transaction; the batch is ACKED only once this resolves, and only
-   *  for the done:true chunk carrying commitLsn/endLsn — a done:false chunk carries no commit
-   *  fields, so acking it is a compile error, not a runtime mistake. A throw here
-   *  retries the SAME batch object in place — no reconnect, no command issued — bounded by
-   *  retryDelayMs. */
+  /** Called with each assembled transaction; acked only once this resolves, and only for the
+   *  done:true chunk (a done:false chunk carries no commitLsn/endLsn, so acking it is a compile
+   *  error). A throw retries the SAME batch in place, bounded by retryDelayMs. */
   onTransaction: (batch: TransactionBatch) => void | Promise<void>
   /** Governs every retry: connection failures, backfill/handler throws, timeouts. Returning null
-   *  gives up (fires onFatalError). attempt resets to 0 on ACKED progress only, never on connect
-   *  or on delivery — a genuinely idle database that suffers ten transient failures over a day
-   *  still reaches onFatalError under the default policy, which is the intended trade, not an
-   *  oversight; idleAck advances never reset the budget either. Omitted = a default that gives up
-   *  after ~10 attempts, roughly five minutes: 1000ms base, ×2 per attempt, 0-1000ms additive
-   *  jitter, capped at 30s. */
+   *  gives up (fires onFatalError). attempt resets to 0 only on ACKED progress, never on connect
+   *  or delivery. Omitted default gives up after ~10 attempts (~5 min): 1000ms base, ×2 per
+   *  attempt, 0-1000ms jitter, capped at 30s. */
   retryDelayMs?: (attempt: number, err: Error) => number | null
   /** The managed layer's only diagnostic channel — see CdcWarning. Raw warnings forward through
-   *  untouched; a throw from this callback is caught and reported to stderr, and the session
-   *  keeps going. */
+   *  untouched; a throw from this callback is caught and reported to stderr. */
   onWarning?: (w: CdcWarning) => void
-  /** Called exactly once, after the layer has fully stopped — no further events and no further
-   *  reconnects follow it. Never called from stop() or from the consumer's own signal
-   *  aborting; those resolve cleanly instead. */
+  /** Called exactly once, after the layer has fully stopped. Never called from stop() or from
+   *  the consumer's own signal aborting — those resolve cleanly instead. */
   onFatalError?: (err: Error) => void
   /** What to do when a durable slot is already held by another backend. 'error' (default) raises
-   *  SlotBusyError — retrying a slot someone else legitimately holds never heals on its own.
-   *  'evict' terminates the holding backend with pg_terminate_backend and polls until it clears;
-   *  it needs the pg_signal_backend grant and fails permanently (42501) without it. Opt-in
-   *  because the driver cannot distinguish a stale zombie from a live consumer. */
+   *  SlotBusyError. 'evict' terminates the holder with pg_terminate_backend and polls until it
+   *  clears; needs the pg_signal_backend grant and fails permanently with 42501 without it. */
   onSlotBusy?: 'error' | 'evict'
   /** Fires instead of backfill when a durable slot already existed and passed its health check —
-   *  there is nothing to backfill, the slot already carries a resumable position. A throw here
-   *  routes through retryDelayMs exactly like a backfill throw. */
+   *  nothing to backfill. A throw here routes through retryDelayMs like a backfill throw. */
   onResume?: (info: { confirmedFlush: string; restartLsn: string }) => void | Promise<void>
   /** Forwarded to start() unchanged; see StartOptions.messages. */
   messages?: boolean
-  /** Forwarded to start() when set. Omitted defaults to a value DERIVED from the server's own
-   *  wal_sender_timeout, read once per connect: max(10_000, wal_sender_timeout * 0.75) — kept
-   *  comfortably above half the server's own ping interval so the server's keepalive clock
-   *  actually expires instead of resetting on every status update. A value set here
-   *  always wins over the derived one. */
+  /** Forwarded to start() when set. Omitted defaults to max(10_000, wal_sender_timeout * 0.75),
+   *  read once per connect and kept above half the server's ping interval so its keepalive clock
+   *  actually expires. A value set here always wins over the derived one. */
   statusIntervalMs?: number
-  /** Forwarded to start() when set. Omitted defaults to a value DERIVED from the server's own
-   *  wal_sender_timeout, read once per connect: max(60_000, wal_sender_timeout * 2) — a fixed
-   *  60s figure alone false-fires on a healthy idle stream once statusIntervalMs's own cadence
-   *  is factored in. When wal_sender_timeout reads 0 (disabled — the server never pings),
-   *  this is left off entirely and keepAlive is turned on instead, with a
-   *  'wal-sender-timeout-disabled' warning naming the setting. A value set here always wins over
-   *  the derived one. */
+  /** Forwarded to start() when set. Omitted defaults to max(60_000, wal_sender_timeout * 2), read
+   *  once per connect — a fixed 60s alone false-fires against statusIntervalMs's own cadence.
+   *  When wal_sender_timeout is 0 (disabled), this is left off and keepAlive is turned on
+   *  instead, with a 'wal-sender-timeout-disabled' warning. A value set here always wins. */
   receiveTimeoutMs?: number
   /** Forwarded to start() unchanged; see StartOptions.maxQueueBytes. */
   maxQueueBytes?: number
@@ -141,63 +86,53 @@ export interface ReplicateOptions {
 }
 
 export interface ReplicateHandle {
-  /** Idempotent: the second call returns the first call's promise. Settles in-flight work (the
-   *  backfill or handler currently running), acks what completed, closes the session, and
-   *  resolves — never fires onFatalError. */
+  /** Idempotent: the second call returns the first call's promise. Settles in-flight work, acks
+   *  what completed, closes the session, and resolves — never fires onFatalError. */
   stop(): Promise<void>
 }
 
 /** A durable-slot health check failed on connect — see ReplicateOptions.slot's { name } form.
- *  Fires straight to onFatalError, skipping the retry loop entirely: the slot row was absent
- *  after previously being observed, its wal_status read 'lost', its confirmed_flush_lsn was
- *  null, or the server's systemId/timeline changed since the last connect — none of these heal
- *  with time. Recovery is a decision only the consumer can make: drop the slot and call
- *  replicate() again to start over, or investigate what invalidated it. */
+ *  Fires straight to onFatalError, skipping retries: the slot row went missing, its wal_status
+ *  read 'lost', confirmed_flush_lsn was null, or the server's systemId/timeline changed — none
+ *  of these heal with time. Drop the slot and call replicate() again, or investigate. */
 export class SlotInvalidatedError extends Error {
   readonly reason = 'slot-invalidated' as const
   constructor(readonly slot: string, override readonly cause: 'absent' | 'wal-lost' | 'no-confirmed-flush' | 'system-changed') { super(`minipg: replication slot ${JSON.stringify(slot)} is invalidated (${cause}) — drop it and call replicate() again to start over`) }
 }
 
-/** backfillTimeoutMs elapsed before the backfill callback resolved — no partial backfill is
- *  usable, so the session is abandoned and the failure fires straight to onFatalError, skipping
- *  the retry budget entirely: retrying would create a fresh slot from a session that already
- *  created one, and the next session's health check would find that slot healthy and resume
- *  streaming with the baseline silently never read. */
+/** backfillTimeoutMs elapsed before backfill resolved — no partial backfill is usable, so the
+ *  session is abandoned straight to onFatalError, skipping the retry budget: retrying would
+ *  rebuild the slot and let the next session's health check silently resume past an unread
+ *  baseline. */
 export class BackfillTimeoutError extends Error {
   readonly reason = 'backfill-timeout' as const
   constructor(readonly ms: number) { super(`minipg: backfill did not resolve within ${ms}ms (backfillTimeoutMs) — the session is abandoned`) }
 }
 
-/** A durable slot is already held by another connection and onSlotBusy is 'error' (the default),
- *  or eviction was attempted and denied — retrying a slot someone else legitimately holds never
- *  heals on its own. Names the slot and the holding PID, never the URL. */
+/** A durable slot is already held by another connection and onSlotBusy is 'error' (default), or
+ *  eviction was denied. Names the slot and holding PID, never the URL. */
 export class SlotBusyError extends Error {
   readonly reason = 'slot-busy' as const
   constructor(readonly slot: string, readonly pid: number) { super(`minipg: replication slot ${JSON.stringify(slot)} is active for PID ${pid} — pass onSlotBusy: 'evict' to terminate it, or wait for the other consumer to release it`) }
 }
 
 /** A durable slot's health check reads `pg_replication_slots.wal_status`, added in PostgreSQL
- *  13 — this server does not have it (42703 undefined_column). This never heals with time, so it
- *  skips the retry loop entirely rather than burning the whole budget on a bare column-does-not-
- *  exist error. `slot: 'temporary'` has no such floor and works on any server the raw layer
- *  supports. */
+ *  13 — this server lacks it (42703). Never heals with time, so it skips the retry loop rather
+ *  than burning the budget on a bare column-does-not-exist error. `slot: 'temporary'` has no
+ *  such floor. */
 export class UnsupportedServerVersionError extends Error {
   readonly reason = 'unsupported-server-version' as const
   constructor() { super("minipg: durable slots need PostgreSQL 13+ (pg_replication_slots.wal_status is not available on this server) — use slot: 'temporary' instead, or upgrade the server") }
 }
 
-/** Lifecycle warnings the managed layer itself emits, through the same channel raw
- *  ReplicationWarning values already use — replicate()'s onWarning takes this wider union and
- *  forwards raw warnings through untouched, so a consumer has exactly one warning channel
- *  regardless of which layer noticed something. `reconnect-attempt`: a session failure or an
- *  onTransaction throw consumed a retry attempt, and the layer is about to sleep for `delayMs`
- *  before attempt number `attempt` — fired both for a full reconnect (S6) and for the in-place
- *  handler retry, since both draw on the same retry budget. `backfill-timeout`:
- *  backfillTimeoutMs elapsed and the session is being abandoned. `slot-evicted`: onSlotBusy:
- *  'evict' terminated another backend holding the slot. `wal-sender-timeout-disabled`: the
- *  server's wal_sender_timeout reads 0 (no server-side liveness pings), so receiveTimeoutMs is
- *  left off and keepAlive is turned on instead. A throw from onWarning is caught and reported to
- *  stderr, exactly like the raw layer's own onWarning. */
+/** Lifecycle warnings the managed layer itself emits, on the same onWarning channel raw
+ *  ReplicationWarning uses — raw warnings forward through untouched. `reconnect-attempt`: a
+ *  session failure or an onTransaction throw consumed a retry attempt, sleeping `delayMs` before
+ *  attempt `attempt` (fired for both a full reconnect and an in-place handler retry).
+ *  `backfill-timeout`: backfillTimeoutMs elapsed, session abandoned. `slot-evicted`: onSlotBusy:
+ *  'evict' terminated another backend. `wal-sender-timeout-disabled`: wal_sender_timeout reads
+ *  0, so receiveTimeoutMs is left off and keepAlive is turned on instead. A throw from onWarning
+ *  is caught and reported to stderr. */
 export type CdcWarning =
   | ReplicationWarning
   | { kind: 'reconnect-attempt'; attempt: number; delayMs: number; message: string }
@@ -205,9 +140,8 @@ export type CdcWarning =
   | { kind: 'slot-evicted'; slot: string; pid: number; message: string }
   | { kind: 'wal-sender-timeout-disabled'; message: string }
 
-// Mirrors the raw layer's own onWarning contract: a throw from the consumer's callback must not
-// take down the session it is reporting on, so it is caught and reported to stderr instead — the
-// one process-stream write this module makes.
+// Mirrors the raw layer's own onWarning contract: a throw from the consumer's callback is caught
+// and reported to stderr instead of taking down the session it's reporting on.
 const deliverWarning = (cb: ((w: CdcWarning) => void) | undefined, w: CdcWarning): void => {
   if (!cb) return
   try { cb(w) } catch (e) { console.error('minipg: onWarning callback threw', e) }
@@ -216,24 +150,19 @@ const deliverWarning = (cb: ((w: CdcWarning) => void) | undefined, w: CdcWarning
 // Always inside [a-z0-9_]{1,63} by construction; createSlot() runs checkSlot() regardless.
 const tempSlotName = (): string => `minipg_cdc_${randomBytes(4).toString('hex')}`
 
-// Mirrors src/replication.ts's own SLOT_NAME (checkSlot is private to that module) — a durable
-// name is interpolated into new SQL sites (health check, eviction) the raw layer does not cover,
-// so it gets validated here before ANY of them ever sees it.
+// Mirrors src/replication.ts's own SLOT_NAME — a durable name is interpolated into new SQL sites
+// (health check, eviction) here, so it's validated before any of them sees it.
 const DURABLE_SLOT_NAME = /^[a-z0-9_]{1,63}$/
 const validateDurableSlotName = (name: string): void => { if (!DURABLE_SLOT_NAME.test(name)) throw new InvalidSlotName(name) }
 
-// These numbers are the reference consumer's (drizzle-pulse) production defaults, not this
-// driver's own reconnect backoff (src/connection.ts, src/pool.ts, src/aurora.ts all use
-// multiplicative jitter) — the additive form here is a deliberate divergence, not an oversight.
-// attempt is 1-based: the first failure passes attempt 1. Returning null at the ceiling keeps
-// "gave up" a single code path; the layer must never have two ways to reach onFatalError.
+// drizzle-pulse's production defaults, not this driver's own backoff elsewhere (multiplicative
+// jitter there, additive here — deliberate). attempt is 1-based; null at the ceiling keeps "gave up" a single code path to onFatalError.
 function defaultRetryDelayMs(attempt: number, _err: Error): number | null {
   return attempt >= 10 ? null : Math.min(1000 * 2 ** (attempt - 1) + Math.random() * 1000, 30_000)
 }
 
-// Fourth module-local sleep in the codebase (src/connection.ts, src/pool.ts, src/aurora.ts each
-// define their own) — this one resolves early on abort instead of running to completion, so a
-// stop() mid-backoff wakes it instead of racing a timer against a flag.
+// Resolves early on abort instead of running to completion, so stop() mid-backoff wakes it
+// instead of racing a timer against a flag.
 const sleep = (ms: number, signal: AbortSignal): Promise<void> =>
   new Promise((resolve) => {
     if (signal.aborted) { resolve(); return }
@@ -242,16 +171,8 @@ const sleep = (ms: number, signal: AbortSignal): Promise<void> =>
     signal.addEventListener('abort', done, { once: true })
   })
 
-// Mirrors isFatalAuth's shape (src/connection.ts:167-171): these never heal with time, so retrying
-// them identically ten times just delays onFatalError. SlotInvalidatedError, SlotBusyError, and
-// 42501 (eviction denied — missing pg_signal_backend) join the auth/publication/slot-name set:
-// none of them heal by waiting. BackfillTimeoutError joins for a different reason: a session that
-// hit the deadline already created the slot, and retrying it would let the next session's health
-// check find that slot healthy and resume streaming past a baseline that was never read.
-// InvalidReplicationShape joins for the same reason as InvalidSlotName: a malformed shapes entry is
-// a consumer typo, not a transient condition — and shape validation runs inside start(), AFTER
-// createSlot and the backfill window, so retrying it burns a fresh temporary slot and a full
-// backfill on every attempt before ever naming the real problem.
+// None of these heal with time (mirrors isFatalAuth, connection.ts). InvalidReplicationShape
+// joins because start() validates shapes AFTER createSlot/backfill, so retrying burns a fresh slot and a full backfill before naming the real problem.
 function isPermanentFailure(err: unknown): boolean {
   const code = (err as { code?: string } | null)?.code
   if (code === '28P01' || code === '28000' || code === '3D000' || code === '42501') return true
@@ -263,17 +184,14 @@ function isPermanentFailure(err: unknown): boolean {
 
 interface SlotHealthRow { active: string; active_pid: string | null; wal_status: string; confirmed_flush_lsn: string | null; restart_lsn: string | null }
 
-// The health check is one round trip over command() — no second connection. All five
-// columns come back as TEXT ('t'/'f', never true/false). slot_type = 'logical' makes a
-// physical slot squatting this name degenerate to zero rows rather than a row with null LSNs.
+// One round trip over command() — no second connection. Columns arrive as TEXT ('t'/'f' never
+// true/false); slot_type = 'logical' keeps a same-named physical slot from returning null LSNs.
 async function readSlotHealth(conn: ReplicationConnection, name: string): Promise<SlotHealthRow | null> {
   let r
   try {
     r = await conn.command(`select active, active_pid, wal_status, confirmed_flush_lsn, restart_lsn from pg_replication_slots where slot_name = '${name}' and slot_type = 'logical'`)
   } catch (e) {
-    // wal_status is a PG13+ column — an older server raises 42703 here, on every connect,
-    // forever. Name the real cause instead of retrying a bare column-does-not-exist error to
-    // the ceiling.
+    // wal_status is a PG13+ column — an older server raises 42703 here forever; name the real cause instead of retrying it to the ceiling.
     if (e instanceof PgError && e.code === '42703') throw new UnsupportedServerVersionError()
     throw e
   }
@@ -281,12 +199,8 @@ async function readSlotHealth(conn: ReplicationConnection, name: string): Promis
   return Object.fromEntries(r.columns.map((c, i) => [c, r.rows[0]![i]])) as unknown as SlotHealthRow
 }
 
-// The eviction procedure runs entirely over command(): terminate the holding backend,
-// then poll until the slot reads inactive or a ~3s deadline passes. 't' and 'f' from
-// pg_terminate_backend both mean "keep polling" — 'f' is the already-gone case (pg_terminate_backend
-// never raises 42704; that code belongs to pg_drop_replication_slot). A
-// 42501 PgError propagates out of command() untouched; the caller's isPermanentFailure()
-// classifies it, so eviction itself never has to know about retry budgets.
+// Entirely over command(): terminate the holder, then poll until the slot reads inactive or a
+// ~3s deadline passes. 't'/'f' both mean "keep polling" ('f' is already-gone; 42704 belongs to pg_drop_replication_slot, not this). 42501 propagates untouched for isPermanentFailure() to classify.
 async function evictAndAwaitClear(conn: ReplicationConnection, name: string, pid: number, opts: ReplicateOptions, signal: AbortSignal): Promise<void> {
   if (!Number.isInteger(pid)) throw new SlotBusyError(name, pid) // the trust boundary: a server-sourced value about to ride into SQL
   await conn.command(`select pg_terminate_backend(${pid})`)
@@ -303,10 +217,8 @@ async function evictAndAwaitClear(conn: ReplicationConnection, name: string, pid
   }
 }
 
-// Merges keepAlive: true into the connect config whenever the caller has decided this connect
-// needs it — the wst = 0 case, forced onto the very connect that measured it via the one
-// reconnect in run() below, and carried onto every later session through derivedKeepAlive once
-// it's known.
+// Merges keepAlive: true onto the connect that measured wst = 0 (the one reconnect in run()
+// below), carried onto every later session through derivedKeepAlive once it's known.
 function withDerivedKeepAlive(url: string | ReplicationConfig, forceKeepAlive: boolean): string | ReplicationConfig {
   if (!forceKeepAlive) return url
   return typeof url === 'string' ? { url, keepAlive: true } : { ...url, keepAlive: true }
@@ -314,17 +226,13 @@ function withDerivedKeepAlive(url: string | ReplicationConfig, forceKeepAlive: b
 
 /** Start a managed CDC session: connect, administer the slot, backfill inside the exported-
  *  snapshot window, then stream with ack tied to onTransaction's resolution. Returns the handle
- *  SYNCHRONOUSLY — the loop itself starts on a microtask, so a stop() called immediately after
- *  replicate() wins before the first connect. */
+ *  SYNCHRONOUSLY — a stop() called immediately after replicate() wins before the first connect. */
 export function replicate(opts: ReplicateOptions): ReplicateHandle {
-  // Consumer misuse (a malformed durable slot name, an empty publications array) is knowable
-  // synchronously and has nothing to do with the async session — validate and throw here, before
-  // the handle exists, rather than let it surface through fireFatal where a consumer who omitted
-  // onFatalError would never see it at all.
+  // Consumer misuse (malformed slot name, empty publications) is knowable synchronously — validate
+  // before the handle exists, so a consumer who omitted onFatalError still sees it.
   if (typeof opts.slot !== 'string') validateDurableSlotName(opts.slot.name)
   if (opts.publications.length === 0) throw new PublicationEmpty()
-  // !(x > 0) catches negative, zero, and NaN in one comparison — a negative value would otherwise
-  // arm a setTimeout that fires immediately, aborting every backfill on entry.
+  // !(x > 0) catches negative, zero, and NaN in one comparison — a negative value would otherwise fire immediately, aborting every backfill on entry.
   if (opts.backfillTimeoutMs !== undefined && !(opts.backfillTimeoutMs > 0)) {
     throw new RangeError(`minipg: backfillTimeoutMs must be a positive number when set (omit it entirely for unbounded) — got ${opts.backfillTimeoutMs}`)
   }
@@ -350,28 +258,22 @@ export function replicate(opts: ReplicateOptions): ReplicateHandle {
   const controller = new AbortController() // internal signal: reaches start()'s own signal, so stop() wakes a parked next()
   const effectiveRetryDelayMs = opts.retryDelayMs ?? defaultRetryDelayMs
   // The consumer's own signal behaves exactly like calling stop() — same teardown, same
-  // idempotency, never onFatalError. Removed in doStop() so a handle that stopped via stop()
-  // itself doesn't leak this listener on opts.signal for the rest of its lifetime.
+  // idempotency, never onFatalError. Removed in doStop() to avoid leaking this listener.
   const onConsumerAbort = (): void => { stop() }
   opts.signal?.addEventListener('abort', onConsumerAbort, { once: true })
   if (opts.signal?.aborted) stop() // already aborted before replicate() was even called
 
-  // S8: tear down (if a session is open) and fire onFatalError exactly once. Every path that
-  // gives up — a permanent error, retryDelayMs returning null on a session failure, or on a
-  // handler throw — funnels through here so there is exactly one way to reach onFatalError.
+  // S8: tear down and fire onFatalError exactly once. Every give-up path (permanent error,
+  // retryDelayMs returning null) funnels through here so there is one way to reach onFatalError.
   function fireFatal(err: Error): void {
     if (fatalFired) return
     fatalFired = true
     repl?.end()
     state = 'dead'
-    // A handle that dies here never calls doStop(), which is the only other place this listener
-    // is removed — without this, a long-lived application-level signal shared across many
-    // short-lived handles accumulates one listener per handle that ended fatally.
+    // Also removed here — doStop() is the only other place this runs, so a handle that dies fatally never leaks the listener on a long-lived shared signal.
     opts.signal?.removeEventListener('abort', onConsumerAbort)
     if (!opts.onFatalError) { console.error('minipg: replicate() session ended fatally with no onFatalError callback wired up —', err); return }
-    // The terminal callback: nothing downstream of this catches a throw, so one is caught and
-    // reported here, exactly like deliverWarning does for onWarning — a throwing onFatalError
-    // must not itself become an unhandled rejection through run()'s own promise.
+    // Nothing downstream catches a throw here, so one is caught and reported, like deliverWarning does for onWarning.
     try { opts.onFatalError(err) } catch (e) { console.error('minipg: onFatalError callback threw', e) }
   }
 
@@ -386,19 +288,14 @@ export function replicate(opts: ReplicateOptions): ReplicateHandle {
         if (stopping) { repl.end(); state = 'stopped'; return }
 
         state = 'preparing'
-        // command() during an active stream throws ReplicationBusy, so every catalog query here,
-        // and all slot administration, must precede start().
+        // command() during an active stream throws ReplicationBusy, so every catalog query and all slot administration must precede start().
         const wst = await repl.command("select setting::int from pg_settings where name = 'wal_sender_timeout'")
         const raw = wst.rows[0]?.[0]
         walSenderTimeoutMs = raw == null ? null : Number(raw)
         if (stopping) { repl.end(); state = 'stopped'; return }
 
-        // wst = 0 means the server never pings at all, so THIS connection needs keepAlive —
-        // but the setting can only be read after the socket exists, and this is that socket. If it
-        // didn't already carry keepAlive (derivedKeepAlive still reflects whatever the PREVIOUS
-        // session decided), reconnect once, now with it on, before anything else happens: no slot
-        // administration has run yet, so there is nothing to unwind. derivedKeepAlive flips to true
-        // right below, so this condition cannot hold twice for the same session.
+        // wst = 0 means this connection needs keepAlive, but the setting is only readable after
+        // the socket exists — reconnect once now (nothing administered yet to unwind); derivedKeepAlive flips below so this can't fire twice.
         if (walSenderTimeoutMs === 0 && !consumerSetKeepAlive && !derivedKeepAlive) {
           repl.end()
           state = 'connecting'
@@ -407,19 +304,13 @@ export function replicate(opts: ReplicateOptions): ReplicateHandle {
           state = 'preparing'
         }
 
-        // Both liveness timers derive from the server's own wal_sender_timeout rather than
-        // shipping as fixed constants — a fixed 60s receiveTimeoutMs false-fires at ~70s on a
-        // healthy idle stream, because the server only pings once the client has been
-        // silent for wal_sender_timeout/2, and a fixed 10s statusIntervalMs keeps resetting that
-        // clock. wst = 0 means the server never pings at all: leave receiveTimeoutMs off and rely
-        // on the keepAlive turned on above instead.
+        // Both timers derive from the server's own wal_sender_timeout rather than fixed constants:
+        // a fixed receiveTimeoutMs false-fires because the server only pings once the client's been silent for half that interval, and a fixed statusIntervalMs keeps resetting that clock.
         const derivedStatusIntervalMs = walSenderTimeoutMs == null ? undefined : Math.max(10_000, walSenderTimeoutMs * 0.75)
         const derivedReceiveTimeoutMs = walSenderTimeoutMs == null || walSenderTimeoutMs === 0 ? undefined : Math.max(60_000, walSenderTimeoutMs * 2)
         derivedKeepAlive = walSenderTimeoutMs === 0 && !consumerSetKeepAlive
         if (walSenderTimeoutMs === 0) {
-          // "keepAlive is enabled instead" is only true when the layer itself turns it on
-          // (derivedKeepAlive above) — a consumer who explicitly pinned keepAlive: false gets
-          // nothing enabled at all, and the warning has to say that plainly instead.
+          // Only true when the layer itself turns keepAlive on (derivedKeepAlive above) — a consumer who pinned keepAlive: false gets nothing enabled, and the warning says that plainly.
           const message = !consumerSetKeepAlive
             ? "minipg: the server's wal_sender_timeout is 0 (disabled) — it will never ping this connection, so receiveTimeoutMs is left off and keepAlive is enabled instead"
             : consumerKeepAliveValue
@@ -437,8 +328,7 @@ export function replicate(opts: ReplicateOptions): ReplicateHandle {
         let resumed: { confirmedFlush: string; restartLsn: string } | null = null
 
         if (isDurable) {
-          // Fixed order on every durable connect: the wst probe above, then identify(), then the
-          // health check.
+          // Fixed order on every durable connect: the wst probe above, then identify(), then the health check.
           const identity = await repl.identify()
           if (lastSystemId !== null && (identity.systemId !== lastSystemId || identity.timeline !== lastTimeline)) {
             throw new SlotInvalidatedError(name, 'system-changed') // a promoted standby voids every prior LSN assumption
@@ -459,9 +349,7 @@ export function replicate(opts: ReplicateOptions): ReplicateHandle {
             if (row.wal_status === 'lost') throw new SlotInvalidatedError(name, 'wal-lost')
             if (row.confirmed_flush_lsn == null) throw new SlotInvalidatedError(name, 'no-confirmed-flush') // guards every LSN use below — this check must run first
             if (row.active === 't' && row.active_pid != null) {
-              // A holder who keeps re-acquiring the slot after being evicted never heals by
-              // trying again — cap the rounds and diagnose it as a permanently busy slot instead
-              // of terminating backends in a tight, unbounded ping-pong.
+              // A holder who keeps re-acquiring after eviction never heals by retrying — cap the rounds instead of terminating backends in an unbounded ping-pong.
               if (opts.onSlotBusy !== 'evict' || ++evictions > 3) throw new SlotBusyError(name, Number(row.active_pid))
               await evictAndAwaitClear(repl, name, Number(row.active_pid), opts, controller.signal)
               if (stopping) { repl.end(); state = 'stopped'; return }
@@ -477,8 +365,7 @@ export function replicate(opts: ReplicateOptions): ReplicateHandle {
         if (resumed) {
           slotForStream = name
           if (opts.onResume) {
-            // A throw here routes through retryDelayMs exactly like a backfill throw — it
-            // shares this try block's outer catch, so nothing special is needed to wire that up.
+            // A throw here routes through retryDelayMs exactly like a backfill throw — it shares this try block's outer catch.
             const p = Promise.resolve(opts.onResume(resumed))
             current = p
             try { await p } finally { current = null }
@@ -487,9 +374,8 @@ export function replicate(opts: ReplicateOptions): ReplicateHandle {
           const created = await repl.createSlot(name, { temporary: !isDurable, snapshot: 'export' })
           if (isDurable) sawSlot = true
           slotForStream = created.slot
-          // stop() landing exactly here still leaves the temporary slot dying with the
-          // connection, and a durable name as the slot the consumer asked for — never a compensating
-          // dropSlot, which would be the silent data-loss recreate this layer refuses to perform.
+          // stop() landing here still leaves the temporary slot dying with the connection, and a
+          // durable name as-is — never a compensating dropSlot, the silent data-loss recreate this layer refuses.
           if (stopping) { repl.end(); state = 'stopped'; return }
 
           state = 'backfilling'
@@ -505,15 +391,11 @@ export function replicate(opts: ReplicateOptions): ReplicateHandle {
           const isReconnect = !firstBackfill
           firstBackfill = false
           try {
-            // A non-timeout throw retries IN PLACE, on the SAME slot/snapshot/window — no new
-            // session, no new slot, no new snapshot, the same in-place shape the handler retry
-            // below uses, applied to backfill.
-            // The deadline above bounds the whole window, retries included: it is armed once,
-            // outside this loop, and never re-armed per attempt.
+            // A non-timeout throw retries IN PLACE on the same slot/snapshot/window — the same
+            // shape the handler retry below uses. The deadline bounds the whole window including retries: armed once, outside this loop.
             for (;;) {
               try {
-                // ZERO commands run on this connection inside the window: the very next thing
-                // sent below (on success) is START_REPLICATION.
+                // ZERO commands run on this connection inside the window — the next thing sent on success is START_REPLICATION.
                 const p = Promise.resolve(opts.backfill?.({ snapshot: created.snapshot, streamStartLsn: created.consistentPoint, isReconnect, signal: window.signal }))
                 current = p
                 await p
@@ -522,10 +404,8 @@ export function replicate(opts: ReplicateOptions): ReplicateHandle {
                 break
               } catch (backfillErr) {
                 current = null
-                // The deadline firing is identified by the window's own abort reason, never by
-                // message text — it is the one throw that skips retry-in-place entirely and goes
-                // straight to onFatalError via isPermanentFailure below, because a partial
-                // backfill is never usable and retrying it would reopen the silent-resume path.
+                // Identified by the window's own abort reason, never message text — the one throw
+                // that skips retry-in-place and goes straight to onFatalError, since a partial backfill is never usable.
                 if (window.signal.reason instanceof BackfillTimeoutError) throw window.signal.reason
                 if (stopping) { repl.end(); state = 'stopped'; return }
                 attempt++
@@ -559,18 +439,14 @@ export function replicate(opts: ReplicateOptions): ReplicateHandle {
         })
 
         for await (const batch of batchTransactions(stream, { maxEvents: opts.maxTransactionEvents })) {
-          // next() drains its queue before honoring `ended` (src/replication.ts), so a fast
-          // producer can leave several transactions already parsed and buffered when stop()
-          // resolves — this check keeps every one of them from still reaching onTransaction.
+          // next() drains its queue before honoring `ended` (replication.ts), so a fast producer
+          // can leave several transactions buffered when stop() resolves — this keeps them from reaching onTransaction.
           if (stopping) { repl.end(); state = 'stopped'; return }
           state = 'handling'
           pendingAckLsn = batch.done ? batch.endLsn : null // done:false carries no commit fields — nothing to ack
 
-          // A handler throw retries the SAME batch in place on this same session — the
-          // stream generator stays parked at its yield the whole time, zero commands issued,
-          // zero reconnects (PostgreSQL BUG #18754: a second START_REPLICATION on this session
-          // would deliver nothing, forever). Only escalates out of this loop by returning
-          // (budget exhausted -> fireFatal) or by falling through once the handler resolves.
+          // A handler throw retries the SAME batch in place, zero commands, zero reconnects
+          // (PostgreSQL BUG #18754: a second START_REPLICATION here delivers nothing, forever). Escalates only via budget exhaustion (fireFatal) or the handler resolving.
           for (;;) {
             try {
               const p = Promise.resolve(opts.onTransaction(batch))
@@ -602,15 +478,12 @@ export function replicate(opts: ReplicateOptions): ReplicateHandle {
         repl.end()
         return
       } catch (rawErr) {
-        // A server CopyDone (ReplicationStreamEnded) lands here exactly like a dead socket: the
-        // walsender accepts exactly one START_REPLICATION per connection (BUG #18754), so the
-        // spent session cannot stream again either way — there is no separate CopyDone branch to
-        // write — both trigger the same full reconnect.
+        // A server CopyDone lands here exactly like a dead socket — the walsender accepts exactly
+        // one START_REPLICATION per connection (BUG #18754), so both trigger the same full reconnect.
         repl?.end()
         if (stopping) { state = 'stopped'; return }
-        // 42704 belongs to slot ACQUISITION (e.g. start() racing a manual
-        // drop on a durable slot), never to pg_terminate_backend — 'already gone' from THAT path
-        // is a plain 'f' row, handled inside evictAndAwaitClear above.
+        // 42704 belongs to slot ACQUISITION (e.g. start() racing a manual drop), never to
+        // pg_terminate_backend — 'already gone' from that path is a plain 'f' row inside evictAndAwaitClear.
         const err: Error = currentIsDurable && rawErr instanceof PgError && rawErr.code === '42704'
           ? new SlotInvalidatedError(currentSlotName!, 'absent')
           : (rawErr as Error)
@@ -636,11 +509,8 @@ export function replicate(opts: ReplicateOptions): ReplicateHandle {
     stopping = true
     opts.signal?.removeEventListener('abort', onConsumerAbort)
     if (state === 'handling') {
-      // A handler's own promise resolves on ITS OWN schedule, not the abort's — so await it
-      // FIRST and ack what it completed BEFORE aborting. Aborting first would reach start()'s
-      // onAbort, which end()s the raw connection immediately — a socket already
-      // being torn down can't carry the ack out, so "acks what completed" would
-      // silently lose the write. The backfilling/idle branch below has the opposite requirement.
+      // Await the handler's promise FIRST and ack what it completed before aborting — aborting
+      // first reaches start()'s onAbort, which end()s the socket immediately and a socket being torn down can't carry the ack out.
       if (current) {
         try {
           await current
@@ -649,9 +519,8 @@ export function replicate(opts: ReplicateOptions): ReplicateHandle {
       }
       controller.abort()
     } else {
-      // Backfilling: the in-flight promise only resolves once ITS OWN signal (derived from this
-      // controller) fires, so abort MUST precede the await here or it never settles. Idle/parked:
-      // a generator suspended at next() only wakes via abort -> onAbort -> end().
+      // Backfilling: the in-flight promise only resolves once its own signal fires, so abort MUST
+      // precede the await here. Idle/parked: a generator suspended at next() only wakes via abort -> onAbort -> end().
       controller.abort() // wakes S6's sleep, aborts S3's window, reaches start()'s own signal
       if (current) { try { await current } catch { /* run()'s own catch handles a rejected backfill */ } }
     }
@@ -659,9 +528,8 @@ export function replicate(opts: ReplicateOptions): ReplicateHandle {
     state = 'stopped'
   }
 
-  // retryDelayMs is invoked from inside run()'s own catch blocks (a handler/backfill retry, or
-  // the per-session catch) — a throw there has nothing left inside run() to catch it, and would
-  // otherwise reject this floating promise and kill the process outside fireFatal's teardown.
+  // retryDelayMs runs inside run()'s own catch blocks — a throw there has nothing left to catch
+  // it, and would otherwise reject this floating promise and kill the process outside fireFatal's teardown.
   Promise.resolve().then(run).catch((e) => fireFatal(e as Error))
 
   return { stop }
