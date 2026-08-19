@@ -359,6 +359,10 @@ export function replicate(opts: ReplicateOptions): ReplicateHandle {
     fatalFired = true
     repl?.end()
     state = 'dead'
+    // A handle that dies here never calls doStop(), which is the only other place this listener
+    // is removed — without this, a long-lived application-level signal shared across many
+    // short-lived handles accumulates one listener per handle that ended fatally.
+    opts.signal?.removeEventListener('abort', onConsumerAbort)
     if (!opts.onFatalError) { console.error('minipg: replicate() session ended fatally with no onFatalError callback wired up —', err); return }
     // The terminal callback: nothing downstream of this catches a throw, so one is caught and
     // reported here, exactly like deliverWarning does for onWarning — a throwing onFatalError

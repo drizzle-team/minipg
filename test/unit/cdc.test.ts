@@ -668,6 +668,36 @@ test('cdc signal: aborting the consumer signal behaves like stop()', async () =>
   expect(backend.sessions.length).toBe(1) // no reconnect attempted
 })
 
+test('cdc signal: a fatal end removes the abort listener instead of leaking it on a shared signal', async () => {
+  const backend = cdcBackend()
+  const ac = new AbortController()
+  let added = 0, removed = 0
+  const origAdd = ac.signal.addEventListener.bind(ac.signal)
+  const origRemove = ac.signal.removeEventListener.bind(ac.signal)
+  ac.signal.addEventListener = ((...args: Parameters<typeof origAdd>) => { added++; return origAdd(...args) }) as typeof ac.signal.addEventListener
+  ac.signal.removeEventListener = ((...args: Parameters<typeof origRemove>) => { removed++; return origRemove(...args) }) as typeof ac.signal.removeEventListener
+
+  let fatalErr: Error | undefined
+  const handle = replicate({
+    url: cfg({ socket: backend.socket }),
+    slot: 'temporary',
+    publications: ['pub'],
+    signal: ac.signal,
+    backfill: async () => {},
+    onTransaction: () => {},
+    retryDelayMs: () => null, // fatal on the very first failure
+    onFatalError: (err) => { fatalErr = err },
+  })
+  await until(() => !!backend.latest?.queries.some((q) => q.startsWith('START_REPLICATION')))
+  backend.latest!.dx.destroy() // session failure -> null retryDelayMs -> fireFatal
+  await until(() => fatalErr !== undefined)
+
+  expect(added).toBe(1)
+  expect(removed).toBe(1) // fireFatal removed it — nothing left listening on the shared signal
+  await handle.stop() // a stop() after fatal must not throw on the already-removed listener
+  expect(removed).toBeGreaterThanOrEqual(1)
+})
+
 test('cdc invalidated: lost, null confirmed_flush, absent after seen, and systemId change go straight to onFatalError', async () => {
   // The real guarantee is that the INVALIDATION ITSELF never reaches retryDelayMs — not that
   // zero session churn ever happens getting there. "absent after seen" and "systemId change" are
