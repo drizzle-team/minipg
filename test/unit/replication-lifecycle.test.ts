@@ -5,7 +5,7 @@
 import { test, expect } from 'bun:test'
 import { Duplex } from 'node:stream'
 import { frame, rowDescription, dataRow as dataRowBody, type WireCol, type Cell } from '../helpers/wire.ts'
-import { replication, ReplicationReceiveTimeout, ReplicationBusy, InvalidSlotName, PublicationEmpty, PublicationMissing, type ReplicationConfig, type ReplicationWarning } from '../../src/index.ts'
+import { replication, ReplicationReceiveTimeout, ReplicationBusy, ReplicationSessionSpent, InvalidSlotName, PublicationEmpty, PublicationMissing, type ReplicationConfig, type ReplicationWarning } from '../../src/index.ts'
 
 const i32 = (n: number) => { const b = Buffer.allocUnsafe(4); b.writeInt32BE(n); return b }
 const u16 = (n: number) => { const b = Buffer.allocUnsafe(2); b.writeUInt16BE(n); return b }
@@ -16,6 +16,7 @@ const ready = (s = 'I') => frame('Z', Buffer.from(s, 'latin1'))
 const rowDesc = (cols: WireCol[]) => frame('T', rowDescription(cols))
 const dataRow = (cells: Cell[]) => frame('D', dataRowBody(cells))
 const copyBoth = () => frame('W', Buffer.from([0, 0, 0]))
+const commandComplete = (tag = 'START_REPLICATION') => frame('C', Buffer.from(tag + '\0', 'latin1'))
 const xlogData = (payload: Buffer) => frame('d', Buffer.concat([Buffer.from('w', 'latin1'), i64zero, i64zero, i64zero, payload]))
 const keepalive = (reply = 0) => frame('d', Buffer.concat([Buffer.from('k', 'latin1'), i64zero, i64zero, Buffer.from([reply])]))
 const pgBegin = () => xlogData(Buffer.concat([Buffer.from('B', 'latin1'), i64zero, i64zero, i32(1)]))
@@ -120,6 +121,26 @@ test('receive timeout disarmed: omitting receiveTimeoutMs never fires during a s
   expect(settled).toBe(false)
   repl.end()
   await p
+})
+
+// Reproduces PostgreSQL BUG #18754: a second START_REPLICATION on one walsender session gets
+// CopyBothResponse (the server accepts the command) followed by CommandComplete/ReadyForQuery
+// with no CopyDone at all — the server never actually entered streaming.
+test('session spent: CommandComplete during copy with no CopyDone surfaces ReplicationSessionSpent instead of hanging', async () => {
+  const backend = fakeBackend({
+    onQuery: (sql) => (sql.startsWith('START_REPLICATION') ? [copyBoth(), commandComplete(), commandComplete(), ready()] : [ready()]),
+  })
+  const repl = await replication(cfg({ socket: backend.socket }))
+  try {
+    const gen = repl.start({ slot: 'repl_1_ok', publications: ['pub'] })
+    let err: unknown
+    await Promise.race([
+      gen.next().catch((e) => { err = e }),
+      Bun.sleep(1500).then(() => { throw new Error('timed out — the loop parked on CommandComplete instead of surfacing an end-of-stream error') }),
+    ])
+    expect(err).toBeInstanceOf(ReplicationSessionSpent)
+    expect((err as ReplicationSessionSpent).reason).toBe('session-spent')
+  } finally { repl.end() }
 })
 
 test('slot name: createSlot and dropSlot reject invalid names before any walsender command', async () => {

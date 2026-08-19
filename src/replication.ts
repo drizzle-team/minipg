@@ -229,6 +229,19 @@ export class ReplicationStreamEnded extends Error {
   constructor() { super('minipg: server ended the replication stream (CopyDone) — start() again or reconnect to resume') }
 }
 
+/** A CommandComplete/ReadyForQuery frame arrived during copy mode WITHOUT a preceding server
+ *  CopyDone ('c') — the walsender accepted START_REPLICATION (CopyBothResponse) but never actually
+ *  entered streaming. The one known cause is PostgreSQL BUG #18754 (open PG14-18): a second
+ *  START_REPLICATION issued on one walsender session never resets the streamingDoneSending /
+ *  streamingDoneReceiving flags a prior START_REPLICATION left set, so WalSndLoop exits on its
+ *  first iteration and EndCommand answers with CommandComplete instead of streaming. Unlike
+ *  ReplicationStreamEnded (a real CopyDone, connection reusable), start()ing again on THIS
+ *  connection hits the same bug again — reconnect instead. */
+export class ReplicationSessionSpent extends Error {
+  readonly reason = 'session-spent' as const
+  constructor() { super("minipg: server ended the session without a CopyDone (PostgreSQL BUG #18754 — a second START_REPLICATION on one walsender connection never re-arms streaming) — reconnect rather than calling start() again on this connection") }
+}
+
 /** No message — not even a keepalive — arrived for `receiveTimeoutMs`: the connection is presumed
  *  dead. The slot keeps retaining WAL, so nothing is lost; reconnect and start() again. If this
  *  fires on a healthy link, raise receiveTimeoutMs relative to the server's wal_sender_timeout. */
@@ -716,6 +729,11 @@ export class ReplicationConnection {
             for (;;) { const n = await this.next(); if (!n || n.type === 'Z') break } // CommandComplete etc. skipped
           } catch { /* connection died mid-handshake — the stream ending is still the story */ }
           throw new ReplicationStreamEnded()
+        }
+        if (m.type === 'C' || m.type === 'Z') { // simple-query reply mid-copy with no server CopyDone — see ReplicationSessionSpent
+          this.copyOpen = false
+          if (m.type === 'C') { for (;;) { const n = await this.next(); if (!n || n.type === 'Z') break } } // drain to ReadyForQuery
+          throw new ReplicationSessionSpent()
         }
         if (m.type !== 'd') continue
         const p = m.body
