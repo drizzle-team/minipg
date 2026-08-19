@@ -101,7 +101,7 @@ function cdcBackend(opts: { onQuery?: (sql: string, session: number) => Buffer[]
         ready(),
       ]
     }
-    // D-07's derived-timeout probe, run once per connect in S2 (preparing), before createSlot.
+    // The derived-timeout probe, run once per connect in S2 (preparing), before createSlot.
     if (sql.includes('wal_sender_timeout')) {
       return [rowDesc([{ name: 'setting', oid: 25 }]), dataRow(['60000']), ready()]
     }
@@ -182,7 +182,7 @@ test('cdc exports: replicate is importable and the raw surface is untouched', ()
   expect(typeof SlotInvalidatedError).toBe('function')
   expect(typeof BackfillTimeoutError).toBe('function')
   expect(typeof SlotBusyError).toBe('function')
-  expect(typeof rawReplication).toBe('function') // CDC-01: the raw surface is unchanged underneath
+  expect(typeof rawReplication).toBe('function') // the raw surface is unchanged underneath
   expect(typeof rawBatchTransactions).toBe('function')
 })
 
@@ -209,7 +209,7 @@ test('cdc window order: no command runs between CREATE_REPLICATION_SLOT and STAR
   expect(settingsIdx).toBeGreaterThanOrEqual(0)
   expect(createIdx).toBeGreaterThan(settingsIdx) // fixed admin order: the probe precedes createSlot
   expect(startIdx).toBeGreaterThan(createIdx)
-  // The real CDC-11 guarantee: the layer itself issues ZERO commands on this connection while
+  // The layer itself issues ZERO commands on this connection while
   // backfill is in flight. start()'s own pre-stream probes (publication, leaf-partition) are
   // legitimate — but only once backfill has already returned, which is why they land AFTER
   // createIdx rather than making createIdx and startIdx wire-adjacent.
@@ -313,7 +313,7 @@ test('cdc one connection: all slot administration rides the single streaming ses
 })
 
 test('cdc default retry: additive jitter, 30s cap, null at attempt 10', async () => {
-  // The real D-01 formula is only reachable through an actual session failure (the policy is
+  // The real retry-delay formula is only reachable through an actual session failure (the policy is
   // module-private by design — not part of the public surface). Rather than waiting out real
   // 1s-30s delays, intercept setTimeout to record what delay the layer actually asked for, then
   // fast-forward it — this observes the REAL computed values, not a re-implementation of them.
@@ -485,12 +485,12 @@ test('cdc one START_REPLICATION: no session ever receives a second start command
 
   await until(() => lastFlushed(s1.sent) >= endLsn) // handler-throw retry, then ack, all on session 1
   expect(seenBatches.length).toBe(2)
-  expect(seenBatches[0]).toBe(seenBatches[1]) // same in-memory batch object, re-presented (D-06)
+  expect(seenBatches[0]).toBe(seenBatches[1]) // same in-memory batch object, re-presented
   expect(queriesAtRetry).toBe(queriesAtThrow) // zero commands issued between the two invocations
   expect(backend.sessions.length).toBe(1) // the throw never reconnected
 
-  // Now force a server CopyDone on session 1 — the ONLY path that must reconnect (CDC-04
-  // satisfied by equivalence, D-06): the session cannot stream again (PostgreSQL BUG #18754).
+  // Now force a server CopyDone on session 1 — the ONLY path that must reconnect: the
+  // session cannot stream again (PostgreSQL BUG #18754).
   s1.dx.push(frame('c', Buffer.alloc(0)))
   await until(() => backend.sessions.length >= 2)
   await until(() => !!backend.latest?.queries.some((q) => q.startsWith('START_REPLICATION')))
@@ -667,7 +667,7 @@ test('cdc signal: aborting the consumer signal behaves like stop()', async () =>
 })
 
 test('cdc invalidated: lost, null confirmed_flush, absent after seen, and systemId change go straight to onFatalError', async () => {
-  // D-02's real guarantee is that the INVALIDATION ITSELF never reaches retryDelayMs — not that
+  // The real guarantee is that the INVALIDATION ITSELF never reaches retryDelayMs — not that
   // zero session churn ever happens getting there. "absent after seen" and "systemId change" are
   // both, by construction, only observable on a SECOND connect (you can't be "seen before" on the
   // first one), and the only way run()'s loop opens a second session is through the ordinary
@@ -732,7 +732,7 @@ test('cdc invalidated: lost, null confirmed_flush, absent after seen, and system
   }
 
   // Scenario 3: absent after seen — the first connect sees zero rows (never seen before, so it
-  // CREATES the slot — D-08's first-observation rule, pinned here too), then a server CopyDone
+  // CREATES the slot — the first-observation rule, pinned here too), then a server CopyDone
   // forces the one legitimate reconnect, and the second connect sees zero rows again -> absent
   // after having been seen -> SlotInvalidatedError, never retried.
   {
@@ -751,7 +751,7 @@ test('cdc invalidated: lost, null confirmed_flush, absent after seen, and system
       onFatalError: (err) => { fatalErr = err },
     })
     await until(() => !!backend.latest?.queries.some((q) => q.startsWith('START_REPLICATION')))
-    expect(backend.latest!.queries.some((q) => q.startsWith('CREATE_REPLICATION_SLOT'))).toBe(true) // first observation created it (D-08)
+    expect(backend.latest!.queries.some((q) => q.startsWith('CREATE_REPLICATION_SLOT'))).toBe(true) // first observation created it
     backend.latest!.dx.push(frame('c', Buffer.alloc(0))) // server CopyDone -> the one legitimate reconnect
     await until(() => fatalErr !== undefined)
     expect(fatalErr).toBeInstanceOf(SlotInvalidatedError)
@@ -1058,7 +1058,7 @@ test('cdc wal_sender_timeout zero: receive timeout stays off, keepAlive on from 
     expect(warnings.some((w) => w.kind === 'wal-sender-timeout-disabled' && w.message.includes('wal_sender_timeout'))).toBe(true)
 
     // (b) session 0 (the probe-only connect) never carried keepAlive; session 1, the one that
-    // actually streams, does — closing D-07's lag for the FIRST session, not just the second.
+    // actually streams, does — closing the keepAlive lag for the FIRST session, not just the second.
     expect(keepAliveBySession[0]?.some((c) => c.enable === true)).toBe(false)
     expect(keepAliveBySession[1]?.some((c) => c.enable === true)).toBe(true)
 
@@ -1066,7 +1066,7 @@ test('cdc wal_sender_timeout zero: receive timeout stays off, keepAlive on from 
     // cumulative spy would otherwise pick up a later session's own status-cadence interval too.
     // The two setInterval sites in src/replication.ts separate cleanly on delay: receive-liveness
     // (armed iff receiveTimeoutMs is set) caps at 5000ms; status cadence never drops below
-    // 10000ms under D-07's floor. A wrongly-undisarmed receiveTimeoutMs at wst=0 would arm a
+    // 10000ms floor. A wrongly-undisarmed receiveTimeoutMs at wst=0 would arm a
     // receive timer at 5000ms and trip the first assertion.
     expect(delays.some((d) => d < 10000)).toBe(false)
     expect(delays.some((d) => d >= 10000)).toBe(true)
