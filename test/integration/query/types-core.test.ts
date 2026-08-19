@@ -494,10 +494,10 @@ describe('override hook & BigInt (config.types)', () => {
     expect(aCell(r)).toBe(9223372036854775807n)
   })
 
-  test('int8[] / numeric[] decode as one raw string (no per-element parsing yet)', async () => {
+  test('int8[] / numeric[] elements keep the scalar precision defaults (BigInt / exact string)', async () => {
     const r = await c.query("select '{1,9007199254740993}'::int8[] a, '{0.1,0.2}'::numeric[] b")
-    expect(aCell(r, 0, 0)).toBe('{1,9007199254740993}')
-    expect(aCell(r, 0, 1)).toBe('{0.1,0.2}')
+    expect(aCell(r, 0, 0)).toEqual([1n, 9007199254740993n]) // past 2^53 — a Number would round to ...92
+    expect(aCell(r, 0, 1)).toEqual(['0.1', '0.2'])
   })
 })
 

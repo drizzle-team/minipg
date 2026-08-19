@@ -200,6 +200,15 @@ export function arrayDecoderFor(arrayOid: number, js?: string): Decoder {
   return arrayDecoderForElem(ELEM_OID[arrayOid], js)
 }
 
+/**
+ * Bind array parser to known array OIDs
+ */
+export function tagArrayCol(col: CodegenCol): CodegenCol {
+  if (col.array || col.json) return col
+  const elem = ELEM_OID[col.oid]
+  return elem === undefined ? col : { ...col, array: { elem } }
+}
+
 // decode2 extends the JS-target set with temporal INSTANT targets: 'date' -> JS Date, 'ms' -> ms number.
 export type Target = JsTarget | 'date' | 'ms'
 /** A column to decode: name + wire OID, optional JS-target override, shaped-JSON marker, and the WIRE

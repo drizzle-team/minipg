@@ -13,7 +13,7 @@
 // driver's BigInt. `int8: 'bigint'` restores parity; per-column shape targets always win.
 import './buffer-polyfill.ts' // MUST be first: installs Buffer on runtimes without it (no-op elsewhere)
 import { buildMapperFactory, type RowMapperFactory } from './mapper.ts'
-import { buildDecoders, INSTANT_OIDS, type CodegenCol } from './decode.ts'
+import { buildDecoders, INSTANT_OIDS, tagArrayCol, type CodegenCol } from './decode.ts'
 import { shapeCols, resolveParamTypes, type ShapeSpec, type ParamType } from './spec.ts'
 import type { ShapeMapper } from './shape.ts'
 import { Parser, parseRowDescription, type RawMessage } from './protocol.ts'
@@ -182,7 +182,8 @@ export class HttpClient {
     else cols = fields.map((f) => ({ name: f.name, oid: f.dataTypeOid }))
     const temporal = this.cfg.temporal ?? 'date'
     const int8 = this.cfg.int8 ?? 'string'
-    return cols.map((c) => {
+    return cols.map((c0) => {
+      const c = tagArrayCol(c0)
       if (!c.js && !c.json) {
         if (temporal === 'string' && INSTANT_OIDS.has(c.oid)) return { ...c, js: 'string' as const, format: 'text' as const }
         if (int8 !== 'bigint' && c.oid === 20) return { ...c, js: int8 }

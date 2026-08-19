@@ -4,11 +4,13 @@
 //
 // Grounded in src/encode.ts: defaultDecoders only registers
 // bool/bytea/int2/int4/oid/float4/float8/json/jsonb; decoderFor falls back to
-// asString for everything else. So arrays/ranges/composites/enums/network/
-// geometric/hstore/uuid/numeric/int8/timestamps all decode to the raw PG text
-// literal STRING today. encodeParam turns JS object/array into JSON.stringify
-// (NOT a PG array/record literal). These tests assert that CURRENT baseline and
-// mark the roadmap rich-decoder / array-literal-encode features as test.todo.
+// asString for everything else. So ranges/composites/enums/network/geometric/
+// hstore all decode to the raw PG text literal STRING today. The exception is
+// BUILT-IN ARRAY types: tagArrayCol binds the array decoder to those wire OIDs,
+// so int4[]/text[]/jsonb[]/... come back as JS arrays with no shape declared —
+// arrays of PER-DATABASE element types (enum[], domain[], composite[]) still
+// don't, since the wire OID alone can't identify the element. These tests
+// assert that baseline and mark roadmap rich-decoder features as test.todo.
 import { test, expect, describe, beforeAll, afterAll } from 'bun:test'
 import { testConnect, caught, PgError } from '../../helpers/db.ts'
 import { buildDecoders, defaultDecoders } from '../../../src/decode.ts'
@@ -45,71 +47,79 @@ afterAll(async () => {
 })
 
 // ---------------------------------------------------------------------------
-describe('array decode — current string baseline', () => {
-  test("int4[] '{1,2,3}' decodes to the raw literal string, not a JS array", async () => {
+// A PLAIN (unshaped) query binds the array decoder off the wire array OID (tagArrayCol), so built-in
+// array columns arrive as JS arrays with the same element semantics a declared shape gives. Full
+// element-precision + grammar coverage lives in array-output.test.ts (dual-variant); this block is the
+// no-shape contract.
+describe('array decode — built-in array OIDs decode to JS arrays with no shape', () => {
+  test("int4[] '{1,2,3}' decodes to a JS array, not the raw literal", async () => {
     const r = await c.query("select '{1,2,3}'::int4[] as a")
-    expect(cell0(r)).toBe('{1,2,3}')
-    expect(Array.isArray(cell0(r))).toBe(false)
+    expect(cell0(r)).toEqual([1, 2, 3])
+    expect(Array.isArray(cell0(r))).toBe(true)
   })
 
-  test('float8[] is surfaced verbatim (no partial element parsing)', async () => {
+  test('float8[] elements parse to numbers', async () => {
     const r = await c.query("select '{1.5,2.25}'::float8[] as a")
-    expect(cell0(r)).toBe('{1.5,2.25}')
+    expect(cell0(r)).toEqual([1.5, 2.25])
   })
 
-  test('text[] with embedded comma keeps PG quoting in the literal', async () => {
+  test('text[] with an embedded comma: PG quoting is unwrapped, not surfaced', async () => {
     const r = await c.query("select array['a,b','c']::text[] as a")
-    expect(cell0(r)).toBe('{"a,b",c}')
+    expect(cell0(r)).toEqual(['a,b', 'c'])
   })
 
-  test('int2[] with NULL token left in the string', async () => {
+  test('int2[] bare NULL token -> a real null element', async () => {
     const r = await c.query("select '{1,NULL,3}'::int2[] as a")
-    expect(cell0(r)).toBe('{1,NULL,3}')
+    expect(cell0(r)).toEqual([1, null, 3])
   })
 
-  test("empty arrays decode to '{}', never null/undefined", async () => {
+  test('empty arrays decode to [], never null/undefined', async () => {
     const r1 = await c.query('select array[]::text[] as a')
     const r2 = await c.query("select '{}'::int4[] as a")
-    expect(cell0(r1)).toBe('{}')
-    expect(cell0(r2)).toBe('{}')
+    expect(cell0(r1)).toEqual([])
+    expect(cell0(r2)).toEqual([])
+  })
+
+  test('element precision follows the scalar defaults: int8[] -> BigInt, numeric[] -> exact string', async () => {
+    expect(cell0(await c.query("select '{9223372036854775807,1}'::int8[] as a"))).toEqual([9223372036854775807n, 1n])
+    expect(cell0(await c.query("select '{1.50,2.00}'::numeric[] as a"))).toEqual(['1.50', '2.00'])
+  })
+
+  test('a config.types entry for the array OID still overrides the built-in parser', async () => {
+    const o = await testConnect({ types: { 1007: (b: Buffer) => 'RAW:' + b.toString('utf8') } })
+    try { expect(cell0(await o.query("select '{1,2,3}'::int4[] as a"))).toBe('RAW:{1,2,3}') } finally { await o.end() }
+  })
+
+  test('element types with per-database OIDs (enum[]) are NOT recognised from the wire OID — still text', async () => {
+    expect(cell0(await c.query("select '{happy,sad}'::pg_temp.mood[] as a"))).toBe('{happy,sad}')
   })
 })
 
-describe('array decode — opt-in / built-in array parser (roadmap)', () => {
-  test.todo("registered array decoder yields [1,2,3] from '{1,2,3}'::int4[]", () => {})
-  test.todo("float8[] '{1.5,2.25,3.75}' -> [1.5,2.25,3.75]", () => {})
-  test.todo("numeric[] '{1.50,2.00}' -> ['1.50','2.00'] strings", () => {})
-  test.todo("int8[] ARRAY[1,2] -> ['1','2'] strings by default", () => {})
-  test.todo('varchar[]/char[]/name[] -> string element arrays', () => {})
-  test.todo("array-literal grammar: '{\"a,b\",c}' -> ['a,b','c']", () => {})
-  test.todo("NULL token: '{1,NULL,3}' -> [1,null,3]; '{\"NULL\"}' -> ['NULL']", () => {})
-  test.todo("lower-bound prefix '[0:1]={40.44,-79.95}' stripped", () => {})
-  test.todo("multidim '{{1,2},{3,4}}' -> [[1,2],[3,4]]", () => {})
-  test.todo('box[] custom ; delimiter parses 2 elements', () => {})
-  test.todo('bytea[] -> Buffer[]; jsonb[] -> parsed objects', () => {})
-  test.todo('custom array parser in config.types overrides built-in', () => {})
-})
-
+// These assert the ENCODE direction (JS array -> PG array literal param). The server echoes an array
+// column back, which now DECODES to a JS array, so each round-trip lands on the input value.
 describe('array encode — JS array -> PG array literal (Option A / declared params)', () => {
   test("JS ['a','b','c'] -> text[] '{a,b,c}' round-trips", async () => {
-    expect(cell0(await c.query('select $1::text[] as a', [['a', 'b', 'c']]))).toBe('{a,b,c}')
+    expect(cell0(await c.query('select $1::text[] as a', [['a', 'b', 'c']]))).toEqual(['a', 'b', 'c'])
+    expect(cell0(await c.query('select ($1::text[])::text as a', [['a', 'b', 'c']]))).toBe('{a,b,c}') // the literal actually sent
   })
 
   test('escape hatch still works: a PG array literal STRING casts', async () => {
-    expect(cell0(await c.query('select $1::int4[] as a', ['{1,2,3}']))).toBe('{1,2,3}')
+    expect(cell0(await c.query('select $1::int4[] as a', ['{1,2,3}']))).toEqual([1, 2, 3])
   })
 
   test('array of bigints -> int8[] (arrayLiteral handles BigInt, no throw)', async () => {
-    expect(cell0(await c.query('select $1::int8[] as a', [[1n, 9223372036854775807n]]))).toBe('{1,9223372036854775807}')
+    expect(cell0(await c.query('select $1::int8[] as a', [[1n, 9223372036854775807n]]))).toEqual([1n, 9223372036854775807n])
   })
 
   test("null elements & empty: ['A',null,'B'] -> {A,NULL,B}; [] -> {}", async () => {
-    expect(cell0(await c.query('select $1::text[] as a', [['A', null, 'B']]))).toBe('{A,NULL,B}')
-    expect(cell0(await c.query('select $1::int4[] as a', [[]]))).toBe('{}')
+    expect(cell0(await c.query('select $1::text[] as a', [['A', null, 'B']]))).toEqual(['A', null, 'B'])
+    expect(cell0(await c.query('select ($1::text[])::text as a', [['A', null, 'B']]))).toBe('{A,NULL,B}') // bare NULL token, not the string "NULL"
+    expect(cell0(await c.query('select $1::int4[] as a', [[]]))).toEqual([])
   })
 
   test("nested [['a'],['b']] -> {{a},{b}}", async () => {
-    expect(cell0(await c.query('select $1::text[] as a', [[['a'], ['b']]]))).toBe('{{a},{b}}')
+    expect(cell0(await c.query('select $1::text[] as a', [[['a'], ['b']]]))).toEqual([['a'], ['b']])
+    expect(cell0(await c.query('select ($1::text[])::text as a', [[['a'], ['b']]]))).toBe('{{a},{b}}')
   })
 
   test('= ANY($1::int4[]) membership with a JS array param', async () => {

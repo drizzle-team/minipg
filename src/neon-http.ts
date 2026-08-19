@@ -13,7 +13,7 @@
 // wire format (text decode only). `$1` placeholders — same as the wire driver.
 import { buildMapperFactory, type RowMapperFactory } from './mapper.ts'
 import { buildDecoders } from './decode.ts'
-import { INSTANT_OIDS, type CodegenCol } from './decode.ts'
+import { INSTANT_OIDS, tagArrayCol, type CodegenCol } from './decode.ts'
 import { shapeCols, type ShapeSpec } from './spec.ts'
 import type { ShapeMapper } from './shape.ts'
 import { parseDataRow } from './protocol.ts'
@@ -208,8 +208,10 @@ export class NeonHttpClient {
     let cols: CodegenCol[]
     if (shape) cols = (typeof shape === 'function' ? (shape.$cols as CodegenCol[]) : shapeCols(shape)).map((c) => (c.format === 'binary' ? { ...c, format: 'text' as const } : c))
     else cols = fields.map((f) => ({ name: f.name, oid: f.dataTypeID }))
+    cols = cols.map(tagArrayCol)
     if (this.temporal !== 'string') return cols
-    return cols.map((c) => (!c.js && !c.json && INSTANT_OIDS.has(c.oid) ? { ...c, js: 'string' as const, format: 'text' as const } : c))
+    return cols.map((c) => (!c.js && !c.json && INSTANT_OIDS.has(c.oid) ? { ...c, js: 'string' as const, format: 'text' as const }
+      : c.array && !c.array.js && INSTANT_OIDS.has(c.array.elem) ? { ...c, array: { ...c.array, js: 'string' as const } } : c))
   }
 
   private rowFrom(mode: ResultMode, mapper: ((b: Buffer) => unknown) | null, body: Buffer): unknown {

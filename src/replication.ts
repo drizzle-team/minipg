@@ -16,7 +16,7 @@ import { PgError, parseErrorFields } from './errors.ts'
 import { getDefaultTransport, type NormalizedConfig } from './connection.ts'
 import { resolveUrl } from './url.ts'
 import { buildDecoders } from './decode.ts'
-import { pickDecoder, replBinaryFor, replBinaryForCol, type CellDecoder, type CodegenCol } from './decode.ts'
+import { pickDecoder, replBinaryFor, replBinaryForCol, tagArrayCol, type CellDecoder, type CodegenCol } from './decode.ts'
 import { shapeCols, type TypeSpec } from './spec.ts'
 import type { JsonMarker, TransformMarker, SpecEntries } from './json.ts'
 import type { CustomMarker } from './registry.ts'
@@ -955,10 +955,12 @@ export class ReplicationConnection {
     const xf = (d: CellDecoder, f: (v: unknown) => unknown): CellDecoder => (b, o, l) => f(d(b, o, l))
     const decoders = info.columns.map((c) => {
       const sc = bySql.get(c.name)
-      if (!sc) return pickDecoder({ name: c.name, oid: c.oid }, this.decoders)
+      // tagArrayCol: a built-in array OID decodes '{…}' to a JS array, exactly as a plain query() does
+      // (and as the binary tuple path already does via array_recv) — no-op on already-tagged shape cols.
+      if (!sc) return pickDecoder(tagArrayCol({ name: c.name, oid: c.oid }), this.decoders)
       // oid 0 = 'unknown': defer to the live relation oid. format:'binary' is a QUERY wire
       // request (BINARY_FAST auto-request in resolveLeaf) — these tuple values arrive as text.
-      const d = pickDecoder({ ...sc, oid: sc.oid === 0 ? c.oid : sc.oid, format: undefined }, this.decoders)
+      const d = pickDecoder(tagArrayCol({ ...sc, oid: sc.oid === 0 ? c.oid : sc.oid, format: undefined }), this.decoders)
       return sc.xform ? xf(d, sc.xform) : d
     })
     const bin = this.binaryMode ? info.columns.map((c) => {
