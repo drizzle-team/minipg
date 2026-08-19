@@ -1196,7 +1196,7 @@ test('cdc eviction deadline: an active slot that never clears raises SlotBusyErr
 })
 
 test('cdc stop guards buffered batches: onTransaction never runs again once stop() is called', async () => {
-  // CR-01: next() drains its queue before honoring `ended`, so a transaction fully received and
+  // next() drains its queue before honoring `ended`, so a transaction fully received and
   // buffered while the handler is parked on an earlier one must not still reach onTransaction —
   // even though the raw layer already has it queued when stop() is called.
   const backend = cdcBackend()
@@ -1236,11 +1236,11 @@ test('cdc stop guards buffered batches: onTransaction never runs again once stop
   expect(calls).toBe(1)
 })
 
-test('cdc CR-02: a durable backfill throw retries in place, on the same snapshot, no new slot, no onResume', async () => {
+test('cdc durable backfill throw retries in place, on the same snapshot, no new slot, no onResume', async () => {
   const backend = cdcBackend({
     // Session 0: zero rows -> durable create path. Any later session (a reconnect, which the
     // fix must never cause): the slot now exists and is healthy — this is what makes the
-    // counterfactual (no in-place retry) manifest CR-02's actual bug, a silent resume, instead
+    // counterfactual (no in-place retry) manifest the actual bug, a silent resume, instead
     // of timing out some other way.
     onQuery: (sql, session) => sql.includes('pg_replication_slots')
       ? (session === 0 ? [rowDesc(healthCols), ready()] : [rowDesc(healthCols), dataRow(['f', null, 'reserved', '0/10', '0/8']), ready()])
@@ -1272,7 +1272,7 @@ test('cdc CR-02: a durable backfill throw retries in place, on the same snapshot
   await handle.stop()
 })
 
-test('cdc CR-02: a backfillTimeoutMs timeout on a durable slot still abandons the session (full path)', async () => {
+test('cdc backfillTimeoutMs timeout on a durable slot still abandons the session (full path)', async () => {
   const backend = cdcBackend({
     onQuery: (sql) => sql.includes('pg_replication_slots') ? [rowDesc(healthCols), ready()] : undefined,
   })
@@ -1297,7 +1297,7 @@ test('cdc CR-02: a backfillTimeoutMs timeout on a durable slot still abandons th
   await handle.stop()
 })
 
-test('cdc W-01: a throw from retryDelayMs is caught and routed through fireFatal, not an unhandled rejection', async () => {
+test('cdc a throw from retryDelayMs is routed through fireFatal, not an unhandled rejection', async () => {
   const backend = cdcBackend()
   let fatalErr: Error | undefined
   let uncaught: unknown
@@ -1326,7 +1326,7 @@ test('cdc W-01: a throw from retryDelayMs is caught and routed through fireFatal
   }
 })
 
-test('cdc W-01: onFatalError itself throwing does not produce an unhandled rejection', async () => {
+test('cdc onFatalError itself throwing does not produce an unhandled rejection', async () => {
   const backend = cdcBackend()
   let uncaught: unknown
   const onUnhandled = (reason: unknown): void => { uncaught = reason }
@@ -1351,7 +1351,7 @@ test('cdc W-01: onFatalError itself throwing does not produce an unhandled rejec
   }
 })
 
-test('cdc WR-02: eviction rounds are capped — a rival that keeps re-acquiring the slot goes fatal instead of looping forever', async () => {
+test('cdc eviction rounds are capped — a rival that keeps re-acquiring the slot goes fatal instead of looping forever', async () => {
   let terminateCalls = 0
   const backend = cdcBackend({
     onQuery: (sql) => {
@@ -1387,7 +1387,7 @@ test('cdc WR-02: eviction rounds are capped — a rival that keeps re-acquiring 
   await handle.stop()
 })
 
-test('cdc WR-03: an invalid durable slot name throws synchronously, without ever needing onFatalError', () => {
+test('cdc an invalid durable slot name throws synchronously, without ever needing onFatalError', () => {
   const backend = cdcBackend()
   expect(() => replicate({
     url: cfg({ socket: backend.socket }),
@@ -1400,7 +1400,7 @@ test('cdc WR-03: an invalid durable slot name throws synchronously, without ever
   expect(backend.sessions.length).toBe(0) // never even attempted to connect
 })
 
-test('cdc WR-03: an empty publications array throws synchronously, without ever needing onFatalError', () => {
+test('cdc an empty publications array throws synchronously, without ever needing onFatalError', () => {
   const backend = cdcBackend()
   expect(() => replicate({
     url: cfg({ socket: backend.socket }),
@@ -1412,7 +1412,7 @@ test('cdc WR-03: an empty publications array throws synchronously, without ever 
   expect(backend.sessions.length).toBe(0)
 })
 
-test('cdc WR-03: a genuinely async fatal error with no onFatalError is reported to stderr instead of vanishing', async () => {
+test('cdc a genuinely async fatal error with no onFatalError is reported to stderr instead of vanishing', async () => {
   const backend = cdcBackend()
   const originalError = console.error
   const errors: unknown[][] = []
@@ -1437,7 +1437,7 @@ test('cdc WR-03: a genuinely async fatal error with no onFatalError is reported 
   }
 })
 
-test('cdc WR-04: a pre-PG13 server (wal_status missing, 42703) fails fast instead of burning the retry budget', async () => {
+test('cdc a pre-PG13 server (wal_status missing, 42703) fails fast instead of burning the retry budget', async () => {
   const backend = cdcBackend({
     onQuery: (sql) => sql.startsWith('select active,') ? [errFrame('42703', 'column "wal_status" does not exist'), ready()] : undefined,
   })
