@@ -523,10 +523,11 @@ test('cdc isReconnect: false on the first session, true on the rebuilt one', asy
   await handle.stop()
 })
 
-test('cdc backfill timeout: the deadline aborts the signal and routes through retryDelayMs', async () => {
+test('cdc backfill timeout: the deadline aborts the signal and goes straight to onFatalError', async () => {
   const backend = cdcBackend()
   let sawAborted = false
-  let capturedErr: Error | undefined
+  let fatalErr: Error | undefined
+  let retryCalls = 0
   const warnings: CdcWarning[] = []
   const handle = replicate({
     url: cfg({ socket: backend.socket }),
@@ -538,14 +539,15 @@ test('cdc backfill timeout: the deadline aborts the signal and routes through re
       sawAborted = signal.aborted
     },
     onTransaction: () => {},
-    retryDelayMs: (_attempt, err) => { capturedErr = err; return null }, // one capture, then stop
+    retryDelayMs: () => { retryCalls++; return 1 }, // must never be consulted — the deadline is terminal
     onWarning: (w) => { warnings.push(w) },
-    onFatalError: () => {},
+    onFatalError: (err) => { fatalErr = err },
   })
-  await until(() => capturedErr !== undefined)
+  await until(() => fatalErr !== undefined)
   expect(sawAborted).toBe(true)
-  expect(capturedErr).toBeInstanceOf(BackfillTimeoutError)
-  expect((capturedErr as BackfillTimeoutError).ms).toBe(50)
+  expect(fatalErr).toBeInstanceOf(BackfillTimeoutError)
+  expect((fatalErr as BackfillTimeoutError).ms).toBe(50)
+  expect(retryCalls).toBe(0)
   expect(warnings.some((w) => w.kind === 'backfill-timeout')).toBe(true)
   await handle.stop()
 })
@@ -1272,12 +1274,13 @@ test('cdc durable backfill throw retries in place, on the same snapshot, no new 
   await handle.stop()
 })
 
-test('cdc backfillTimeoutMs timeout on a durable slot still abandons the session (full path)', async () => {
+test('cdc backfillTimeoutMs timeout on a durable slot fires onFatalError without a retry', async () => {
   const backend = cdcBackend({
     onQuery: (sql) => sql.includes('pg_replication_slots') ? [rowDesc(healthCols), ready()] : undefined,
   })
   let backfillCalls = 0
   let fatalErr: Error | undefined
+  let retryCalls = 0
   const handle = replicate({
     url: cfg({ socket: backend.socket }),
     slot: { name: 'durable_backfill_timeout' },
@@ -1288,12 +1291,48 @@ test('cdc backfillTimeoutMs timeout on a durable slot still abandons the session
       await new Promise<void>((resolve) => { signal.addEventListener('abort', () => resolve(), { once: true }) })
     },
     onTransaction: () => {},
-    retryDelayMs: (_attempt, err) => { fatalErr = err; return null }, // one capture, then stop
-    onFatalError: () => {},
+    retryDelayMs: () => { retryCalls++; return 1 }, // must never be consulted — the deadline is terminal
+    onFatalError: (err) => { fatalErr = err },
   })
   await until(() => fatalErr !== undefined)
   expect(fatalErr).toBeInstanceOf(BackfillTimeoutError)
-  expect(backfillCalls).toBe(1) // never retried in place — a timeout routes through the outer catch, not the retry loop
+  expect(backfillCalls).toBe(1) // never retried in place
+  expect(retryCalls).toBe(0) // never consulted — the outer catch's isPermanentFailure short-circuits it
+  expect(backend.sessions.length).toBe(1) // no reconnect, no second session
+  await handle.stop()
+})
+
+test('cdc backfillTimeoutMs timeout on a durable slot never opens a second session or resumes', async () => {
+  const backend = cdcBackend({
+    // Session 0: zero rows -> durable create path, where the timeout fires. Session 1+ reports
+    // the slot as healthy — the row a wrongly-retried reconnect would find and resume from,
+    // streaming forever with the baseline never read. The fix must never let session 1 exist.
+    onQuery: (sql, session) => sql.includes('pg_replication_slots')
+      ? (session === 0 ? [rowDesc(healthCols), ready()] : [rowDesc(healthCols), dataRow(['f', null, 'reserved', '0/10', '0/8']), ready()])
+      : undefined,
+  })
+  let backfillCalls = 0
+  let onResumeCalls = 0
+  let fatalErr: Error | undefined
+  const handle = replicate({
+    url: cfg({ socket: backend.socket }),
+    slot: { name: 'durable_backfill_timeout_no_resume' },
+    publications: ['pub'],
+    backfillTimeoutMs: 30,
+    backfill: async ({ signal }) => {
+      backfillCalls++
+      await new Promise<void>((resolve) => { signal.addEventListener('abort', () => resolve(), { once: true }) })
+    },
+    onResume: async () => { onResumeCalls++ },
+    onTransaction: () => {},
+    retryDelayMs: () => 1,
+    onFatalError: (err) => { fatalErr = err },
+  })
+  await until(() => fatalErr !== undefined)
+  expect(fatalErr).toBeInstanceOf(BackfillTimeoutError)
+  expect(backfillCalls).toBe(1)
+  expect(onResumeCalls).toBe(0) // the resume path this deadline used to reopen never runs
+  expect(backend.sessions.length).toBe(1) // exactly one session — no reconnect ever finds the slot healthy
   await handle.stop()
 })
 

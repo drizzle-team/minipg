@@ -64,11 +64,16 @@ export interface ReplicateOptions {
    *  exported snapshot, and the same isReconnect value are handed to another call to backfill —
    *  no new slot, no new snapshot, no reconnect. The snapshot survives an in-place retry because
    *  the layer still issues zero commands on the replication connection between attempts; it
-   *  only dies once one runs (SQLSTATE 22023), which START_REPLICATION is. Only a
-   *  backfillTimeoutMs timeout abandons the session and takes the full reconnect path instead. */
+   *  only dies once one runs (SQLSTATE 22023), which START_REPLICATION is. A
+   *  backfillTimeoutMs timeout is the one exception: it fires onFatalError immediately instead,
+   *  with no retry at all — see backfillTimeoutMs. */
   backfill?: (info: { snapshot: string; streamStartLsn: string; isReconnect: boolean; signal: AbortSignal }) => void | Promise<void>
   /** Abandon the session if backfill has not resolved within this many ms (omitted = unbounded).
-   *  Fires BackfillTimeoutError and routes through retryDelayMs like a connection failure. */
+   *  Terminal: fires BackfillTimeoutError straight to onFatalError, skipping retryDelayMs and the
+   *  retry budget entirely — the same way a failed durable-slot health check does. A session that
+   *  timed out here already created the slot; retrying would rebuild it, and the next session's
+   *  health check would find that slot healthy and silently resume streaming with the baseline
+   *  never read. Failing here instead of retrying is what keeps that from happening. */
   backfillTimeoutMs?: number
   /** Forwarded to batchTransactions() as maxEvents — omitted or non-positive means unbounded,
    *  matching that helper's own default; the managed layer does not invent a ceiling the helper
@@ -150,12 +155,14 @@ export class SlotInvalidatedError extends Error {
   constructor(readonly slot: string, override readonly cause: 'absent' | 'wal-lost' | 'no-confirmed-flush' | 'system-changed') { super(`minipg: replication slot ${JSON.stringify(slot)} is invalidated (${cause}) — drop it and call replicate() again to start over`) }
 }
 
-/** backfillTimeoutMs elapsed before the backfill callback resolved — the session is abandoned (no
- *  partial backfill is usable) and the failure routes through retryDelayMs like any other session
- *  failure. */
+/** backfillTimeoutMs elapsed before the backfill callback resolved — no partial backfill is
+ *  usable, so the session is abandoned and the failure fires straight to onFatalError, skipping
+ *  the retry budget entirely: retrying would create a fresh slot from a session that already
+ *  created one, and the next session's health check would find that slot healthy and resume
+ *  streaming with the baseline silently never read. */
 export class BackfillTimeoutError extends Error {
   readonly reason = 'backfill-timeout' as const
-  constructor(readonly ms: number) { super(`minipg: backfill did not resolve within ${ms}ms (backfillTimeoutMs) — the session is abandoned and will retry`) }
+  constructor(readonly ms: number) { super(`minipg: backfill did not resolve within ${ms}ms (backfillTimeoutMs) — the session is abandoned`) }
 }
 
 /** A durable slot is already held by another connection and onSlotBusy is 'error' (the default),
@@ -235,12 +242,15 @@ const sleep = (ms: number, signal: AbortSignal): Promise<void> =>
 // Mirrors isFatalAuth's shape (src/connection.ts:167-171): these never heal with time, so retrying
 // them identically ten times just delays onFatalError. SlotInvalidatedError, SlotBusyError, and
 // 42501 (eviction denied — missing pg_signal_backend) join the auth/publication/slot-name set:
-// none of them heal by waiting.
+// none of them heal by waiting. BackfillTimeoutError joins for a different reason: a session that
+// hit the deadline already created the slot, and retrying it would let the next session's health
+// check find that slot healthy and resume streaming past a baseline that was never read.
 function isPermanentFailure(err: unknown): boolean {
   const code = (err as { code?: string } | null)?.code
   if (code === '28P01' || code === '28000' || code === '3D000' || code === '42501') return true
   return err instanceof PublicationMissing || err instanceof PublicationEmpty || err instanceof InvalidSlotName ||
-    err instanceof SlotInvalidatedError || err instanceof SlotBusyError || err instanceof UnsupportedServerVersionError
+    err instanceof SlotInvalidatedError || err instanceof SlotBusyError || err instanceof UnsupportedServerVersionError ||
+    err instanceof BackfillTimeoutError
 }
 
 interface SlotHealthRow { active: string; active_pid: string | null; wal_status: string; confirmed_flush_lsn: string | null; restart_lsn: string | null }
@@ -462,7 +472,7 @@ export function replicate(opts: ReplicateOptions): ReplicateHandle {
           const deadline = opts.backfillTimeoutMs
             ? setTimeout(() => {
                 window.abort(new BackfillTimeoutError(opts.backfillTimeoutMs!))
-                deliverWarning(opts.onWarning, { kind: 'backfill-timeout', ms: opts.backfillTimeoutMs!, message: `minipg: backfill did not resolve within ${opts.backfillTimeoutMs}ms (backfillTimeoutMs) — the session is abandoned and will retry` })
+                deliverWarning(opts.onWarning, { kind: 'backfill-timeout', ms: opts.backfillTimeoutMs!, message: `minipg: backfill did not resolve within ${opts.backfillTimeoutMs}ms (backfillTimeoutMs) — the session is abandoned` })
               }, opts.backfillTimeoutMs)
             : undefined
           const isReconnect = !firstBackfill
@@ -486,8 +496,9 @@ export function replicate(opts: ReplicateOptions): ReplicateHandle {
               } catch (backfillErr) {
                 current = null
                 // The deadline firing is identified by the window's own abort reason, never by
-                // message text — it is the one throw that abandons the session instead of
-                // retrying in place, because a partial backfill is never usable.
+                // message text — it is the one throw that skips retry-in-place entirely and goes
+                // straight to onFatalError via isPermanentFailure below, because a partial
+                // backfill is never usable and retrying it would reopen the silent-resume path.
                 if (window.signal.reason instanceof BackfillTimeoutError) throw window.signal.reason
                 if (stopping) { repl.end(); state = 'stopped'; return }
                 attempt++
