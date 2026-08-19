@@ -322,10 +322,14 @@ test('cdc default retry: additive jitter, 30s cap, null at attempt 10', async ()
   // module-private by design — not part of the public surface). Rather than waiting out real
   // 1s-30s delays, intercept setTimeout to record what delay the layer actually asked for, then
   // fast-forward it — this observes the REAL computed values, not a re-implementation of them.
+  // The stack check attributes each capture to src/cdc.ts's own sleep() so an unrelated ≥500ms
+  // timer from Bun internals or a leaked prior test can't land in delays[] and corrupt the exact
+  // delays.length === 9 / per-index assertions below — a global interception window has no other
+  // way to tell "our retry" from "something else that happened to fire during it".
   const delays: number[] = []
   const realSetTimeout = globalThis.setTimeout
   globalThis.setTimeout = ((fn: (...a: unknown[]) => void, ms?: number, ...rest: unknown[]) => {
-    if (typeof ms === 'number' && ms >= 500) { delays.push(ms); return realSetTimeout(fn, 0) }
+    if (typeof ms === 'number' && ms >= 500 && new Error().stack?.includes('/src/cdc.ts')) { delays.push(ms); return realSetTimeout(fn, 0) }
     return realSetTimeout(fn, ms, ...rest)
   }) as typeof setTimeout
 
