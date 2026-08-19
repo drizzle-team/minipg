@@ -59,13 +59,18 @@ const lastFlushed = (sent: Buffer[]): bigint => {
   return 0n
 }
 
+// Bound once, at module load — a test that monkeypatches globalThis.Date.now (e.g. the eviction-
+// deadline test below, to exercise a real 3s deadline comparison in the code under test) must
+// never also skew until()'s own elapsed-time math, or a real hang gets misreported as a pass.
+const realDateNow = Date.now
+
 /** Polls `check` until it returns true or `timeoutMs` elapses — the fake backend is entirely
  *  in-process, so a session reaching a given wire state (e.g. START_REPLICATION sent) settles in
  *  microtasks, not real network latency; a short poll interval is deliberate. */
 async function until(check: () => boolean, timeoutMs = 2000): Promise<void> {
-  const t0 = Date.now()
+  const t0 = realDateNow()
   while (!check()) {
-    if (Date.now() - t0 > timeoutMs) throw new Error('minipg test: timed out waiting for condition')
+    if (realDateNow() - t0 > timeoutMs) throw new Error('minipg test: timed out waiting for condition')
     await Bun.sleep(5)
   }
 }
