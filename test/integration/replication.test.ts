@@ -857,6 +857,7 @@ describe('replication()', () => {
         await backfillRead
         await c.query(`insert into ${K}_cdc values (2)`) // strictly post-slot: stream-only
         allowBackfillToReturn?.()
+        await handle.ready // resolves once START_REPLICATION is accepted by the real server
         await Promise.race([
           streamed,
           Bun.sleep(10_000).then(() => { throw new Error('timed out waiting for the post-slot insert to stream') }),
@@ -868,6 +869,32 @@ describe('replication()', () => {
         await handle.stop()
         await c.query(`drop publication ${K}_cdcpub`)
         await c.query(`drop table ${K}_cdc`)
+      }
+    })
+  }, 15_000)
+
+  test('cdc temporary slot with a prefix: the row in pg_replication_slots names the process', async () => {
+    await withConn(async (c) => {
+      await c.query(`create table ${K}_pfxtbl(id int4 primary key)`)
+      await c.query(`create publication ${K}_pfxpub for table ${K}_pfxtbl`)
+      const handle = replicate({
+        url: TEST_CONFIG,
+        slot: { temporary: true, prefix: `${K}_pfx` },
+        publications: [`${K}_pfxpub`],
+        backfill: async () => {},
+        onTransaction: () => {},
+      })
+      try {
+        await handle.ready // the slot exists by the time START_REPLICATION is accepted
+        const rows = await c.query(`select slot_name, temporary from pg_replication_slots where slot_name like '${K}\\_pfx\\_%'`)
+        expect(rows.rows.length).toBe(1)
+        const [slotName, temporary] = rows.rows[0] as unknown[]
+        expect(slotName as string).toMatch(new RegExp(`^${K}_pfx_[0-9a-f]+$`))
+        expect(temporary).toBe(true)
+      } finally {
+        await handle.stop()
+        await c.query(`drop publication ${K}_pfxpub`)
+        await c.query(`drop table ${K}_pfxtbl`)
       }
     })
   }, 15_000)
