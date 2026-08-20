@@ -14,8 +14,13 @@ export interface ReplicateOptions {
    *  - `{ name }`: durable slot, health-checked via `command()` each connect (needs PG13+, else
    *    {@link UnsupportedServerVersionError}); malformed names throw {@link InvalidSlotName}
    *    synchronously, and a later absence raises {@link SlotInvalidatedError} instead of
-   *    recreating it. Retains WAL so a disconnected consumer resumes where it left off. */
-  slot: 'temporary' | { name: string }
+   *    recreating it. Retains WAL so a disconnected consumer resumes where it left off.
+   *  - `{ temporary: true, prefix }`: same as `'temporary'`, but the slot is named
+   *    `<prefix>_<8 hex>` instead of `minipg_cdc_<8 hex>`, so the row in `pg_replication_slots`
+   *    identifies the process that owns it. Defaults to `minipg_cdc` when omitted. Validated
+   *    like a durable name, with room held back for the suffix; malformed prefixes throw
+   *    {@link InvalidSlotName} synchronously. */
+  slot: 'temporary' | { name: string } | { temporary: true; prefix?: string }
   /** Publications to subscribe — forwarded to `start()`, whose {@link PublicationMissing} probe
    *  applies unchanged. An empty array throws {@link PublicationEmpty} synchronously, before any
    *  session starts. */
@@ -166,12 +171,17 @@ const deliverWarning = (cb: ((w: CdcWarning) => void) | undefined, w: CdcWarning
 }
 
 // Always inside [a-z0-9_]{1,63} by construction; createSlot() runs checkSlot() regardless.
-const tempSlotName = (): string => `minipg_cdc_${randomBytes(4).toString('hex')}`
+const tempSlotName = (prefix: string): string => `${prefix}_${randomBytes(4).toString('hex')}`
 
 // Mirrors src/replication.ts's own SLOT_NAME — a durable name is interpolated into new SQL sites
 // (health check, eviction) here, so it's validated before any of them sees it.
 const DURABLE_SLOT_NAME = /^[a-z0-9_]{1,63}$/
 const validateDurableSlotName = (name: string): void => { if (!DURABLE_SLOT_NAME.test(name)) throw new InvalidSlotName(name) }
+
+// 54 = 63 (NAMEDATALEN) minus the 8-hex suffix minus the joining underscore. Postgres does not
+// reject an over-long slot name — it truncates to 63 bytes with only a NOTICE — so without this
+// cap two prefixes differing only past character 54 would silently collapse onto one slot.
+const TEMP_SLOT_PREFIX = /^[a-z0-9_]{1,54}$/
 
 // drizzle-pulse's production defaults, not this driver's own backoff elsewhere (multiplicative
 // jitter there, additive here — deliberate). attempt is 1-based; null at the ceiling keeps "gave up" a single code path to onFatalError.
@@ -269,7 +279,10 @@ function withDerivedKeepAlive(url: string | ReplicationConfig, forceKeepAlive: b
 export function replicate(opts: ReplicateOptions): ReplicateHandle {
   // Consumer misuse (malformed slot name, empty publications) is knowable synchronously — validate
   // before the handle exists, so a consumer who omitted onFatalError still sees it.
-  if (typeof opts.slot !== 'string') validateDurableSlotName(opts.slot.name)
+  if (typeof opts.slot !== 'string') {
+    if ('name' in opts.slot) validateDurableSlotName(opts.slot.name)
+    else if (opts.slot.prefix !== undefined && !TEMP_SLOT_PREFIX.test(opts.slot.prefix)) throw new InvalidSlotName(opts.slot.prefix)
+  }
   if (opts.publications.length === 0) throw new PublicationEmpty()
   // !(x > 0) catches negative, zero, and NaN in one comparison — a negative value would otherwise fire immediately, aborting every backfill on entry.
   if (opts.backfillTimeoutMs !== undefined && !(opts.backfillTimeoutMs > 0)) {
@@ -289,7 +302,8 @@ export function replicate(opts: ReplicateOptions): ReplicateHandle {
   let lastSystemId: string | null = null // persisted across connects; a durable slot's systemId/timeline must never move under it
   let lastTimeline: number | null = null
   let derivedKeepAlive = false // true once a connect measures wal_sender_timeout = 0 and the consumer didn't set their own keepAlive
-  const durableName = typeof opts.slot === 'string' ? null : opts.slot.name // captured once, after the synchronous validation above — a later mutation of opts.slot.name is unobservable
+  const durableName = typeof opts.slot === 'string' || !('name' in opts.slot) ? null : opts.slot.name // captured once, after the synchronous validation above — a later mutation of opts.slot.name is unobservable
+  const tempPrefix = typeof opts.slot !== 'string' && !('name' in opts.slot) ? (opts.slot.prefix ?? 'minipg_cdc') : 'minipg_cdc' // captured once, alongside durableName, for the same reason
   const consumerSetKeepAlive = typeof opts.url !== 'string' && opts.url.keepAlive !== undefined
   const controller = new AbortController() // internal signal: reaches start()'s own signal, so stop() wakes a parked next()
   const effectiveRetryDelayMs = opts.retryDelayMs ?? defaultRetryDelayMs
@@ -360,7 +374,7 @@ export function replicate(opts: ReplicateOptions): ReplicateHandle {
         }
 
         const isDurable = durableName !== null
-        const name = durableName ?? tempSlotName()
+        const name = durableName ?? tempSlotName(tempPrefix)
 
         let resumed: { confirmedFlush: string; restartLsn: string } | null = null
         // Set by the catch below (a recreatable SlotInvalidatedError) or by an onResume

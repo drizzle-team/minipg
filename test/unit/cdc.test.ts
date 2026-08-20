@@ -2096,3 +2096,21 @@ test('cdc onResume verdict: a recreate on every connect exhausts the budget', as
   expect(backend.sessions.length).toBe(sessionsAtFatal)
   await handle.stop()
 })
+
+test('cdc a temporary slot with a prefix names itself <prefix>_<hex>, still TEMPORARY', async () => {
+  const backend = cdcBackend()
+  const handle = replicate({
+    url: cfg({ socket: backend.socket }),
+    slot: { temporary: true, prefix: 'myproc' },
+    publications: ['pub'],
+    backfill: async () => {},
+    onTransaction: () => {},
+  })
+  try {
+    await until(() => !!backend.latest?.queries.some((q) => q.startsWith('START_REPLICATION')))
+    const createQuery = backend.latest!.queries.find((q) => q.startsWith('CREATE_REPLICATION_SLOT'))
+    expect(createQuery).toMatch(/^CREATE_REPLICATION_SLOT myproc_[0-9a-f]{8} TEMPORARY LOGICAL pgoutput EXPORT_SNAPSHOT$/)
+  } finally {
+    await handle.stop()
+  }
+})
