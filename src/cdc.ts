@@ -1,10 +1,9 @@
-// replicate() is a consumer of the raw replication() API, not a rewrite of it — it owns the
-// reconnect loop, slot lifecycle, backfill window, and ack-on-handler-resolve.
-// Session states: S0 idle -> S1 connecting -> S2 preparing -> S3 backfilling -> S4 streaming ->
-// S5 handling -> S6 backoff -> S7 stopped / S8 dead. A transient failure in S1-S5 drives S6; a handler throw (S5) retries in place instead, zero reconnects.
 import { replication, batchTransactions, PublicationMissing, PublicationEmpty, InvalidSlotName, InvalidReplicationShape, type ReplicationConnection, type ReplicationConfig, type ReplicationWarning, type TransactionBatch, type TableShape } from './replication.ts'
 import { PgError } from './errors.ts'
 import { randomBytes } from 'node:crypto'
+
+// replicate() is a consumer of the raw replication() API: it owns the reconnect loop, slot
+// lifecycle, backfill window, and ack-on-handler-resolve.
 
 /** One session's lifecycle stage, tracked on the handle's own closure so two concurrent
  *  replicate() calls never share state. */
@@ -173,13 +172,13 @@ const sleep = (ms: number, signal: AbortSignal): Promise<void> =>
 
 // None of these heal with time (mirrors isFatalAuth, connection.ts). InvalidReplicationShape
 // joins because start() validates shapes AFTER createSlot/backfill, so retrying burns a fresh slot and a full backfill before naming the real problem.
+const PERMANENT_SQLSTATES = new Set(['28P01', '28000', '3D000', '42501'])
+const PERMANENT_ERRORS = [PublicationMissing, PublicationEmpty, InvalidSlotName, InvalidReplicationShape,
+  SlotInvalidatedError, SlotBusyError, UnsupportedServerVersionError, BackfillTimeoutError]
+
 function isPermanentFailure(err: unknown): boolean {
   const code = (err as { code?: string } | null)?.code
-  if (code === '28P01' || code === '28000' || code === '3D000' || code === '42501') return true
-  return err instanceof PublicationMissing || err instanceof PublicationEmpty || err instanceof InvalidSlotName ||
-    err instanceof InvalidReplicationShape ||
-    err instanceof SlotInvalidatedError || err instanceof SlotBusyError || err instanceof UnsupportedServerVersionError ||
-    err instanceof BackfillTimeoutError
+  return (code !== undefined && PERMANENT_SQLSTATES.has(code)) || PERMANENT_ERRORS.some((E) => err instanceof E)
 }
 
 interface SlotHealthRow { active: string; active_pid: string | null; wal_status: string; confirmed_flush_lsn: string | null; restart_lsn: string | null }
@@ -199,13 +198,13 @@ async function readSlotHealth(conn: ReplicationConnection, name: string): Promis
   return Object.fromEntries(r.columns.map((c, i) => [c, r.rows[0]![i]])) as unknown as SlotHealthRow
 }
 
-// Entirely over command(): terminate the holder, then poll until the slot reads inactive or a
-// ~3s deadline passes. 't'/'f' both mean "keep polling" ('f' is already-gone; 42704 belongs to pg_drop_replication_slot, not this). 42501 propagates untouched for isPermanentFailure() to classify.
+// Runs on the replication connection itself, never a second one: terminate the holder, then
+// poll until the slot reads inactive or a ~3s deadline passes. 't'/'f' both mean "keep polling" ('f' is already-gone; 42704 belongs to pg_drop_replication_slot, not this). 42501 propagates untouched for isPermanentFailure() to classify.
 async function evictAndAwaitClear(conn: ReplicationConnection, name: string, pid: number, opts: ReplicateOptions, signal: AbortSignal): Promise<void> {
   if (!Number.isInteger(pid)) throw new SlotBusyError(name, pid) // the trust boundary: a server-sourced value about to ride into SQL
   await conn.command(`select pg_terminate_backend(${pid})`)
   const deadline = Date.now() + 3000
-  for (;;) {
+  while (true) {
     const poll = await conn.command(`select active from pg_replication_slots where slot_name = '${name}'`)
     if (poll.rows.length === 0) throw new SlotInvalidatedError(name, 'absent') // dropped mid-poll — never the same as still busy
     if (poll.rows[0]![0] === 'f') {
@@ -244,10 +243,10 @@ export function replicate(opts: ReplicateOptions): ReplicateHandle {
   let attempt = 0 // shared by S6 (reconnect) and the in-place handler retry — one shared budget for both
   let repl: ReplicationConnection | null = null
   let current: Promise<unknown> | null = null // the in-flight backfill or handler promise, awaited by stop()
-  let pendingAckLsn: string | null = null      // a done:true batch's endLsn once its handler resolves, until acked
+  let pendingAckLsn: string | null = null // a done:true batch's endLsn once its handler resolves, until acked
   let walSenderTimeoutMs: number | null = null // read once per connect; derives statusIntervalMs/receiveTimeoutMs and the wst=0 keepAlive fallback below
   let stopPromise: Promise<void> | null = null
-  let sawSlot = false                    // absent on the FIRST observation creates the durable slot; absent on any LATER one invalidates it
+  let sawSlot = false // absent on the FIRST observation creates the durable slot; absent on any LATER one invalidates it
   let lastSystemId: string | null = null // persisted across connects; a durable slot's systemId/timeline must never move under it
   let lastTimeline: number | null = null
   let derivedKeepAlive = false // true once a connect measures wal_sender_timeout = 0 and the consumer didn't set their own keepAlive
@@ -279,7 +278,7 @@ export function replicate(opts: ReplicateOptions): ReplicateHandle {
 
   async function run(): Promise<void> {
     if (stopping) { state = 'stopped'; return }
-    for (;;) { // one iteration = one session: S1 connecting through S4/S5, or a failure into S6
+    while (true) { // one iteration = one session: S1 connecting through S4/S5, or a failure into S6
       currentIsDurable = false // reset every iteration — stale from a prior session must never drive the 42704 mapping below
       currentSlotName = null
       try {
@@ -338,7 +337,7 @@ export function replicate(opts: ReplicateOptions): ReplicateHandle {
           if (stopping) { repl.end(); state = 'stopped'; return }
 
           let evictions = 0 // caps S2 -> S2 rounds: two 'evict'-configured consumers pointed at the same slot must not terminate each other forever
-          for (;;) { // S2 -> S2 on eviction: re-reads the row over the SAME connection, no reconnect, bounded only by evictAndAwaitClear's own ~3s deadline
+          while (true) { // S2 -> S2 on eviction: re-reads the row over the SAME connection, no reconnect, bounded only by evictAndAwaitClear's own ~3s deadline
             const row = await readSlotHealth(repl, name)
             if (stopping) { repl.end(); state = 'stopped'; return }
             if (!row) {
@@ -393,7 +392,7 @@ export function replicate(opts: ReplicateOptions): ReplicateHandle {
           try {
             // A non-timeout throw retries IN PLACE on the same slot/snapshot/window — the same
             // shape the handler retry below uses. The deadline bounds the whole window including retries: armed once, outside this loop.
-            for (;;) {
+            while (true) {
               try {
                 // ZERO commands run on this connection inside the window — the next thing sent on success is START_REPLICATION.
                 const p = Promise.resolve(opts.backfill?.({ snapshot: created.snapshot, streamStartLsn: created.consistentPoint, isReconnect, signal: window.signal }))
@@ -447,7 +446,7 @@ export function replicate(opts: ReplicateOptions): ReplicateHandle {
 
           // A handler throw retries the SAME batch in place, zero commands, zero reconnects
           // (PostgreSQL BUG #18754: a second START_REPLICATION here delivers nothing, forever). Escalates only via budget exhaustion (fireFatal) or the handler resolving.
-          for (;;) {
+          while (true) {
             try {
               const p = Promise.resolve(opts.onTransaction(batch))
               current = p

@@ -1,12 +1,5 @@
-# Publishes a preview build of every commit to pkg.pr.new, so a teammate can install an
-# unreleased build without burning a version number or vendoring a tarball.
-#
-# PREREQUISITE: the pkg.pr.new GitHub App must be installed on this repository, or every
-# publish step fails. https://github.com/apps/pkg-pr-new
-#
-# The install URL for each commit is written to the job summary, and to a PR comment when
-# the run is for a pull request. Preview builds are not published to npm; the Publish
-# workflow remains the only path to the registry.
+# Publishes a preview build of every commit to pkg.pr.new.
+# Requires the pkg.pr.new GitHub App on this repository: https://github.com/apps/pkg-pr-new
 name: Preview release
 
 on:
@@ -15,8 +8,7 @@ on:
     tags: ['!**']
   pull_request:
 
-# pkg.pr.new authenticates through its GitHub App and posts its PR comment as the app, so
-# the workflow token only ever needs to read the repository for checkout.
+# checkout only; the PR comment is posted by the pkg.pr.new app, not this token
 permissions:
   contents: read
 
@@ -40,21 +32,14 @@ jobs:
 
       - run: bun install --frozen-lockfile
 
-      # The same fast gate the Publish workflow runs. A preview that does not typecheck,
-      # build, pass the unit suite and survive the packaging checks is worse than no
-      # preview: it looks installable and is not. The integration suite is deliberately
-      # excluded — it needs a live cluster and a 20 minute job, which is too slow to sit
-      # in front of every commit.
+      # The Publish workflow's fast gate; the integration suite needs a live cluster and is too slow here.
       - run: bun run typecheck
       - run: bun run build
       - run: bun test test/unit
       - run: bun run verify:publish
 
-      # A preview-service outage must not turn the build red — the gates above already
-      # decided whether the commit is good.
-      # --previewVersion rewrites the published package.json version to 0.0.0-preview-<sha>.
-      # Without it a preview keeps the source version, so a preview of 0.3.3 can settle into
-      # a consumer's lockfile and shadow the real 0.3.3 once that ships to npm.
+      # --previewVersion prevents a preview shadowing the real npm release of the same version.
+      # continue-on-error: a pkg.pr.new outage must not fail a commit the gates above passed.
       - name: Publish preview to pkg.pr.new
         id: preview
         continue-on-error: true
