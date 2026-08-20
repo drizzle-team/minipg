@@ -714,7 +714,9 @@ test('cdc invalidated: lost, null confirmed_flush, absent after seen, and system
   // first one), and the only way run()'s loop opens a second session is through the ordinary
   // transient-failure path, which legitimately spends one retryDelayMs call. What must never
   // happen is retryDelayMs being consulted FOR a SlotInvalidatedError — recorded here so a
-  // regression (routing invalidation through the normal retry budget) fails loudly.
+  // regression (routing invalidation through the normal retry budget) fails loudly. This
+  // guarantee holds when onSlotInvalidated is unset or 'error'; under 'recreate' the budget is
+  // consulted with the caught invalidation deliberately, so a recreate loop stays bounded.
   const noRetryForInvalidation = (calls: { attempt: number; err: Error }[]) =>
     expect(calls.every((c) => !(c.err instanceof SlotInvalidatedError))).toBe(true)
 
@@ -882,6 +884,260 @@ test('cdc recreate: a lost durable slot is dropped, recreated, backfilled with t
   s0.dx.push(pgCommit(commitLsn, endLsn))
   await until(() => lastFlushed(s0.sent) >= endLsn)
 
+  expect(fatalErr).toBeUndefined()
+  expect(backend.sessions.length).toBe(1)
+  await handle.stop()
+})
+
+test('cdc recreate: absent after seen drops nothing that exists and recreates', async () => {
+  const backend = cdcBackend({
+    onQuery: (sql) => sql.startsWith('select active,') ? [rowDesc(healthCols), ready()] : undefined,
+  })
+  const backfillInfos: { isReconnect: boolean }[] = []
+  let fatalErr: Error | undefined
+  const handle = replicate({
+    url: cfg({ socket: backend.socket }),
+    slot: { name: 'durable_absent_recreate' },
+    onSlotInvalidated: 'recreate',
+    publications: ['pub'],
+    backfill: async (info) => { backfillInfos.push({ isReconnect: info.isReconnect }) },
+    onTransaction: async () => {},
+    retryDelayMs: () => 1,
+    onFatalError: (err) => { fatalErr = err },
+  })
+
+  await until(() => !!backend.latest?.queries.some((q) => q.startsWith('START_REPLICATION')))
+  expect(backend.sessions[0]!.queries.some((q) => q.startsWith('CREATE_REPLICATION_SLOT'))).toBe(true) // first observation created it
+  expect(backend.sessions[0]!.queries.some((q) => q.startsWith('DROP_REPLICATION_SLOT'))).toBe(false)
+
+  backend.latest!.dx.push(frame('c', Buffer.alloc(0))) // server CopyDone -> the one legitimate reconnect
+  await until(() => backend.sessions.length >= 2 && !!backend.latest?.queries.some((q) => q.startsWith('START_REPLICATION')))
+
+  const s1Shape = backend.sessions[1]!.queries.filter((q) => q.startsWith('DROP_REPLICATION_SLOT') || q.startsWith('CREATE_REPLICATION_SLOT'))
+  expect(s1Shape.length).toBe(2)
+  expect(s1Shape[0]!.startsWith('DROP_REPLICATION_SLOT')).toBe(true)
+  expect(s1Shape[1]!.startsWith('CREATE_REPLICATION_SLOT')).toBe(true)
+
+  expect(backfillInfos.length).toBe(2)
+  expect(backfillInfos[1]!.isReconnect).toBe(true)
+  expect(fatalErr).toBeUndefined()
+  await handle.stop()
+})
+
+test('cdc recreate: 55006 on the drop polls and retries on the same connection', async () => {
+  let dropCalls = 0
+  const backend = cdcBackend({
+    onQuery: (sql) => {
+      if (sql.startsWith('select active,')) return [rowDesc(healthCols), dataRow(['f', null, 'lost', '0/10', '0/8']), ready()]
+      if (sql.startsWith('DROP_REPLICATION_SLOT')) {
+        dropCalls++
+        return dropCalls === 1
+          ? [errFrame('55006', 'replication slot "durable_drop55006" is active for PID 111'), ready()]
+          : [ready()]
+      }
+      return undefined
+    },
+  })
+  let fatalErr: Error | undefined
+  const handle = replicate({
+    url: cfg({ socket: backend.socket }),
+    slot: { name: 'durable_drop55006' },
+    onSlotInvalidated: 'recreate',
+    publications: ['pub'],
+    backfill: async () => {},
+    onTransaction: async () => {},
+    retryDelayMs: () => 1,
+    onFatalError: (err) => { fatalErr = err },
+  })
+
+  await until(() => !!backend.latest?.queries.some((q) => q.startsWith('START_REPLICATION')))
+  const shape = backend.sessions[0]!.queries.filter((q) => q.startsWith('DROP_REPLICATION_SLOT') || q.startsWith('CREATE_REPLICATION_SLOT'))
+  expect(shape.length).toBe(3)
+  expect(shape[0]!.startsWith('DROP_REPLICATION_SLOT')).toBe(true)
+  expect(shape[1]!.startsWith('DROP_REPLICATION_SLOT')).toBe(true)
+  expect(shape[2]!.startsWith('CREATE_REPLICATION_SLOT')).toBe(true)
+  expect(backend.sessions.length).toBe(1) // the retry stayed on the same connection
+  expect(fatalErr).toBeUndefined()
+  await handle.stop()
+})
+
+test('cdc recreate: 42704 on the drop means already gone and the create proceeds', async () => {
+  const backend = cdcBackend({
+    onQuery: (sql) => {
+      if (sql.startsWith('select active,')) return [rowDesc(healthCols), dataRow(['f', null, 'lost', '0/10', '0/8']), ready()]
+      if (sql.startsWith('DROP_REPLICATION_SLOT')) return [errFrame('42704', 'replication slot "durable_drop42704" does not exist'), ready()]
+      return undefined
+    },
+  })
+  const backfillInfos: { isReconnect: boolean }[] = []
+  let fatalErr: Error | undefined
+  const handle = replicate({
+    url: cfg({ socket: backend.socket }),
+    slot: { name: 'durable_drop42704' },
+    onSlotInvalidated: 'recreate',
+    publications: ['pub'],
+    backfill: async (info) => { backfillInfos.push({ isReconnect: info.isReconnect }) },
+    onTransaction: async () => {},
+    retryDelayMs: () => 1,
+    onFatalError: (err) => { fatalErr = err },
+  })
+
+  await until(() => !!backend.latest?.queries.some((q) => q.startsWith('START_REPLICATION')))
+  const shape = backend.sessions[0]!.queries.filter((q) => q.startsWith('DROP_REPLICATION_SLOT') || q.startsWith('CREATE_REPLICATION_SLOT'))
+  expect(shape.length).toBe(2)
+  expect(shape[0]!.startsWith('DROP_REPLICATION_SLOT')).toBe(true)
+  expect(shape[1]!.startsWith('CREATE_REPLICATION_SLOT')).toBe(true)
+  expect(backfillInfos.length).toBe(1)
+  expect(backfillInfos[0]!.isReconnect).toBe(true)
+  expect(fatalErr).toBeUndefined()
+  await handle.stop()
+})
+
+test('cdc recreate: system-changed stays terminal and never drops', async () => {
+  const backend = cdcBackend({
+    onQuery: (sql, session) => sql.startsWith('IDENTIFY_SYSTEM')
+      ? [rowDesc([{ name: 'systemid', oid: 25 }, { name: 'timeline', oid: 25 }, { name: 'xlogpos', oid: 25 }, { name: 'dbname', oid: 25 }]),
+          dataRow([session === 0 ? '7000000000000000001' : '9999999999999999999', '1', '0/10', 'd']), ready()]
+      : undefined,
+  })
+  let fatalErr: Error | undefined
+  const handle = replicate({
+    url: cfg({ socket: backend.socket }),
+    slot: { name: 'durable_systemchange_recreate' },
+    onSlotInvalidated: 'recreate',
+    publications: ['pub'],
+    backfill: async () => {},
+    onTransaction: async () => {},
+    retryDelayMs: () => 1,
+    onFatalError: (err) => { fatalErr = err },
+  })
+  await until(() => !!backend.latest?.queries.some((q) => q.startsWith('START_REPLICATION')))
+  backend.latest!.dx.push(frame('c', Buffer.alloc(0)))
+  await until(() => fatalErr !== undefined)
+  expect(fatalErr).toBeInstanceOf(SlotInvalidatedError)
+  expect((fatalErr as SlotInvalidatedError).cause).toBe('system-changed')
+  for (const s of backend.sessions) expect(s.queries.some((q) => q.startsWith('DROP_REPLICATION_SLOT'))).toBe(false)
+  await handle.stop()
+})
+
+test('cdc recreate: repeated recreation without progress exhausts the budget', async () => {
+  const backend = cdcBackend({
+    onQuery: (sql) => sql.startsWith('select active,')
+      ? [rowDesc(healthCols), dataRow(['f', null, 'lost', '0/10', '0/8']), ready()]
+      : undefined,
+  })
+  const calls: { attempt: number; err: Error }[] = []
+  let fatalErr: Error | undefined
+  let fatalCount = 0
+  const handle = replicate({
+    url: cfg({ socket: backend.socket }),
+    slot: { name: 'durable_budget_exhaust' },
+    onSlotInvalidated: 'recreate',
+    publications: ['pub'],
+    backfill: async () => {},
+    onTransaction: async () => {},
+    retryDelayMs: (attempt, err) => { calls.push({ attempt, err }); return attempt < 4 ? 1 : null },
+    onFatalError: (err) => { fatalErr = err; fatalCount++ },
+  })
+
+  // Each recreated session dies via a server CopyDone before anything acks, forcing the next
+  // connect's health check to see the slot lost again and recreate once more — until the budget
+  // returns null. Waits on the SESSION INDEX, not backend.latest — the next session hasn't opened
+  // yet right after a push, and re-checking the same dead session's queries would spin forever.
+  let sessionIdx = 0
+  while (fatalErr === undefined) {
+    await until(() => (backend.sessions.length > sessionIdx && !!backend.sessions[sessionIdx]?.queries.some((q) => q.startsWith('START_REPLICATION'))) || fatalErr !== undefined)
+    if (fatalErr !== undefined) break
+    backend.sessions[sessionIdx]!.dx.push(frame('c', Buffer.alloc(0)))
+    sessionIdx++
+  }
+
+  expect(fatalCount).toBe(1)
+  expect(calls.map((c) => c.attempt)).toEqual([1, 2, 3, 4])
+  expect(calls.some((c) => c.err instanceof SlotInvalidatedError)).toBe(true)
+  const sessionsAtFatal = backend.sessions.length
+  await Bun.sleep(50)
+  expect(backend.sessions.length).toBe(sessionsAtFatal)
+  await handle.stop()
+})
+
+test('cdc recreate: an acked transaction resets the budget after a recreate', async () => {
+  const backend = cdcBackend({
+    onQuery: (sql, session) => sql.startsWith('select active,')
+      ? (session === 0
+          ? [rowDesc(healthCols), dataRow(['f', null, 'lost', '0/10', '0/8']), ready()]
+          : [rowDesc(healthCols), dataRow(['f', null, 'reserved', '0/10', '0/8']), ready()])
+      : undefined,
+  })
+  const calls: { attempt: number; err: Error }[] = []
+  let fatalErr: Error | undefined
+  const handle = replicate({
+    url: cfg({ socket: backend.socket }),
+    slot: { name: 'durable_reset_after_recreate' },
+    onSlotInvalidated: 'recreate',
+    publications: ['pub'],
+    backfill: async () => {},
+    onTransaction: async () => {},
+    retryDelayMs: (attempt, err) => { calls.push({ attempt, err }); return 1 },
+    onFatalError: (err) => { fatalErr = err },
+  })
+
+  await until(() => !!backend.latest?.queries.some((q) => q.startsWith('START_REPLICATION')))
+  expect(calls.length).toBe(1)
+  expect(calls[0]!.attempt).toBe(1)
+
+  const s0 = backend.latest!
+  const relId = 12, commitLsn = 0x40n, endLsn = 0x50n
+  s0.dx.push(pgBegin())
+  s0.dx.push(pgRelation(relId, 'public', 'reset_after_recreate', 'd', [{ name: 'id', oid: 23, key: true }]))
+  s0.dx.push(pgInsert(relId, [textCell('1')]))
+  s0.dx.push(pgCommit(commitLsn, endLsn))
+  await until(() => lastFlushed(s0.sent) >= endLsn)
+
+  s0.dx.destroy() // dies right after the ack -> the budget was just reset -> attempt 1, not 2
+  await until(() => calls.length >= 2)
+  expect(calls.map((c) => c.attempt)).toEqual([1, 1])
+  expect(fatalErr).toBeUndefined()
+  await handle.stop()
+})
+
+test('cdc recreate: a null confirmed_flush is dropped and recreated instead of going fatal', async () => {
+  const backend = cdcBackend({
+    onQuery: (sql) => sql.includes('pg_replication_slots')
+      ? [rowDesc(healthCols), dataRow(['f', null, 'reserved', null, '0/8']), ready()]
+      : undefined,
+  })
+  const backfillInfos: { isReconnect: boolean }[] = []
+  const calls: { attempt: number; err: Error }[] = []
+  let fatalErr: Error | undefined
+  const handle = replicate({
+    url: cfg({ socket: backend.socket }),
+    slot: { name: 'durable_nullflush_recreate' },
+    onSlotInvalidated: 'recreate',
+    publications: ['pub'],
+    backfill: async (info) => { backfillInfos.push({ isReconnect: info.isReconnect }) },
+    onTransaction: async () => {},
+    retryDelayMs: (attempt, err) => { calls.push({ attempt, err }); return 1 },
+    onFatalError: (err) => { fatalErr = err },
+  })
+
+  await until(() => !!backend.latest?.queries.some((q) => q.startsWith('START_REPLICATION')))
+  const queries = backend.sessions[0]!.queries
+  const healthIdx = queries.findIndex((q) => q.startsWith('select active,'))
+  const dropIdx = queries.findIndex((q) => q.startsWith('DROP_REPLICATION_SLOT'))
+  const createIdx = queries.findIndex((q) => q.startsWith('CREATE_REPLICATION_SLOT'))
+  const startIdx = queries.findIndex((q) => q.startsWith('START_REPLICATION'))
+  expect(healthIdx).toBeGreaterThanOrEqual(0)
+  expect(dropIdx).toBeGreaterThan(healthIdx)
+  expect(createIdx).toBeGreaterThan(dropIdx)
+  expect(startIdx).toBeGreaterThan(createIdx)
+
+  expect(backfillInfos.length).toBe(1)
+  expect(backfillInfos[0]!.isReconnect).toBe(true)
+  expect(calls.length).toBe(1)
+  expect(calls[0]!.attempt).toBe(1)
+  expect(calls[0]!.err).toBeInstanceOf(SlotInvalidatedError)
+  expect((calls[0]!.err as SlotInvalidatedError).cause).toBe('no-confirmed-flush')
   expect(fatalErr).toBeUndefined()
   expect(backend.sessions.length).toBe(1)
   await handle.stop()
