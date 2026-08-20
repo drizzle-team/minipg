@@ -73,8 +73,12 @@ export interface ReplicateOptions {
    *  backfills from scratch. On a temporary slot this option is inert, same as `onSlotBusy`. */
   onSlotInvalidated?: 'error' | 'recreate'
   /** Fires instead of `backfill` when a durable slot already existed and passed its health check
-   *  — nothing to backfill. A throw here routes through `retryDelayMs` like a backfill throw. */
-  onResume?: (info: { confirmedFlush: string; restartLsn: string }) => void | Promise<void>
+   *  — nothing to backfill. Returning `'recreate'` drops the slot and recreates it with an
+   *  exported snapshot, firing `backfill` instead of resuming — for when the consumer's own
+   *  durability check finds that resuming from `confirmedFlush` would skip commits it never
+   *  recorded. Returning nothing resumes as normal. A throw still routes through `retryDelayMs`
+   *  like a backfill throw. */
+  onResume?: (info: { confirmedFlush: string; restartLsn: string }) => void | 'recreate' | Promise<void | 'recreate'>
   /** Forwarded to `start()` unchanged; see `StartOptions.messages`. */
   messages?: boolean
   /** Forwarded to `start()` when set. Omitted defaults to `max(10_000, wal_sender_timeout * 0.75)`,
@@ -314,9 +318,9 @@ export function replicate(opts: ReplicateOptions): ReplicateHandle {
 
   // current is non-null exactly while p is pending, so doStop() can await the in-flight
   // onResume/backfill/onTransaction call and ack whatever it completes.
-  async function track(p: Promise<unknown>): Promise<void> {
+  async function track<T>(p: Promise<T>): Promise<T> {
     current = p
-    try { await p } finally { current = null }
+    try { return await p } finally { current = null }
   }
 
   async function run(): Promise<void> {
@@ -359,7 +363,10 @@ export function replicate(opts: ReplicateOptions): ReplicateHandle {
         const name = durableName ?? tempSlotName()
 
         let resumed: { confirmedFlush: string; restartLsn: string } | null = null
-        let recreate: SlotInvalidatedError | null = null // set only by the catch below, consulted by the recreate section further down
+        // Set by the catch below (a recreatable SlotInvalidatedError) or by an onResume
+        // 'recreate' verdict (a plain Error) — either way, consulted by the recreate section
+        // further down.
+        let recreate: Error | null = null
 
         if (isDurable) {
           try {
@@ -402,7 +409,13 @@ export function replicate(opts: ReplicateOptions): ReplicateHandle {
 
         if (resumed && opts.onResume) {
           // A throw here routes through retryDelayMs exactly like a backfill throw — it shares this try block's outer catch.
-          await track(Promise.resolve(opts.onResume(resumed)))
+          const verdict = await track(Promise.resolve(opts.onResume(resumed)))
+          if (verdict === 'recreate') {
+            // A plain Error, deliberately not a SlotInvalidatedError — it must never re-enter
+            // isPermanentFailure and turn a per-connect verdict into a terminal one.
+            recreate = new Error("minipg: onResume returned 'recreate' — dropping the slot and rebuilding from a fresh snapshot")
+            resumed = null
+          }
         }
 
         if (recreate !== null) {

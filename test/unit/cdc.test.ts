@@ -1997,3 +1997,102 @@ test('cdc and raw slot-name validation reject and accept identically at every bo
   expect(rawAccepts.get('a'.repeat(63))).toBe(true)
   expect(rawAccepts.get('a'.repeat(64))).toBe(false)
 })
+
+test('cdc onResume verdict: recreate drops the healthy slot and rebuilds from a fresh snapshot', async () => {
+  const backend = cdcBackend() // default healthy row: active 'f', confirmed_flush '0/10', restart '0/8'
+  const resumeInfos: { confirmedFlush: string; restartLsn: string }[] = []
+  const backfillInfos: { isReconnect: boolean }[] = []
+  const calls: { attempt: number; err: Error }[] = []
+  let onResumeCalls = 0
+  let fatalErr: Error | undefined
+  const handle = replicate({
+    url: cfg({ socket: backend.socket }),
+    slot: { name: 'durable_verdict_recreate' },
+    publications: ['pub'],
+    backfill: async (info) => { backfillInfos.push({ isReconnect: info.isReconnect }) },
+    onResume: async (info) => {
+      onResumeCalls++
+      resumeInfos.push(info)
+      return onResumeCalls === 1 ? 'recreate' : undefined
+    },
+    onTransaction: async () => {},
+    retryDelayMs: (attempt, err) => { calls.push({ attempt, err }); return 1 },
+    onFatalError: (err) => { fatalErr = err },
+  })
+
+  await until(() => !!backend.latest?.queries.some((q) => q.startsWith('START_REPLICATION')))
+  const s0 = backend.sessions[0]!
+  const healthIdx = s0.queries.findIndex((q) => q.startsWith('select active,'))
+  const dropIdx = s0.queries.findIndex((q) => q.startsWith('DROP_REPLICATION_SLOT'))
+  const createIdx = s0.queries.findIndex((q) => q.startsWith('CREATE_REPLICATION_SLOT'))
+  const startIdx = s0.queries.findIndex((q) => q.startsWith('START_REPLICATION'))
+  expect(healthIdx).toBeGreaterThanOrEqual(0)
+  expect(dropIdx).toBeGreaterThan(healthIdx)
+  expect(createIdx).toBeGreaterThan(dropIdx)
+  expect(startIdx).toBeGreaterThan(createIdx)
+
+  expect(backfillInfos.length).toBe(1)
+  expect(backfillInfos[0]!.isReconnect).toBe(true)
+
+  // Filtered, not calls.length: the CopyDone-driven reconnect below consumes the budget too, with
+  // its own unrelated error — this checks only the verdict's own consult.
+  const verdictCalls = calls.filter((c) => c.err.message.includes('onResume'))
+  expect(verdictCalls.length).toBe(1)
+  expect(verdictCalls[0]!.err).not.toBeInstanceOf(SlotInvalidatedError)
+
+  expect(resumeInfos[0]).toEqual({ confirmedFlush: '0/10', restartLsn: '0/8' }) // the fake's default row
+
+  const relId = 40, commitLsn = 0x60n, endLsn = 0x70n
+  s0.dx.push(pgBegin())
+  s0.dx.push(pgRelation(relId, 'public', 'verdict', 'd', [{ name: 'id', oid: 23, key: true }]))
+  s0.dx.push(pgInsert(relId, [textCell('1')]))
+  s0.dx.push(pgCommit(commitLsn, endLsn))
+  await until(() => lastFlushed(s0.sent) >= endLsn)
+
+  // force a reconnect via server CopyDone — onResume runs again, now returning undefined
+  s0.dx.push(frame('c', Buffer.alloc(0)))
+  await until(() => backend.sessions.length >= 2 && !!backend.latest?.queries.some((q) => q.startsWith('START_REPLICATION')))
+  const s1 = backend.latest!
+  expect(s1.queries.some((q) => q.startsWith('DROP_REPLICATION_SLOT'))).toBe(false)
+  expect(s1.queries.some((q) => q.startsWith('CREATE_REPLICATION_SLOT'))).toBe(false)
+  expect(backfillInfos.length).toBe(1)
+  expect(onResumeCalls).toBe(2)
+
+  expect(fatalErr).toBeUndefined()
+  await handle.stop()
+})
+
+test('cdc onResume verdict: a recreate on every connect exhausts the budget', async () => {
+  const backend = cdcBackend() // default healthy row: every connect's health check passes, onResume alone decides
+  const calls: { attempt: number; err: Error }[] = []
+  let fatalErr: Error | undefined
+  let fatalCount = 0
+  const handle = replicate({
+    url: cfg({ socket: backend.socket }),
+    slot: { name: 'durable_verdict_exhaust' },
+    publications: ['pub'],
+    backfill: async () => {},
+    onResume: async () => 'recreate' as const,
+    onTransaction: async () => {},
+    retryDelayMs: (attempt, err) => { calls.push({ attempt, err }); return attempt < 4 ? 1 : null },
+    onFatalError: (err) => { fatalErr = err; fatalCount++ },
+  })
+
+  // Each rebuilt session consumes the budget twice: once for the verdict itself, once when the
+  // CopyDone pushed below kills it before anything acks — neither consult resets the budget.
+  let sessionIdx = 0
+  while (fatalErr === undefined) {
+    await until(() => (backend.sessions.length > sessionIdx && !!backend.sessions[sessionIdx]?.queries.some((q) => q.startsWith('START_REPLICATION'))) || fatalErr !== undefined)
+    if (fatalErr !== undefined) break
+    backend.sessions[sessionIdx]!.dx.push(frame('c', Buffer.alloc(0)))
+    sessionIdx++
+  }
+
+  expect(fatalCount).toBe(1)
+  expect(calls.map((c) => c.attempt)).toEqual([1, 2, 3, 4])
+  expect(calls.every((c) => !(c.err instanceof SlotInvalidatedError))).toBe(true)
+  const sessionsAtFatal = backend.sessions.length
+  await Bun.sleep(50)
+  expect(backend.sessions.length).toBe(sessionsAtFatal)
+  await handle.stop()
+})
