@@ -245,7 +245,6 @@ export function replicate(opts: ReplicateOptions): ReplicateHandle {
   let repl: ReplicationConnection | null = null
   let current: Promise<unknown> | null = null // the in-flight backfill or handler promise, awaited by stop()
   let pendingAckLsn: string | null = null // a done:true batch's endLsn once its handler resolves, until acked
-  let walSenderTimeoutMs: number | null = null // read once per connect; derives statusIntervalMs/receiveTimeoutMs and the wst=0 keepAlive fallback below
   let stopPromise: Promise<void> | null = null
   let sawSlot = false // absent on the FIRST observation creates the durable slot; absent on any LATER one invalidates it
   let lastSystemId: string | null = null // persisted across connects; a durable slot's systemId/timeline must never move under it
@@ -285,7 +284,7 @@ export function replicate(opts: ReplicateOptions): ReplicateHandle {
         // command() during an active stream throws ReplicationBusy, so every catalog query and all slot administration must precede start().
         const wst = await repl.command("select setting::int from pg_settings where name = 'wal_sender_timeout'")
         const raw = wst.rows[0]?.[0]
-        walSenderTimeoutMs = raw == null ? null : Number(raw)
+        const walSenderTimeoutMs = raw == null ? null : Number(raw) // read once per connect; derives statusIntervalMs/receiveTimeoutMs and the wst=0 keepAlive fallback below
         if (stopping) throw STOP
 
         // wst = 0 means this connection needs keepAlive, but the setting is only readable after
