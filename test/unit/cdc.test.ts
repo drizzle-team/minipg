@@ -2229,3 +2229,39 @@ test('cdc a fresh session mints a fresh suffix on the same prefix', async () => 
     await handle.stop()
   }
 })
+
+test('cdc ready resolves once the server accepts START_REPLICATION', async () => {
+  const backend = cdcBackend()
+  let transactions = 0
+  const handle = replicate({
+    url: cfg({ socket: backend.socket }),
+    slot: 'temporary',
+    publications: ['pub'],
+    backfill: async () => {},
+    onTransaction: () => { transactions++ },
+  })
+  await handle.ready
+  expect(backend.latest!.queries.some((q) => q.startsWith('START_REPLICATION'))).toBe(true)
+  expect(transactions).toBe(0)
+  await handle.stop()
+})
+
+test('cdc ready rejects with the first attempt error, before the retry budget is touched', async () => {
+  const backend = cdcBackend({
+    onQuery: (sql, session) => sql.includes('wal_sender_timeout') && session === 0 ? [errFrame('57P01', 'boom'), ready()] : undefined,
+  })
+  let fatalErr: Error | undefined
+  const handle = replicate({
+    url: cfg({ socket: backend.socket }),
+    slot: 'temporary',
+    publications: ['pub'],
+    backfill: async () => {},
+    onTransaction: () => {},
+    retryDelayMs: () => 50,
+    onFatalError: (err) => { fatalErr = err },
+  })
+  await expect(handle.ready).rejects.toBeInstanceOf(PgError)
+  await expect(handle.ready).rejects.toHaveProperty('code', '57P01')
+  expect(fatalErr).toBeUndefined() // proves the rejection came from the first attempt, not budget exhaustion
+  await handle.stop()
+})

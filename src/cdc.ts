@@ -110,6 +110,11 @@ export interface ReplicateHandle {
   /** Idempotent: the second call returns the first call's promise. Settles in-flight work, acks
    *  what completed, closes the session, and resolves — never fires `onFatalError`. */
   stop(): Promise<void>
+  /** Settles once the first connect attempt settles: resolves when the server accepts
+   *  `START_REPLICATION`, rejects with that attempt's error (or with a stop-before-connect error
+   *  if `stop()` lands first). Later reconnects never re-settle it — a settled promise ignores
+   *  further resolve/reject calls. Ignoring it is safe; nothing needs to await it. */
+  ready: Promise<void>
 }
 
 /** A durable-slot health check failed on connect — see {@link ReplicateOptions.slot}'s `{ name }`
@@ -302,6 +307,12 @@ export function replicate(opts: ReplicateOptions): ReplicateHandle {
   let lastSystemId: string | null = null // persisted across connects; a durable slot's systemId/timeline must never move under it
   let lastTimeline: number | null = null
   let derivedKeepAlive = false // true once a connect measures wal_sender_timeout = 0 and the consumer didn't set their own keepAlive
+  let resolveReady!: () => void
+  let rejectReady!: (err: Error) => void; const ready = new Promise<void>((res, rej) => { resolveReady = res; rejectReady = rej })
+  // run() is a floating promise, so an unawaited ready would otherwise surface an unhandled
+  // rejection the moment the first connect fails. Attaching a reaction here marks it handled
+  // forever without affecting what a consumer who DOES await it sees.
+  ready.catch(() => {})
   const durableName = typeof opts.slot === 'string' || !('name' in opts.slot) ? null : opts.slot.name // captured once, after the synchronous validation above — a later mutation of opts.slot.name is unobservable
   const tempPrefix = typeof opts.slot !== 'string' && !('name' in opts.slot) ? (opts.slot.prefix ?? 'minipg_cdc') : 'minipg_cdc' // captured once, alongside durableName, for the same reason
   const consumerSetKeepAlive = typeof opts.url !== 'string' && opts.url.keepAlive !== undefined
@@ -322,6 +333,7 @@ export function replicate(opts: ReplicateOptions): ReplicateHandle {
   function fireFatal(err: Error): void {
     if (fatalFired) return
     fatalFired = true
+    rejectReady(err) // covers the give-up paths that return without throwing, where the outer catch below never runs
     repl?.end()
     // Also removed here — doStop() is the only other place this runs, so a handle that dies fatally never leaks the listener on a long-lived shared signal.
     opts.signal?.removeEventListener('abort', onConsumerAbort)
@@ -507,6 +519,7 @@ export function replicate(opts: ReplicateOptions): ReplicateHandle {
           hydrateToast: opts.hydrateToast,
           idleAck: opts.idleAck,
           onWarning: (w) => deliverWarning(opts.onWarning, w),
+          onReady: resolveReady,
         })
 
         for await (const batch of batchTransactions(stream, { maxEvents: opts.maxTransactionEvents })) {
@@ -553,6 +566,7 @@ export function replicate(opts: ReplicateOptions): ReplicateHandle {
         const err: Error = durableName !== null && rawErr instanceof PgError && rawErr.code === '42704'
           ? new SlotInvalidatedError(durableName, 'absent')
           : (rawErr as Error)
+        rejectReady(err) // a no-op once ready has settled — only a first-connect failure answers promptly here
         // The 42704 remap above manufactures a SlotInvalidatedError on a dead connection, so it
         // can't be handled in place like the durable block's own catch does — letting it fall
         // through here lets the next connect's health check see the absence and recreate it.
@@ -575,6 +589,7 @@ export function replicate(opts: ReplicateOptions): ReplicateHandle {
 
   async function doStop(): Promise<void> {
     stopping = true
+    rejectReady(new Error('minipg: replicate() stopped before the first connect opened a stream'))
     opts.signal?.removeEventListener('abort', onConsumerAbort)
     if (handling) {
       // Await the handler's promise FIRST and ack what it completed before aborting — aborting
@@ -599,5 +614,5 @@ export function replicate(opts: ReplicateOptions): ReplicateHandle {
   // it, and would otherwise reject this floating promise and kill the process outside fireFatal's teardown.
   Promise.resolve().then(run).catch((e) => fireFatal(e as Error))
 
-  return { stop }
+  return { stop, ready }
 }
