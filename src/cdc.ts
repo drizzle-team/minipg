@@ -274,6 +274,13 @@ export function replicate(opts: ReplicateOptions): ReplicateHandle {
     try { opts.onFatalError(err) } catch (e) { console.error('minipg: onFatalError callback threw', e) }
   }
 
+  // current is non-null exactly while p is pending, so doStop() can await the in-flight
+  // onResume/backfill/onTransaction call and ack whatever it completes.
+  async function track(p: Promise<unknown>): Promise<void> {
+    current = p
+    try { await p } finally { current = null }
+  }
+
   async function run(): Promise<void> {
     if (stopping) return
     while (true) { // one iteration = one session: S1 connecting through S4/S5, or a failure into S6
@@ -354,9 +361,7 @@ export function replicate(opts: ReplicateOptions): ReplicateHandle {
           slotForStream = name
           if (opts.onResume) {
             // A throw here routes through retryDelayMs exactly like a backfill throw — it shares this try block's outer catch.
-            const p = Promise.resolve(opts.onResume(resumed))
-            current = p
-            try { await p } finally { current = null }
+            await track(Promise.resolve(opts.onResume(resumed)))
           }
         } else {
           const created = await repl.createSlot(name, { temporary: !isDurable, snapshot: 'export' })
@@ -383,14 +388,10 @@ export function replicate(opts: ReplicateOptions): ReplicateHandle {
             while (true) {
               try {
                 // ZERO commands run on this connection inside the window — the next thing sent on success is START_REPLICATION.
-                const p = Promise.resolve(opts.backfill?.({ snapshot: created.snapshot, streamStartLsn: created.consistentPoint, isReconnect, signal: window.signal }))
-                current = p
-                await p
-                current = null
+                await track(Promise.resolve(opts.backfill?.({ snapshot: created.snapshot, streamStartLsn: created.consistentPoint, isReconnect, signal: window.signal })))
                 window.signal.throwIfAborted() // a backfill that ignored the signal still fails the window
                 break
               } catch (backfillErr) {
-                current = null
                 // Identified by the window's own abort reason, never message text — the one throw
                 // that skips retry-in-place and goes straight to onFatalError, since a partial backfill is never usable.
                 if (window.signal.reason instanceof BackfillTimeoutError) throw window.signal.reason
@@ -435,13 +436,9 @@ export function replicate(opts: ReplicateOptions): ReplicateHandle {
           // (PostgreSQL BUG #18754: a second START_REPLICATION here delivers nothing, forever). Escalates only via budget exhaustion (fireFatal) or the handler resolving.
           while (true) {
             try {
-              const p = Promise.resolve(opts.onTransaction(batch))
-              current = p
-              await p
-              current = null
+              await track(Promise.resolve(opts.onTransaction(batch)))
               break
             } catch (handlerErr) {
-              current = null
               if (stopping) throw STOP
               attempt++
               const delay = effectiveRetryDelayMs(attempt, handlerErr as Error)
