@@ -1140,6 +1140,106 @@ describe('replication()', () => {
     })
   }, 20_000)
 
+  test('cdc onResume recreate verdict: drops and recreates the durable slot with a fresh exported snapshot', async () => {
+    await withConn(async (c) => {
+      await c.query(`create table ${K}_verd(id int4 primary key)`)
+      await c.query(`create publication ${K}_verdpub for table ${K}_verd`)
+      const slotName = `${K}_verdslot`
+      try {
+        // Run 1: create the durable slot for real and ack past insert 1 — the durable progress a
+        // long-running process resumes from.
+        let resolveSlotCreated: (() => void) | undefined
+        const slotCreated = new Promise<void>((resolve) => { resolveSlotCreated = resolve })
+        let resolveFirst: (() => void) | undefined
+        const firstStreamed = new Promise<void>((resolve) => { resolveFirst = resolve })
+        const handle1 = replicate({
+          url: TEST_CONFIG,
+          slot: { name: slotName },
+          publications: [`${K}_verdpub`],
+          backfill: async () => { resolveSlotCreated?.() },
+          onTransaction: (batch) => {
+            if (!batch.done) return
+            if (batch.events.some((e) => e.kind === 'insert' && (e as Extract<ReplicationEvent, { kind: 'insert' }>).new.id === 1)) resolveFirst?.()
+          },
+        })
+        try {
+          await slotCreated // the slot must exist before the insert, or it lands before the slot's restart point
+          await c.query(`insert into ${K}_verd values (1)`)
+          await Promise.race([
+            firstStreamed,
+            Bun.sleep(10_000).then(() => { throw new Error('timed out waiting for the first insert to stream') }),
+          ])
+        } finally { await handle1.stop() }
+
+        // The real pre-recreate position — the verdict must have been judged against this, not
+        // some value the driver invents.
+        const flushRow = await c.query(`select confirmed_flush_lsn from pg_replication_slots where slot_name = '${slotName}'`)
+        const confirmedFlushBefore = (flushRow.rows[0] as unknown[])[0] as string
+
+        // Run 2: onResume answers 'recreate' once — this is the one server behavior worth a live
+        // proof: drop, create with an exported snapshot, adopt it, then stream.
+        let onResumeCalls = 0
+        const resumeInfos: { confirmedFlush: string; restartLsn: string }[] = []
+        let backfillCallsRun2 = 0
+        let lastBackfillIsReconnect: boolean | undefined
+        let resolveRebuilt: (() => void) | undefined
+        const rebuilt = new Promise<void>((resolve) => { resolveRebuilt = resolve })
+        let resolveSecond: (() => void) | undefined
+        const secondStreamed = new Promise<void>((resolve) => { resolveSecond = resolve })
+        const handle2 = replicate({
+          url: TEST_CONFIG,
+          slot: { name: slotName },
+          publications: [`${K}_verdpub`],
+          onResume: (info) => {
+            onResumeCalls++
+            resumeInfos.push(info)
+            return onResumeCalls === 1 ? 'recreate' : undefined
+          },
+          backfill: async (info) => {
+            backfillCallsRun2++
+            lastBackfillIsReconnect = info.isReconnect
+            resolveRebuilt?.()
+          },
+          onTransaction: (batch) => {
+            if (!batch.done) return
+            if (batch.events.some((e) => e.kind === 'insert' && (e as Extract<ReplicationEvent, { kind: 'insert' }>).new.id === 2)) resolveSecond?.()
+          },
+        })
+        try {
+          await Promise.race([
+            rebuilt,
+            Bun.sleep(10_000).then(() => { throw new Error('timed out waiting for the recreate to rebuild the slot') }),
+          ])
+          // backfill firing at all — a plain resume never calls it — is the proof the drop and
+          // create really happened on the server, and the snapshot it consumed came from the
+          // fresh slot.
+          expect(backfillCallsRun2).toBe(1)
+          expect(lastBackfillIsReconnect).toBe(true)
+          expect(resumeInfos[0]?.confirmedFlush).toBe(confirmedFlushBefore)
+
+          await c.query(`insert into ${K}_verd values (2)`)
+          await Promise.race([
+            secondStreamed,
+            Bun.sleep(15_000).then(() => { throw new Error('timed out waiting for the second insert to stream after recreate') }),
+          ])
+          // The recreated slot takes the create path on the same connect — no second resume
+          // happens within run 2.
+          expect(onResumeCalls).toBe(1)
+        } finally { await handle2.stop() }
+      } finally {
+        // No step here may be skipped because an earlier one threw — a leaked slot or
+        // publication poisons every later run on this cluster.
+        try {
+          const r = await replication(TEST_CONFIG)
+          try { await r.dropSlot(slotName) } catch { /* a mid-test failure can leave no slot; 42704 must never skip the drops below */ } finally { r.end() }
+        } finally {
+          try { await c.query(`drop publication ${K}_verdpub`) }
+          finally { await c.query(`drop table ${K}_verd`) }
+        }
+      }
+    })
+  }, 20_000)
+
   // A fixed 60s receiveTimeoutMs false-fires a healthy idle stream at ~70s, measured: the server
   // pings only once the client has been silent for wal_sender_timeout/2, and a 10s status cadence
   // keeps resetting that clock, so no keepalive ever arrives. The window here can't
