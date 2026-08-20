@@ -376,8 +376,9 @@ export function replicate(opts: ReplicateOptions): ReplicateHandle {
           controller.signal.addEventListener('abort', onWindowAbort, { once: true })
           const deadline = opts.backfillTimeoutMs
             ? setTimeout(() => {
-                window.abort(new BackfillTimeoutError(opts.backfillTimeoutMs!))
-                deliverWarning(opts.onWarning, { kind: 'backfill-timeout', ms: opts.backfillTimeoutMs!, message: `minipg: backfill did not resolve within ${opts.backfillTimeoutMs}ms (backfillTimeoutMs) — the session is abandoned` })
+                const err = new BackfillTimeoutError(opts.backfillTimeoutMs!)
+                window.abort(err)
+                deliverWarning(opts.onWarning, { kind: 'backfill-timeout', ms: err.ms, message: err.message })
               }, opts.backfillTimeoutMs)
             : undefined
           const isReconnect = !firstBackfill
