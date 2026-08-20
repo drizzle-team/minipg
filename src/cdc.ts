@@ -5,10 +5,6 @@ import { randomBytes } from 'node:crypto'
 // replicate() is a consumer of the raw replication() API: it owns the reconnect loop, slot
 // lifecycle, backfill window, and ack-on-handler-resolve.
 
-/** One session's lifecycle stage, tracked on the handle's own closure so two concurrent
- *  replicate() calls never share state. */
-type SessionState = 'idle' | 'connecting' | 'preparing' | 'backfilling' | 'streaming' | 'handling' | 'backoff' | 'stopped' | 'dead'
-
 export interface ReplicateOptions {
   /** Connection target, forwarded verbatim to replication() on every (re)connect — a string, or
    *  the same config object replication() accepts. */
@@ -236,8 +232,8 @@ export function replicate(opts: ReplicateOptions): ReplicateHandle {
     throw new RangeError(`minipg: backfillTimeoutMs must be a positive number when set (omit it entirely for unbounded) — got ${opts.backfillTimeoutMs}`)
   }
 
-  let state: SessionState = 'idle'
   let stopping = false
+  let handling = false // true only while onTransaction's promise for the current batch is pending — doStop() reads this to pick its teardown order
   let fatalFired = false // onFatalError's own guard — S8 must never fire it twice
   let firstBackfill = true
   let attempt = 0 // shared by S6 (reconnect) and the in-place handler retry — one shared budget for both
@@ -267,7 +263,6 @@ export function replicate(opts: ReplicateOptions): ReplicateHandle {
     if (fatalFired) return
     fatalFired = true
     repl?.end()
-    state = 'dead'
     // Also removed here — doStop() is the only other place this runs, so a handle that dies fatally never leaks the listener on a long-lived shared signal.
     opts.signal?.removeEventListener('abort', onConsumerAbort)
     if (!opts.onFatalError) { console.error('minipg: replicate() session ended fatally with no onFatalError callback wired up —', err); return }
@@ -276,28 +271,24 @@ export function replicate(opts: ReplicateOptions): ReplicateHandle {
   }
 
   async function run(): Promise<void> {
-    if (stopping) { state = 'stopped'; return }
+    if (stopping) return
     while (true) { // one iteration = one session: S1 connecting through S4/S5, or a failure into S6
       try {
-        state = 'connecting'
         repl = await replication(withDerivedKeepAlive(opts.url, derivedKeepAlive))
-        if (stopping) { repl.end(); state = 'stopped'; return }
+        if (stopping) { repl.end(); return }
 
-        state = 'preparing'
         // command() during an active stream throws ReplicationBusy, so every catalog query and all slot administration must precede start().
         const wst = await repl.command("select setting::int from pg_settings where name = 'wal_sender_timeout'")
         const raw = wst.rows[0]?.[0]
         walSenderTimeoutMs = raw == null ? null : Number(raw)
-        if (stopping) { repl.end(); state = 'stopped'; return }
+        if (stopping) { repl.end(); return }
 
         // wst = 0 means this connection needs keepAlive, but the setting is only readable after
         // the socket exists — reconnect once now (nothing administered yet to unwind); derivedKeepAlive flips below so this can't fire twice.
         if (walSenderTimeoutMs === 0 && !consumerSetKeepAlive && !derivedKeepAlive) {
           repl.end()
-          state = 'connecting'
           repl = await replication(withDerivedKeepAlive(opts.url, true))
-          if (stopping) { repl.end(); state = 'stopped'; return }
-          state = 'preparing'
+          if (stopping) { repl.end(); return }
         }
 
         // Both timers derive from the server's own wal_sender_timeout rather than fixed constants:
@@ -328,12 +319,12 @@ export function replicate(opts: ReplicateOptions): ReplicateHandle {
           }
           lastSystemId = identity.systemId
           lastTimeline = identity.timeline
-          if (stopping) { repl.end(); state = 'stopped'; return }
+          if (stopping) { repl.end(); return }
 
           let evictions = 0 // caps S2 -> S2 rounds: two 'evict'-configured consumers pointed at the same slot must not terminate each other forever
           while (true) { // S2 -> S2 on eviction: re-reads the row over the SAME connection, no reconnect, bounded only by evictAndAwaitClear's own ~3s deadline
             const row = await readSlotHealth(repl, name)
-            if (stopping) { repl.end(); state = 'stopped'; return }
+            if (stopping) { repl.end(); return }
             if (!row) {
               if (!sawSlot) break // first observation ever: fall through to createSlot below
               throw new SlotInvalidatedError(name, 'absent') // was there, now gone — never silently recreated
@@ -345,14 +336,14 @@ export function replicate(opts: ReplicateOptions): ReplicateHandle {
               // A holder who keeps re-acquiring after eviction never heals by retrying — cap the rounds instead of terminating backends in an unbounded ping-pong.
               if (opts.onSlotBusy !== 'evict' || ++evictions > 3) throw new SlotBusyError(name, Number(row.active_pid))
               await evictAndAwaitClear(repl, name, Number(row.active_pid), opts, controller.signal)
-              if (stopping) { repl.end(); state = 'stopped'; return }
+              if (stopping) { repl.end(); return }
               continue
             }
             resumed = { confirmedFlush: row.confirmed_flush_lsn, restartLsn: row.restart_lsn! }
             break
           }
         }
-        if (stopping) { repl.end(); state = 'stopped'; return }
+        if (stopping) { repl.end(); return }
 
         let slotForStream: string
         if (resumed) {
@@ -369,9 +360,8 @@ export function replicate(opts: ReplicateOptions): ReplicateHandle {
           slotForStream = created.slot
           // stop() landing here still leaves the temporary slot dying with the connection, and a
           // durable name as-is — never a compensating dropSlot, the silent data-loss recreate this layer refuses.
-          if (stopping) { repl.end(); state = 'stopped'; return }
+          if (stopping) { repl.end(); return }
 
-          state = 'backfilling'
           const window = new AbortController()
           const onWindowAbort = (): void => window.abort()
           controller.signal.addEventListener('abort', onWindowAbort, { once: true })
@@ -400,13 +390,13 @@ export function replicate(opts: ReplicateOptions): ReplicateHandle {
                 // Identified by the window's own abort reason, never message text — the one throw
                 // that skips retry-in-place and goes straight to onFatalError, since a partial backfill is never usable.
                 if (window.signal.reason instanceof BackfillTimeoutError) throw window.signal.reason
-                if (stopping) { repl.end(); state = 'stopped'; return }
+                if (stopping) { repl.end(); return }
                 attempt++
                 const delay = effectiveRetryDelayMs(attempt, backfillErr as Error)
                 if (delay == null) { fireFatal(backfillErr as Error); return }
                 deliverWarning(opts.onWarning, { kind: 'reconnect-attempt', attempt, delayMs: delay, message: `minipg: backfill threw (${(backfillErr as Error).message}) — retrying the same snapshot in place in ${delay}ms (attempt ${attempt})` })
                 await sleep(delay, controller.signal)
-                if (stopping) { repl.end(); state = 'stopped'; return }
+                if (stopping) { repl.end(); return }
               }
             }
           } finally {
@@ -415,7 +405,6 @@ export function replicate(opts: ReplicateOptions): ReplicateHandle {
           }
         }
 
-        state = 'streaming'
         const stream = repl.start({
           slot: slotForStream,
           publications: opts.publications,
@@ -434,8 +423,8 @@ export function replicate(opts: ReplicateOptions): ReplicateHandle {
         for await (const batch of batchTransactions(stream, { maxEvents: opts.maxTransactionEvents })) {
           // next() drains its queue before honoring `ended` (replication.ts), so a fast producer
           // can leave several transactions buffered when stop() resolves — this keeps them from reaching onTransaction.
-          if (stopping) { repl.end(); state = 'stopped'; return }
-          state = 'handling'
+          if (stopping) { repl.end(); return }
+          handling = true
           pendingAckLsn = batch.done ? batch.endLsn : null // done:false carries no commit fields — nothing to ack
 
           // A handler throw retries the SAME batch in place, zero commands, zero reconnects
@@ -449,13 +438,13 @@ export function replicate(opts: ReplicateOptions): ReplicateHandle {
               break
             } catch (handlerErr) {
               current = null
-              if (stopping) { repl.end(); state = 'stopped'; return }
+              if (stopping) { repl.end(); return }
               attempt++
               const delay = effectiveRetryDelayMs(attempt, handlerErr as Error)
               if (delay == null) { fireFatal(handlerErr as Error); return }
               deliverWarning(opts.onWarning, { kind: 'reconnect-attempt', attempt, delayMs: delay, message: `minipg: onTransaction threw (${(handlerErr as Error).message}) — retrying the same batch in place in ${delay}ms (attempt ${attempt})` })
               await sleep(delay, controller.signal)
-              if (stopping) { repl.end(); state = 'stopped'; return }
+              if (stopping) { repl.end(); return }
             }
           }
 
@@ -464,17 +453,16 @@ export function replicate(opts: ReplicateOptions): ReplicateHandle {
             pendingAckLsn = null
             attempt = 0 // the ONLY reset site: the budget resets on ACKED progress, never on delivery
           }
-          state = 'streaming'
+          handling = false
         }
 
-        state = 'stopped'
         repl.end()
         return
       } catch (rawErr) {
         // A server CopyDone lands here exactly like a dead socket — the walsender accepts exactly
         // one START_REPLICATION per connection (BUG #18754), so both trigger the same full reconnect.
         repl?.end()
-        if (stopping) { state = 'stopped'; return }
+        if (stopping) return
         // 42704 belongs to slot ACQUISITION (e.g. start() racing a manual drop), never to
         // pg_terminate_backend — 'already gone' from that path is a plain 'f' row inside evictAndAwaitClear.
         const err: Error = durableName !== null && rawErr instanceof PgError && rawErr.code === '42704'
@@ -484,10 +472,9 @@ export function replicate(opts: ReplicateOptions): ReplicateHandle {
         attempt++
         const delay = effectiveRetryDelayMs(attempt, err)
         if (delay == null) { fireFatal(err); return }
-        state = 'backoff'
         deliverWarning(opts.onWarning, { kind: 'reconnect-attempt', attempt, delayMs: delay, message: `minipg: session failed (${err.message}) — reconnecting in ${delay}ms (attempt ${attempt})` })
         await sleep(delay, controller.signal)
-        if (stopping) { state = 'stopped'; return }
+        if (stopping) return
         // loop back to S1 for a fresh session
       }
     }
@@ -501,7 +488,7 @@ export function replicate(opts: ReplicateOptions): ReplicateHandle {
   async function doStop(): Promise<void> {
     stopping = true
     opts.signal?.removeEventListener('abort', onConsumerAbort)
-    if (state === 'handling') {
+    if (handling) {
       // Await the handler's promise FIRST and ack what it completed before aborting — aborting
       // first reaches start()'s onAbort, which end()s the socket immediately and a socket being torn down can't carry the ack out.
       if (current) {
@@ -518,7 +505,6 @@ export function replicate(opts: ReplicateOptions): ReplicateHandle {
       if (current) { try { await current } catch { /* run()'s own catch handles a rejected backfill */ } }
     }
     repl?.end()
-    state = 'stopped'
   }
 
   // retryDelayMs runs inside run()'s own catch blocks — a throw there has nothing left to catch
