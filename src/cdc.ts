@@ -252,7 +252,6 @@ export function replicate(opts: ReplicateOptions): ReplicateHandle {
   let derivedKeepAlive = false // true once a connect measures wal_sender_timeout = 0 and the consumer didn't set their own keepAlive
   const durableName = typeof opts.slot === 'string' ? null : opts.slot.name // captured once, after the synchronous validation above — a later mutation of opts.slot.name is unobservable
   const consumerSetKeepAlive = typeof opts.url !== 'string' && opts.url.keepAlive !== undefined
-  const consumerKeepAliveValue = typeof opts.url !== 'string' ? opts.url.keepAlive : undefined
   const controller = new AbortController() // internal signal: reaches start()'s own signal, so stop() wakes a parked next()
   const effectiveRetryDelayMs = opts.retryDelayMs ?? defaultRetryDelayMs
   // The consumer's own signal behaves exactly like calling stop() — same teardown, same
@@ -311,7 +310,7 @@ export function replicate(opts: ReplicateOptions): ReplicateHandle {
           // Only true when the layer itself turns keepAlive on (derivedKeepAlive above) — a consumer who pinned keepAlive: false gets nothing enabled, and the warning says that plainly.
           const message = !consumerSetKeepAlive
             ? "minipg: the server's wal_sender_timeout is 0 (disabled) — it will never ping this connection, so receiveTimeoutMs is left off and keepAlive is enabled instead"
-            : consumerKeepAliveValue
+            : typeof opts.url !== 'string' && opts.url.keepAlive
               ? "minipg: the server's wal_sender_timeout is 0 (disabled) — it will never ping this connection, so receiveTimeoutMs is left off; keepAlive is already enabled on this connection"
               : "minipg: the server's wal_sender_timeout is 0 (disabled) — it will never ping this connection, receiveTimeoutMs is left off, and keepAlive is explicitly disabled on this connection: there is no liveness detection at all"
           deliverWarning(opts.onWarning, { kind: 'wal-sender-timeout-disabled', message })
