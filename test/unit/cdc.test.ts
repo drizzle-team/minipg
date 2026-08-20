@@ -2114,3 +2114,118 @@ test('cdc a temporary slot with a prefix names itself <prefix>_<hex>, still TEMP
     await handle.stop()
   }
 })
+
+test('cdc bare slot: "temporary" still names itself minipg_cdc_<hex>', async () => {
+  const backend = cdcBackend()
+  const handle = replicate({
+    url: cfg({ socket: backend.socket }),
+    slot: 'temporary',
+    publications: ['pub'],
+    backfill: async () => {},
+    onTransaction: () => {},
+  })
+  try {
+    await until(() => !!backend.latest?.queries.some((q) => q.startsWith('START_REPLICATION')))
+    const createQuery = backend.latest!.queries.find((q) => q.startsWith('CREATE_REPLICATION_SLOT'))
+    expect(createQuery).toMatch(/^CREATE_REPLICATION_SLOT minipg_cdc_[0-9a-f]{8} TEMPORARY/)
+  } finally {
+    await handle.stop()
+  }
+})
+
+test('cdc slot: { temporary: true } with no prefix also names itself minipg_cdc_<hex>', async () => {
+  const backend = cdcBackend()
+  const handle = replicate({
+    url: cfg({ socket: backend.socket }),
+    slot: { temporary: true },
+    publications: ['pub'],
+    backfill: async () => {},
+    onTransaction: () => {},
+  })
+  try {
+    await until(() => !!backend.latest?.queries.some((q) => q.startsWith('START_REPLICATION')))
+    const createQuery = backend.latest!.queries.find((q) => q.startsWith('CREATE_REPLICATION_SLOT'))
+    expect(createQuery).toMatch(/^CREATE_REPLICATION_SLOT minipg_cdc_[0-9a-f]{8} TEMPORARY/)
+  } finally {
+    await handle.stop()
+  }
+})
+
+test('cdc a 54-character prefix is accepted, a 55-character one throws synchronously, and so does an empty one', async () => {
+  const okBackend = cdcBackend()
+  const okPrefix = 'a'.repeat(54)
+  const handle = replicate({
+    url: cfg({ socket: okBackend.socket }),
+    slot: { temporary: true, prefix: okPrefix },
+    publications: ['pub'],
+    backfill: async () => {},
+    onTransaction: () => {},
+  })
+  try {
+    await until(() => !!okBackend.latest?.queries.some((q) => q.startsWith('START_REPLICATION')))
+    const createQuery = okBackend.latest!.queries.find((q) => q.startsWith('CREATE_REPLICATION_SLOT'))
+    const name = createQuery!.split(' ')[1]!
+    expect(name.length).toBe(63) // 54 + '_' + 8 hex
+  } finally {
+    await handle.stop()
+  }
+
+  const tooLongBackend = cdcBackend()
+  expect(() => replicate({
+    url: cfg({ socket: tooLongBackend.socket }),
+    slot: { temporary: true, prefix: 'a'.repeat(55) },
+    publications: ['pub'],
+    backfill: async () => {},
+    onTransaction: () => {},
+    // deliberately no onFatalError — the whole point is that this must not need one
+  })).toThrow(InvalidSlotName)
+  expect(tooLongBackend.sessions.length).toBe(0)
+
+  const emptyBackend = cdcBackend()
+  expect(() => replicate({
+    url: cfg({ socket: emptyBackend.socket }),
+    slot: { temporary: true, prefix: '' },
+    publications: ['pub'],
+    backfill: async () => {},
+    onTransaction: () => {},
+    // deliberately no onFatalError — the whole point is that this must not need one
+  })).toThrow(InvalidSlotName)
+  expect(emptyBackend.sessions.length).toBe(0)
+})
+
+test('cdc a prefix with a character outside [a-z0-9_] throws synchronously', () => {
+  const backend = cdcBackend()
+  expect(() => replicate({
+    url: cfg({ socket: backend.socket }),
+    slot: { temporary: true, prefix: 'Bad-Name' },
+    publications: ['pub'],
+    backfill: async () => {},
+    onTransaction: () => {},
+    // deliberately no onFatalError — the whole point is that this must not need one
+  })).toThrow(InvalidSlotName)
+  expect(backend.sessions.length).toBe(0)
+})
+
+test('cdc a fresh session mints a fresh suffix on the same prefix', async () => {
+  const backend = cdcBackend()
+  const handle = replicate({
+    url: cfg({ socket: backend.socket }),
+    slot: { temporary: true, prefix: 'myproc' },
+    publications: ['pub'],
+    backfill: async () => {},
+    onTransaction: () => {},
+    retryDelayMs: () => 1,
+  })
+  try {
+    await until(() => !!backend.sessions[0]?.queries.some((q) => q.startsWith('START_REPLICATION')))
+    backend.sessions[0]!.dx.destroy()
+    await until(() => !!backend.sessions[1]?.queries.some((q) => q.startsWith('START_REPLICATION')))
+    const name0 = backend.sessions[0]!.queries.find((q) => q.startsWith('CREATE_REPLICATION_SLOT'))!.split(' ')[1]!
+    const name1 = backend.sessions[1]!.queries.find((q) => q.startsWith('CREATE_REPLICATION_SLOT'))!.split(' ')[1]!
+    expect(name0).toMatch(/^myproc_[0-9a-f]{8}$/)
+    expect(name1).toMatch(/^myproc_[0-9a-f]{8}$/)
+    expect(name0).not.toBe(name1)
+  } finally {
+    await handle.stop()
+  }
+})
