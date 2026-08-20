@@ -35,7 +35,9 @@ export interface ReplicateOptions {
    *  `22023`). Adopt it on your OWN connection inside `REPEATABLE READ` or `SERIALIZABLE` (else
    *  `0A000`). A throw retries IN PLACE on the same slot/snapshot; a
    *  {@link ReplicateOptions.backfillTimeoutMs} timeout instead goes straight to `onFatalError`,
-   *  no retry. */
+   *  no retry. `isReconnect` is false only on the handle's first connect ever — true on every
+   *  later connect and on any recreate, sharing its source with {@link ReplicateOptions.onResume}'s
+   *  own `isReconnect`, so the two always agree on which connect this is. */
   backfill?: (info: { snapshot: string; streamStartLsn: string; isReconnect: boolean; signal: AbortSignal }) => void | Promise<void>
   /** Abandon the session if `backfill` hasn't resolved within this many ms (omitted = unbounded).
    *  Fires {@link BackfillTimeoutError} straight to `onFatalError`, skipping the retry budget —
@@ -82,8 +84,10 @@ export interface ReplicateOptions {
    *  exported snapshot, firing `backfill` instead of resuming — for when the consumer's own
    *  durability check finds that resuming from `confirmedFlush` would skip commits it never
    *  recorded. Returning nothing resumes as normal. A throw still routes through `retryDelayMs`
-   *  like a backfill throw. */
-  onResume?: (info: { confirmedFlush: string; restartLsn: string }) => void | 'recreate' | Promise<void | 'recreate'>
+   *  like a backfill throw. `isReconnect` is false only on the handle's first connect ever, from
+   *  the same source `backfill`'s own `isReconnect` reads — the two always agree on which connect
+   *  this is. */
+  onResume?: (info: { confirmedFlush: string; restartLsn: string; isReconnect: boolean }) => void | 'recreate' | Promise<void | 'recreate'>
   /** Forwarded to `start()` unchanged; see `StartOptions.messages`. */
   messages?: boolean
   /** Forwarded to `start()` when set. Omitted defaults to `max(10_000, wal_sender_timeout * 0.75)`,
@@ -297,7 +301,7 @@ export function replicate(opts: ReplicateOptions): ReplicateHandle {
   let stopping = false
   let handling = false // true only while onTransaction's promise for the current batch is pending — doStop() reads this to pick its teardown order
   let fatalFired = false // onFatalError's own guard — S8 must never fire it twice
-  let firstBackfill = true
+  let sessions = 0 // incremented once per loop iteration below — the one shared source both backfill's and onResume's isReconnect derive from
   let attempt = 0 // shared by S6 (reconnect) and the in-place handler retry — one shared budget for both
   let repl: ReplicationConnection | null = null
   let current: Promise<unknown> | null = null // the in-flight backfill or handler promise, awaited by stop()
@@ -352,6 +356,7 @@ export function replicate(opts: ReplicateOptions): ReplicateHandle {
   async function run(): Promise<void> {
     if (stopping) return
     while (true) { // one iteration = one session: S1 connecting through S4/S5, or a failure into S6
+      sessions++
       try {
         repl = await replication(withDerivedKeepAlive(opts.url, derivedKeepAlive))
         if (stopping) throw STOP
@@ -435,7 +440,7 @@ export function replicate(opts: ReplicateOptions): ReplicateHandle {
 
         if (resumed && opts.onResume) {
           // A throw here routes through retryDelayMs exactly like a backfill throw — it shares this try block's outer catch.
-          const verdict = await track(Promise.resolve(opts.onResume(resumed)))
+          const verdict = await track(Promise.resolve(opts.onResume({ ...resumed, isReconnect: sessions > 1 })))
           if (verdict === 'recreate') {
             // A plain Error, deliberately not a SlotInvalidatedError — it must never re-enter
             // isPermanentFailure and turn a per-connect verdict into a terminal one.
@@ -451,7 +456,6 @@ export function replicate(opts: ReplicateOptions): ReplicateHandle {
           await sleep(delay, controller.signal)
           if (stopping) throw STOP
           await dropForRecreate(repl, name, controller.signal)
-          firstBackfill = false // a recreate on a handle's first connect must still report isReconnect: true
           if (stopping) throw STOP
         }
 
@@ -476,8 +480,7 @@ export function replicate(opts: ReplicateOptions): ReplicateHandle {
                 deliverWarning(opts.onWarning, { kind: 'backfill-timeout', ms: err.ms, message: err.message })
               }, opts.backfillTimeoutMs)
             : undefined
-          const isReconnect = !firstBackfill
-          firstBackfill = false
+          const isReconnect = sessions > 1 || recreate !== null
           try {
             // A non-timeout throw retries IN PLACE on the same slot/snapshot/window — the same
             // shape the handler retry below uses. The deadline bounds the whole window including retries: armed once, outside this loop.

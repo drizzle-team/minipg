@@ -1147,7 +1147,7 @@ test('cdc copydone: durable recovery reconnects without createSlot, snapshot, or
   const backend = cdcBackend() // default pg_replication_slots row is healthy: active 'f', confirmed_flush '0/10', restart '0/8'
   let backfillCalls = 0
   let queriesAtResume = -1
-  const resumeInfos: { confirmedFlush: string; restartLsn: string }[] = []
+  const resumeInfos: { confirmedFlush: string; restartLsn: string; isReconnect: boolean }[] = []
   const handle = replicate({
     url: cfg({ socket: backend.socket }),
     slot: { name: 'durable_resume' },
@@ -1164,7 +1164,7 @@ test('cdc copydone: durable recovery reconnects without createSlot, snapshot, or
   expect(s1.queries.some((q) => q.startsWith('CREATE_REPLICATION_SLOT'))).toBe(false)
   expect(s1.queries.some((q) => q.includes('pg_replication_slots'))).toBe(true)
   expect(resumeInfos.length).toBe(1)
-  expect(resumeInfos[0]).toEqual({ confirmedFlush: '0/10', restartLsn: '0/8' }) // the fake's row
+  expect(resumeInfos[0]).toEqual({ confirmedFlush: '0/10', restartLsn: '0/8', isReconnect: false }) // the fake's row
   const startIdx = s1.queries.findIndex((q) => q.startsWith('START_REPLICATION'))
   expect(startIdx).toBeGreaterThanOrEqual(queriesAtResume) // onResume ran BEFORE START_REPLICATION appears in queries
 
@@ -1185,6 +1185,8 @@ test('cdc copydone: durable recovery reconnects without createSlot, snapshot, or
   expect(s2.queries.some((q) => q.startsWith('START_REPLICATION'))).toBe(true)
   expect(backfillCalls).toBe(0)
   expect(resumeInfos.length).toBe(2) // onResume ran on BOTH sessions
+  expect(resumeInfos[0]!.isReconnect).toBe(false)
+  expect(resumeInfos[1]!.isReconnect).toBe(true) // a durable slot that only ever resumes never backfills — this is the only signal of a reconnect
 
   await handle.stop()
 })
@@ -2000,7 +2002,7 @@ test('cdc and raw slot-name validation reject and accept identically at every bo
 
 test('cdc onResume verdict: recreate drops the healthy slot and rebuilds from a fresh snapshot', async () => {
   const backend = cdcBackend() // default healthy row: active 'f', confirmed_flush '0/10', restart '0/8'
-  const resumeInfos: { confirmedFlush: string; restartLsn: string }[] = []
+  const resumeInfos: { confirmedFlush: string; restartLsn: string; isReconnect: boolean }[] = []
   const backfillInfos: { isReconnect: boolean }[] = []
   const calls: { attempt: number; err: Error }[] = []
   let onResumeCalls = 0
@@ -2040,7 +2042,7 @@ test('cdc onResume verdict: recreate drops the healthy slot and rebuilds from a 
   expect(verdictCalls.length).toBe(1)
   expect(verdictCalls[0]!.err).not.toBeInstanceOf(SlotInvalidatedError)
 
-  expect(resumeInfos[0]).toEqual({ confirmedFlush: '0/10', restartLsn: '0/8' }) // the fake's default row
+  expect(resumeInfos[0]).toEqual({ confirmedFlush: '0/10', restartLsn: '0/8', isReconnect: false }) // the fake's default row
 
   const relId = 40, commitLsn = 0x60n, endLsn = 0x70n
   s0.dx.push(pgBegin())
@@ -2349,4 +2351,56 @@ test('cdc stop() before the first connect rejects ready', async () => {
   await expect(handle.ready).rejects.toThrow('minipg: replicate() stopped before the first connect opened a stream')
   await stopPromise
   expect(socketCalls).toBe(0)
+})
+
+test('cdc onResume isReconnect: false on the first session, true on the second — a durable slot that only ever resumes never backfills', async () => {
+  const backend = cdcBackend() // default healthy row resumes every session, never creates
+  const seen: boolean[] = []
+  const handle = replicate({
+    url: cfg({ socket: backend.socket }),
+    slot: { name: 'durable_resume_only' },
+    publications: ['pub'],
+    backfill: async () => {},
+    onResume: async ({ isReconnect }) => { seen.push(isReconnect) },
+    onTransaction: () => {},
+    retryDelayMs: () => 1,
+  })
+  await until(() => !!backend.latest?.queries.some((q) => q.startsWith('START_REPLICATION')))
+  expect(seen).toEqual([false])
+
+  backend.latest!.dx.destroy()
+  await until(() => backend.sessions.length >= 2 && !!backend.latest?.queries.some((q) => q.startsWith('START_REPLICATION')))
+  expect(seen).toEqual([false, true]) // the per-backfill flag this replaces would have reported false forever here — backfill never runs on a resume-only slot
+
+  await handle.stop()
+})
+
+test('cdc backfill and onResume agree on the reconnect flag across a create-then-resume handle', async () => {
+  const backend = cdcBackend({
+    // Session 0: no row -> creates and backfills. Session 1: healthy row -> resumes.
+    onQuery: (sql, session) => sql.includes('pg_replication_slots')
+      ? (session === 0 ? [rowDesc(healthCols), ready()] : [rowDesc(healthCols), dataRow(['f', null, 'reserved', '0/10', '0/8']), ready()])
+      : undefined,
+  })
+  const backfillFlags: boolean[] = []
+  const resumeFlags: boolean[] = []
+  const handle = replicate({
+    url: cfg({ socket: backend.socket }),
+    slot: { name: 'durable_create_then_resume' },
+    publications: ['pub'],
+    backfill: async ({ isReconnect }) => { backfillFlags.push(isReconnect) },
+    onResume: async ({ isReconnect }) => { resumeFlags.push(isReconnect) },
+    onTransaction: () => {},
+    retryDelayMs: () => 1,
+  })
+  await until(() => !!backend.latest?.queries.some((q) => q.startsWith('START_REPLICATION')))
+  expect(backfillFlags).toEqual([false])
+  expect(resumeFlags).toEqual([])
+
+  backend.latest!.dx.destroy()
+  await until(() => backend.sessions.length >= 2 && !!backend.latest?.queries.some((q) => q.startsWith('START_REPLICATION')))
+  expect(backfillFlags).toEqual([false]) // unchanged — session 1 resumed, it never backfilled again
+  expect(resumeFlags).toEqual([true]) // the same connect index (session 1) that backfill would have called a reconnect too
+
+  await handle.stop()
 })
