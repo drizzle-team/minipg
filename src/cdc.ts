@@ -250,8 +250,7 @@ export function replicate(opts: ReplicateOptions): ReplicateHandle {
   let lastSystemId: string | null = null // persisted across connects; a durable slot's systemId/timeline must never move under it
   let lastTimeline: number | null = null
   let derivedKeepAlive = false // true once a connect measures wal_sender_timeout = 0 and the consumer didn't set their own keepAlive
-  let currentSlotName: string | null = null // durable-session bookkeeping for the catch block's 42704 -> SlotInvalidatedError mapping below
-  let currentIsDurable = false
+  const durableName = typeof opts.slot === 'string' ? null : opts.slot.name // captured once, after the synchronous validation above — a later mutation of opts.slot.name is unobservable
   const consumerSetKeepAlive = typeof opts.url !== 'string' && opts.url.keepAlive !== undefined
   const consumerKeepAliveValue = typeof opts.url !== 'string' ? opts.url.keepAlive : undefined
   const controller = new AbortController() // internal signal: reaches start()'s own signal, so stop() wakes a parked next()
@@ -279,8 +278,6 @@ export function replicate(opts: ReplicateOptions): ReplicateHandle {
   async function run(): Promise<void> {
     if (stopping) { state = 'stopped'; return }
     while (true) { // one iteration = one session: S1 connecting through S4/S5, or a failure into S6
-      currentIsDurable = false // reset every iteration — stale from a prior session must never drive the 42704 mapping below
-      currentSlotName = null
       try {
         state = 'connecting'
         repl = await replication(withDerivedKeepAlive(opts.url, derivedKeepAlive))
@@ -318,11 +315,8 @@ export function replicate(opts: ReplicateOptions): ReplicateHandle {
           deliverWarning(opts.onWarning, { kind: 'wal-sender-timeout-disabled', message })
         }
 
-        const isDurable = typeof opts.slot !== 'string'
-        const name = typeof opts.slot === 'string' ? tempSlotName() : opts.slot.name
-        if (isDurable) validateDurableSlotName(name) // a consumer bug, not slot invalidation — checked before ANY interpolation site below sees it
-        currentIsDurable = isDurable
-        currentSlotName = name
+        const isDurable = durableName !== null
+        const name = durableName ?? tempSlotName()
 
         let resumed: { confirmedFlush: string; restartLsn: string } | null = null
 
@@ -483,8 +477,8 @@ export function replicate(opts: ReplicateOptions): ReplicateHandle {
         if (stopping) { state = 'stopped'; return }
         // 42704 belongs to slot ACQUISITION (e.g. start() racing a manual drop), never to
         // pg_terminate_backend — 'already gone' from that path is a plain 'f' row inside evictAndAwaitClear.
-        const err: Error = currentIsDurable && rawErr instanceof PgError && rawErr.code === '42704'
-          ? new SlotInvalidatedError(currentSlotName!, 'absent')
+        const err: Error = durableName !== null && rawErr instanceof PgError && rawErr.code === '42704'
+          ? new SlotInvalidatedError(durableName, 'absent')
           : (rawErr as Error)
         if (isPermanentFailure(err)) { fireFatal(err); return }
         attempt++
