@@ -2265,3 +2265,88 @@ test('cdc ready rejects with the first attempt error, before the retry budget is
   expect(fatalErr).toBeUndefined() // proves the rejection came from the first attempt, not budget exhaustion
   await handle.stop()
 })
+
+test('cdc ready rejects via fireFatal on a give-up path that returns without throwing', async () => {
+  const backend = cdcBackend()
+  let fatalErr: Error | undefined
+  const handle = replicate({
+    url: cfg({ socket: backend.socket }),
+    slot: 'temporary',
+    publications: ['pub'],
+    backfill: async () => { throw new Error('backfill is broken') },
+    onTransaction: () => {},
+    retryDelayMs: () => null, // gives up on the first backfill throw — the outer catch never runs this session
+    onFatalError: (err) => { fatalErr = err },
+  })
+  // Without the fireFatal reject site this await hangs forever: the give-up path here returns
+  // from inside the try, so the outer catch below never settles ready.
+  await expect(handle.ready).rejects.toThrow('backfill is broken')
+  expect(fatalErr).toBeInstanceOf(Error)
+  await handle.stop()
+})
+
+test('cdc ready never re-settles on a later reconnect', async () => {
+  const backend = cdcBackend()
+  const handle = replicate({
+    url: cfg({ socket: backend.socket }),
+    slot: 'temporary',
+    publications: ['pub'],
+    backfill: async () => {},
+    onTransaction: () => {},
+    retryDelayMs: () => 1,
+  })
+  await handle.ready
+
+  backend.latest!.dx.destroy()
+  await until(() => backend.sessions.length >= 2 && !!backend.latest?.queries.some((q) => q.startsWith('START_REPLICATION')))
+  // A settled promise ignores every later resolve/reject — the second session's own onReady must
+  // be a no-op here, not a second settle attempt someone later reintroduces inside the loop.
+  await handle.ready
+  await handle.stop()
+})
+
+test('cdc an untouched ready produces no unhandled rejection when the first connect fails', async () => {
+  const backend = cdcBackend({
+    onQuery: (sql) => sql.includes('wal_sender_timeout') ? [errFrame('57P01', 'boom'), ready()] : undefined,
+  })
+  let uncaught: unknown
+  const onUnhandled = (reason: unknown): void => { uncaught = reason }
+  process.on('unhandledRejection', onUnhandled)
+  try {
+    let fatalErr: Error | undefined
+    // handle.ready is deliberately never referenced below this point: no await, no .catch, no
+    // .then, no expect().rejects — any of those attaches a handler and masks the bug under test.
+    const handle = replicate({
+      url: cfg({ socket: backend.socket }),
+      slot: 'temporary',
+      publications: ['pub'],
+      backfill: async () => {},
+      onTransaction: () => {},
+      retryDelayMs: () => null, // fatal on the very first failure
+      onFatalError: (err) => { fatalErr = err },
+    })
+    await until(() => fatalErr !== undefined)
+    // Unhandled-rejection detection fires when the microtask queue drains, not on the next
+    // microtask — a real timer turn is required before this assertion means anything.
+    await Bun.sleep(20)
+    expect(uncaught).toBeUndefined()
+    await handle.stop()
+  } finally {
+    process.off('unhandledRejection', onUnhandled)
+  }
+})
+
+test('cdc stop() before the first connect rejects ready', async () => {
+  let socketCalls = 0
+  const handle = replicate({
+    url: cfg({ socket: () => { socketCalls++; throw new Error('should never be called') } }),
+    slot: 'temporary',
+    publications: ['pub'],
+    backfill: async () => {},
+    onTransaction: () => {},
+  })
+  const stopPromise = handle.stop() // synchronous stop, before run()'s own microtask ever executes
+  await expect(handle.ready).rejects.toThrow('minipg: replicate() stopped before the first connect opened a stream')
+  await stopPromise
+  expect(socketCalls).toBe(0)
+})
