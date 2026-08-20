@@ -6,97 +6,103 @@ import { randomBytes } from 'node:crypto'
 // lifecycle, backfill window, and ack-on-handler-resolve.
 
 export interface ReplicateOptions {
-  /** Connection target, forwarded verbatim to replication() on every (re)connect — a string, or
-   *  the same config object replication() accepts. */
+  /** Connection target, forwarded verbatim to {@link replication} on every (re)connect — a string,
+   *  or the same config object `replication()` accepts. */
   url: string | ReplicationConfig
-  /** 'temporary': fresh random-suffixed slot each session, exported-snapshot backfill —
-   *  disconnects LOSE queued changes (PG 10-17). { name }: durable slot, health-checked via
-   *  command() each connect (needs PG13+, else UnsupportedServerVersionError); malformed names
-   *  throw InvalidSlotName synchronously, and a later absence raises SlotInvalidatedError instead
-   *  of recreating it. Retains WAL so a disconnected consumer resumes where it left off. */
+  /** - `'temporary'`: fresh random-suffixed slot each session, exported-snapshot backfill —
+   *    disconnects LOSE queued changes (PG 10-17).
+   *  - `{ name }`: durable slot, health-checked via `command()` each connect (needs PG13+, else
+   *    {@link UnsupportedServerVersionError}); malformed names throw {@link InvalidSlotName}
+   *    synchronously, and a later absence raises {@link SlotInvalidatedError} instead of
+   *    recreating it. Retains WAL so a disconnected consumer resumes where it left off. */
   slot: 'temporary' | { name: string }
-  /** Publications to subscribe — forwarded to start(), whose PublicationMissing probe applies
-   *  unchanged. An empty array throws PublicationEmpty synchronously, before any session starts. */
+  /** Publications to subscribe — forwarded to `start()`, whose {@link PublicationMissing} probe
+   *  applies unchanged. An empty array throws {@link PublicationEmpty} synchronously, before any
+   *  session starts. */
   publications: string[]
-  /** Per-table decode shapes, forwarded to start() unchanged. */
+  /** Per-table decode shapes, forwarded to `start()` unchanged. */
   shapes?: TableShape[]
-  /** Aborting stops the session the same way stop() does: settle in-flight work, ack what
-   *  completed, close, resolve — never fires onFatalError. */
+  /** Aborting stops the session the same way `stop()` does: settle in-flight work, ack what
+   *  completed, close, resolve — never fires {@link ReplicateOptions.onFatalError}. */
   signal?: AbortSignal
-  /** Runs once per session that just created a slot, strictly between CREATE_REPLICATION_SLOT
-   *  and START_REPLICATION — the snapshot dies on the connection's next command (SQLSTATE
-   *  22023). Adopt it on your OWN connection inside REPEATABLE READ or SERIALIZABLE (else 0A000).
-   *  A throw retries IN PLACE on the same slot/snapshot; a backfillTimeoutMs timeout instead goes
-   *  straight to onFatalError, no retry. */
+  /** Runs once per session that just created a slot, strictly between `CREATE_REPLICATION_SLOT`
+   *  and `START_REPLICATION` — the snapshot dies on the connection's next command (SQLSTATE
+   *  `22023`). Adopt it on your OWN connection inside `REPEATABLE READ` or `SERIALIZABLE` (else
+   *  `0A000`). A throw retries IN PLACE on the same slot/snapshot; a
+   *  {@link ReplicateOptions.backfillTimeoutMs} timeout instead goes straight to `onFatalError`,
+   *  no retry. */
   backfill?: (info: { snapshot: string; streamStartLsn: string; isReconnect: boolean; signal: AbortSignal }) => void | Promise<void>
-  /** Abandon the session if backfill hasn't resolved within this many ms (omitted = unbounded).
-   *  Fires BackfillTimeoutError straight to onFatalError, skipping the retry budget — retrying
-   *  would rebuild the slot and let the next session's health check silently resume past an
-   *  unread baseline. Must be positive when set; replicate() throws RangeError otherwise. */
+  /** Abandon the session if `backfill` hasn't resolved within this many ms (omitted = unbounded).
+   *  Fires {@link BackfillTimeoutError} straight to `onFatalError`, skipping the retry budget —
+   *  retrying would rebuild the slot and let the next session's health check silently resume past
+   *  an unread baseline. Must be positive when set; `replicate()` throws `RangeError` otherwise. */
   backfillTimeoutMs?: number
-  /** Forwarded to batchTransactions() as maxEvents — omitted or non-positive means unbounded,
-   *  matching that helper's own default. */
+  /** Forwarded to {@link batchTransactions} as `maxEvents` — omitted or non-positive means
+   *  unbounded, matching that helper's own default. */
   maxTransactionEvents?: number
   /** Called with each assembled transaction; acked only once this resolves, and only for the
-   *  done:true chunk (a done:false chunk carries no commitLsn/endLsn, so acking it is a compile
-   *  error). A throw retries the SAME batch in place, bounded by retryDelayMs. */
+   *  `done:true` chunk (a `done:false` chunk carries no `commitLsn`/`endLsn`, so acking it is a
+   *  compile error). A throw retries the SAME batch in place, bounded by
+   *  {@link ReplicateOptions.retryDelayMs}. */
   onTransaction: (batch: TransactionBatch) => void | Promise<void>
-  /** Governs every retry: connection failures, backfill/handler throws, timeouts. Returning null
-   *  gives up (fires onFatalError). attempt resets to 0 only on ACKED progress, never on connect
-   *  or delivery. Omitted default gives up after ~10 attempts (~5 min): 1000ms base, ×2 per
-   *  attempt, 0-1000ms jitter, capped at 30s. */
+  /** Governs every retry: connection failures, backfill/handler throws, timeouts. Returning
+   *  `null` gives up (fires `onFatalError`). `attempt` resets to 0 only on ACKED progress, never
+   *  on connect or delivery. Omitted default gives up after ~10 attempts (~5 min): 1000ms base,
+   *  ×2 per attempt, 0-1000ms jitter, capped at 30s. */
   retryDelayMs?: (attempt: number, err: Error) => number | null
-  /** The managed layer's only diagnostic channel — see CdcWarning. Raw warnings forward through
-   *  untouched; a throw from this callback is caught and reported to stderr. */
+  /** The managed layer's only diagnostic channel — see {@link CdcWarning}. Raw warnings forward
+   *  through untouched; a throw from this callback is caught and reported to stderr. */
   onWarning?: (w: CdcWarning) => void
-  /** Called exactly once, after the layer has fully stopped. Never called from stop() or from
-   *  the consumer's own signal aborting — those resolve cleanly instead. */
+  /** Called exactly once, after the layer has fully stopped. Never called from `stop()` or from
+   *  the consumer's own `signal` aborting — those resolve cleanly instead. */
   onFatalError?: (err: Error) => void
-  /** What to do when a durable slot is already held by another backend. 'error' (default) raises
-   *  SlotBusyError. 'evict' terminates the holder with pg_terminate_backend and polls until it
-   *  clears; needs the pg_signal_backend grant and fails permanently with 42501 without it. */
+  /** What to do when a durable slot is already held by another backend. `'error'` (default)
+   *  raises {@link SlotBusyError}. `'evict'` terminates the holder with `pg_terminate_backend`
+   *  and polls until it clears; needs the `pg_signal_backend` grant and fails permanently with
+   *  `42501` without it. */
   onSlotBusy?: 'error' | 'evict'
-  /** Fires instead of backfill when a durable slot already existed and passed its health check —
-   *  nothing to backfill. A throw here routes through retryDelayMs like a backfill throw. */
+  /** Fires instead of `backfill` when a durable slot already existed and passed its health check
+   *  — nothing to backfill. A throw here routes through `retryDelayMs` like a backfill throw. */
   onResume?: (info: { confirmedFlush: string; restartLsn: string }) => void | Promise<void>
-  /** Forwarded to start() unchanged; see StartOptions.messages. */
+  /** Forwarded to `start()` unchanged; see `StartOptions.messages`. */
   messages?: boolean
-  /** Forwarded to start() when set. Omitted defaults to max(10_000, wal_sender_timeout * 0.75),
+  /** Forwarded to `start()` when set. Omitted defaults to `max(10_000, wal_sender_timeout * 0.75)`,
    *  read once per connect and kept above half the server's ping interval so its keepalive clock
    *  actually expires. A value set here always wins over the derived one. */
   statusIntervalMs?: number
-  /** Forwarded to start() when set. Omitted defaults to max(60_000, wal_sender_timeout * 2), read
-   *  once per connect — a fixed 60s alone false-fires against statusIntervalMs's own cadence.
-   *  When wal_sender_timeout is 0 (disabled), this is left off and keepAlive is turned on
-   *  instead, with a 'wal-sender-timeout-disabled' warning. A value set here always wins. */
+  /** Forwarded to `start()` when set. Omitted defaults to `max(60_000, wal_sender_timeout * 2)`,
+   *  read once per connect — a fixed 60s alone false-fires against `statusIntervalMs`'s own
+   *  cadence. When `wal_sender_timeout` is 0 (disabled), this is left off and `keepAlive` is
+   *  turned on instead, with a `'wal-sender-timeout-disabled'` warning. A value set here always
+   *  wins. */
   receiveTimeoutMs?: number
-  /** Forwarded to start() unchanged; see StartOptions.maxQueueBytes. */
+  /** Forwarded to `start()` unchanged; see `StartOptions.maxQueueBytes`. */
   maxQueueBytes?: number
-  /** Forwarded to start() unchanged; see StartOptions.binary. */
+  /** Forwarded to `start()` unchanged; see `StartOptions.binary`. */
   binary?: boolean | 'auto'
-  /** Forwarded to start() unchanged; see StartOptions.hydrateToast. */
+  /** Forwarded to `start()` unchanged; see `StartOptions.hydrateToast`. */
   hydrateToast?: boolean
-  /** Forwarded to start() unchanged; see StartOptions.idleAck. */
+  /** Forwarded to `start()` unchanged; see `StartOptions.idleAck`. */
   idleAck?: boolean
 }
 
 export interface ReplicateHandle {
   /** Idempotent: the second call returns the first call's promise. Settles in-flight work, acks
-   *  what completed, closes the session, and resolves — never fires onFatalError. */
+   *  what completed, closes the session, and resolves — never fires `onFatalError`. */
   stop(): Promise<void>
 }
 
-/** A durable-slot health check failed on connect — see ReplicateOptions.slot's { name } form.
- *  Fires straight to onFatalError, skipping retries: the slot row went missing, its wal_status
- *  read 'lost', confirmed_flush_lsn was null, or the server's systemId/timeline changed — none
- *  of these heal with time. Drop the slot and call replicate() again, or investigate. */
+/** A durable-slot health check failed on connect — see {@link ReplicateOptions.slot}'s `{ name }`
+ *  form. Fires straight to `onFatalError`, skipping retries: the slot row went missing, its
+ *  `wal_status` read `'lost'`, `confirmed_flush_lsn` was null, or the server's systemId/timeline
+ *  changed — none heal with time. Drop the slot and call `replicate()` again, or investigate. */
 export class SlotInvalidatedError extends Error {
   readonly reason = 'slot-invalidated' as const
   constructor(readonly slot: string, override readonly cause: 'absent' | 'wal-lost' | 'no-confirmed-flush' | 'system-changed') { super(`minipg: replication slot ${JSON.stringify(slot)} is invalidated (${cause}) — drop it and call replicate() again to start over`) }
 }
 
-/** backfillTimeoutMs elapsed before backfill resolved — no partial backfill is usable, so the
- *  session is abandoned straight to onFatalError, skipping the retry budget: retrying would
+/** `backfillTimeoutMs` elapsed before backfill resolved — no partial backfill is usable, so the
+ *  session is abandoned straight to `onFatalError`, skipping the retry budget: retrying would
  *  rebuild the slot and let the next session's health check silently resume past an unread
  *  baseline. */
 export class BackfillTimeoutError extends Error {
@@ -104,15 +110,15 @@ export class BackfillTimeoutError extends Error {
   constructor(readonly ms: number) { super(`minipg: backfill did not resolve within ${ms}ms (backfillTimeoutMs) — the session is abandoned`) }
 }
 
-/** A durable slot is already held by another connection and onSlotBusy is 'error' (default), or
- *  eviction was denied. Names the slot and holding PID, never the URL. */
+/** A durable slot is already held by another connection and `onSlotBusy` is `'error'` (default),
+ *  or eviction was denied. Names the slot and holding PID, never the URL. */
 export class SlotBusyError extends Error {
   readonly reason = 'slot-busy' as const
   constructor(readonly slot: string, readonly pid: number) { super(`minipg: replication slot ${JSON.stringify(slot)} is active for PID ${pid} — pass onSlotBusy: 'evict' to terminate it, or wait for the other consumer to release it`) }
 }
 
 /** A durable slot's health check reads `pg_replication_slots.wal_status`, added in PostgreSQL
- *  13 — this server lacks it (42703). Never heals with time, so it skips the retry loop rather
+ *  13 — this server lacks it (`42703`). Never heals with time, so it skips the retry loop rather
  *  than burning the budget on a bare column-does-not-exist error. `slot: 'temporary'` has no
  *  such floor. */
 export class UnsupportedServerVersionError extends Error {
@@ -120,14 +126,16 @@ export class UnsupportedServerVersionError extends Error {
   constructor() { super("minipg: durable slots need PostgreSQL 13+ (pg_replication_slots.wal_status is not available on this server) — use slot: 'temporary' instead, or upgrade the server") }
 }
 
-/** Lifecycle warnings the managed layer itself emits, on the same onWarning channel raw
- *  ReplicationWarning uses — raw warnings forward through untouched. `reconnect-attempt`: a
- *  session failure or an onTransaction throw consumed a retry attempt, sleeping `delayMs` before
- *  attempt `attempt` (fired for both a full reconnect and an in-place handler retry).
- *  `backfill-timeout`: backfillTimeoutMs elapsed, session abandoned. `slot-evicted`: onSlotBusy:
- *  'evict' terminated another backend. `wal-sender-timeout-disabled`: wal_sender_timeout reads
- *  0, so receiveTimeoutMs is left off and keepAlive is turned on instead. A throw from onWarning
- *  is caught and reported to stderr. */
+/** Lifecycle warnings the managed layer itself emits, on the same `onWarning` channel raw
+ *  {@link ReplicationWarning} uses — raw warnings forward through untouched.
+ *  - `reconnect-attempt`: a session failure or an `onTransaction` throw consumed a retry attempt,
+ *    sleeping `delayMs` before attempt `attempt` (fired for both a full reconnect and an
+ *    in-place handler retry).
+ *  - `backfill-timeout`: `backfillTimeoutMs` elapsed, session abandoned.
+ *  - `slot-evicted`: `onSlotBusy: 'evict'` terminated another backend.
+ *  - `wal-sender-timeout-disabled`: `wal_sender_timeout` reads 0, so `receiveTimeoutMs` is left
+ *    off and `keepAlive` is turned on instead. A throw from `onWarning` is caught and reported
+ *    to stderr. */
 export type CdcWarning =
   | ReplicationWarning
   | { kind: 'reconnect-attempt'; attempt: number; delayMs: number; message: string }
@@ -199,7 +207,7 @@ async function readSlotHealth(conn: ReplicationConnection, name: string): Promis
   return Object.fromEntries(r.columns.map((c, i) => [c, r.rows[0]![i]])) as unknown as SlotHealthRow
 }
 
-// Runs on the replication connection itself, never a second one: terminate the holder, then
+// Always runs on the existing replication connection: terminate the holder, then
 // poll until the slot reads inactive or a ~3s deadline passes. 't'/'f' both mean "keep polling" ('f' is already-gone; 42704 belongs to pg_drop_replication_slot, not this). 42501 propagates untouched for isPermanentFailure() to classify.
 async function evictAndAwaitClear(conn: ReplicationConnection, name: string, pid: number, onWarning: ReplicateOptions['onWarning'], signal: AbortSignal): Promise<void> {
   if (!Number.isInteger(pid)) throw new SlotBusyError(name, pid) // the trust boundary: a server-sourced value about to ride into SQL
@@ -225,8 +233,8 @@ function withDerivedKeepAlive(url: string | ReplicationConfig, forceKeepAlive: b
 }
 
 /** Start a managed CDC session: connect, administer the slot, backfill inside the exported-
- *  snapshot window, then stream with ack tied to onTransaction's resolution. Returns the handle
- *  SYNCHRONOUSLY — a stop() called immediately after replicate() wins before the first connect. */
+ *  snapshot window, then stream with ack tied to `onTransaction`'s resolution. Returns the handle
+ *  SYNCHRONOUSLY — a `stop()` called immediately after `replicate()` wins before the first connect. */
 export function replicate(opts: ReplicateOptions): ReplicateHandle {
   // Consumer misuse (malformed slot name, empty publications) is knowable synchronously — validate
   // before the handle exists, so a consumer who omitted onFatalError still sees it.

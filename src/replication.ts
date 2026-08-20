@@ -35,40 +35,40 @@ export type Row = Record<string, unknown>
 export type ReplicationEvent =
   | {
       kind: 'begin'; xid: number; commitTime: Date
-      /** Same instant as commitTime, as epoch microseconds — carries pgoutput's full precision where Date floors to milliseconds. */
+      /** Same instant as `commitTime`, as epoch microseconds — carries pgoutput's full precision where `Date` floors to milliseconds. */
       commitTimeUs: number
       /** The tx's commit-record LSN — identical to the matching commit event's `lsn`. */
       finalLsn: string
     }
   | {
       kind: 'commit'
-      /** The commit record's OWN position (=== begin.finalLsn). Not the ack target. */
+      /** The commit record's OWN position (=== `begin.finalLsn`). Not the ack target. */
       lsn: string
-      /** First LSN after the commit record — `repl.ack(e.endLsn)` acknowledges this tx. ack()
-       *  normalizes any value inside [lsn, endLsn) to endLsn, so acking `lsn` by mistake still works. */
+      /** First LSN after the commit record — `repl.ack(e.endLsn)` acknowledges this tx. `ack()`
+       *  normalizes any value inside `[lsn, endLsn)` to `endLsn`, so acking `lsn` by mistake still works. */
       endLsn: string
       commitTime: Date
-      /** Same instant as commitTime, as epoch microseconds — carries pgoutput's full precision where Date floors to milliseconds. */
+      /** Same instant as `commitTime`, as epoch microseconds — carries pgoutput's full precision where `Date` floors to milliseconds. */
       commitTimeUs: number
     }
   | { kind: 'insert'; schema: string; table: string; new: Row }
   | ({
       kind: 'update'; schema: string; table: string; new: Row
       /** SHAPE keys of TOASTed columns pgoutput omitted because they're unmodified — listed in
-       *  BOTH modes. With hydrateToast (default true) and a FULL old row the driver fills them
-       *  into `new` from `old`; otherwise they're ABSENT from `new` (not null — null would mean
-       *  SQL NULL) and unrecoverable: a follow-up query reads the CURRENT row, not this event's. */
+       *  BOTH modes. With {@link StartOptions.hydrateToast} (default true) and a FULL old row the
+       *  driver fills them into `new` from `old`; otherwise they're ABSENT from `new` (not null —
+       *  null would mean SQL NULL) and unrecoverable: a follow-up query reads the CURRENT row, not this event's. */
       unchanged: string[]
-      /** Present only when TableShape.key was declared. Under `oldKind: 'full'` the declared key
-       *  columns are compared (see `sameValue`); under `'key'` it's `true` with no comparison (the
-       *  tuple's presence is the signal); under `null` it's `false`. Exact only when the declared
-       *  key equals the replica identity key — a proper-subset key over-reports `true` on any identity change, even unchanged. */
+      /** Present only when {@link TableShape.key} was declared. Under `oldKind: 'full'` the declared
+       *  key columns are compared (see `sameValue`); under `'key'` it's `true` with no comparison
+       *  (the tuple's presence is the signal); under `null` it's `false`. Exact only when the
+       *  declared key equals the replica identity key — a proper-subset key over-reports `true` on any identity change, even unchanged. */
       keyChanged?: boolean
     } & (
       | {
-          /** Under identity DEFAULT/INDEX, 'key' appears only when the identity key changed — exact,
+          /** Under identity DEFAULT/INDEX, `'key'` appears only when the identity key changed — exact,
            *  no declared key needed; the old row is full width with `null` (not-carried, not SQL
-           *  NULL) outside the identity. Under FULL every column is flagged `key: true`, so that flag alone can't identify the real key — declare TableShape.key for `keyChanged`. */
+           *  NULL) outside the identity. Under FULL every column is flagged `key: true`, so that flag alone can't identify the real key — declare {@link TableShape.key} for `keyChanged`. */
           oldKind: 'key' | 'full'
           old: Row
         }
@@ -81,17 +81,17 @@ export type ReplicationEvent =
 
 export type ReplicationConfig = Pick<ConnectConfig,
   'url' | 'host' | 'port' | 'user' | 'password' | 'database' | 'ssl' | 'path' | 'socket' | 'applicationName' | 'connectTimeout' | 'types' | 'jsonBigints' | 'options' | 'channelBinding'> & {
-  /** Enable TCP keepalive (SO_KEEPALIVE) — a liveness signal independent of receiveTimeoutMs. `true`
-   *  uses the OS default delay; the object form sets it explicitly. Applied via setKeepAlive() after
-   *  connect, not a tls.connect() option (which silently drops keepalive — nodejs/node#62003). No-op
-   *  on unix-socket and custom `socket` transports without setKeepAlive. */
+  /** Enable TCP keepalive (`SO_KEEPALIVE`) — a liveness signal independent of `receiveTimeoutMs`.
+   *  `true` uses the OS default delay; the object form sets it explicitly. Applied via
+   *  `setKeepAlive()` after connect, not a `tls.connect()` option (which silently drops keepalive
+   *  — nodejs/node#62003). No-op on unix-socket and custom `socket` transports without `setKeepAlive`. */
   keepAlive?: boolean | { initialDelayMs?: number }
 }
 
 /** One table's declared decode shape for `start({ shapes })`. An ARRAY of these (not a keyed
  *  object) so schema/table names containing dots or quotes never need escaping. */
 export interface TableShape {
-  /** Table schema; default 'public'. */
+  /** Table schema; default `'public'`. */
   schema?: string
   table: string
   /** shape key -> SQL column name, for keys that differ (e.g. drizzle JS property names). Keys
@@ -102,45 +102,45 @@ export interface TableShape {
    *  columns keep default decoding. Array/json-valued keys always compare as changed (no recursive
    *  branch), so `keyChanged` is `true` on every update for those — prefer scalar keys; empty arrays throw. */
   key?: string[]
-  /** OUTPUT key -> spec: the same grammar as query()'s { shape } — TypeSpec strings, Json()/Jsonb(),
-   *  Transform(), defineType()/minipg-geometry markers; object literal or ordered [key, spec]
-   *  entries. Collect() can't apply to a replication row and throws at start(). */
+  /** OUTPUT key -> spec: the same grammar as `query()`'s `{ shape }` — {@link TypeSpec} strings,
+   *  `Json()`/`Jsonb()`, `Transform()`, `defineType()`/minipg-geometry markers; object literal or
+   *  ordered `[key, spec]` entries. `Collect()` can't apply to a replication row and throws at `start()`. */
   shape: Record<string, TypeSpec | JsonMarker | TransformMarker | CustomMarker> | SpecEntries<TypeSpec | JsonMarker | TransformMarker | CustomMarker>
 }
 
 export interface StartOptions {
   slot: string
-  /** Publications to subscribe. Empty rejects with PublicationEmpty; a missing one with
-   *  PublicationMissing — checked before START_REPLICATION since pgoutput reports it late (PG18:
-   *  not at all). One that exists but publishes no tables yet is legal: warns via onWarning and
-   *  streams. A publication created after the slot may still be invisible to its historical snapshot. */
+  /** Publications to subscribe. Empty rejects with {@link PublicationEmpty}; a missing one with
+   *  {@link PublicationMissing} — checked before `START_REPLICATION` since pgoutput reports it
+   *  late (PG18: not at all). One that exists but publishes no tables yet is legal: warns via
+   *  `onWarning` and streams. A publication created after the slot may still be invisible to its historical snapshot. */
   publications: string[]
   /** Per-table decode shapes, matched by (schema, table) at relation announce. Declared columns
-   *  decode like a query() shape spec, keyed by the SHAPE keys (`columns` maps a key to its SQL
+   *  decode like a `query()` shape spec, keyed by the SHAPE keys (`columns` maps a key to its SQL
    *  column when differing; `unchanged` uses the same keys). Undeclared columns/tables keep default
-   *  decoding; 'unknown' defers to the relation oid. Never silent: unknown column, duplicate mapping, or key collision all throw. Applies to new AND old tuples. */
+   *  decoding; `'unknown'` defers to the relation oid. Never silent: unknown column, duplicate mapping, or key collision all throw. Applies to new AND old tuples. */
   shapes?: TableShape[]
   /** LSN to start from; default = the server resumes from the slot's confirmed position. */
   from?: string | bigint
-  /** Deliver pg_logical_emit_message() events (default true). */
+  /** Deliver `pg_logical_emit_message()` events (default true). */
   messages?: boolean
   /** Standby-status heartbeat interval, ms (default 10_000). */
   statusIntervalMs?: number
   /** Fail the stream if no message (including keepalives) arrives for this many ms — a black-holed
    *  TCP connection otherwise parks forever. Off by default; undefined/zero/negative disarm it. The
-   *  server's wal_sender_timeout (default 60s) pings at half that interval once quiet, but the
-   *  client's own status updates (statusIntervalMs) postpone it — size well above wal_sender_timeout to avoid a false-fire on a healthy idle stream. */
+   *  server's `wal_sender_timeout` (default 60s) pings at half that interval once quiet, but the
+   *  client's own status updates (`statusIntervalMs`) postpone it — size well above `wal_sender_timeout` to avoid a false-fire on a healthy idle stream. */
   receiveTimeoutMs?: number
   /** Ceiling on buffered-but-undelivered message bytes before the socket pauses (resumes once the
    *  queue drains below half) — bounds memory when the consumer stops reading. Default 64 MiB;
    *  `Infinity` disables it; zero/negative/non-finite fall back to the default so misconfiguration
    *  can't leave the socket paused forever. Counts each message body only — real retention runs higher. */
   maxQueueBytes?: number
-  /** BINARY tuple values (PG14+ pgoutput option). Default 'auto': enabled when the server is 14+
+  /** BINARY tuple values (PG14+ pgoutput option). Default `'auto'`: enabled when the server is 14+
    *  AND the driver can binary-decode every published column and shaped target (a pre-start
-   *  capability probe). Arrays decode to real JS arrays and float4 to the exact stored f32;
+   *  capability probe). Arrays decode to real JS arrays and `float4` to the exact stored f32;
    *  anything binary can't honor keeps the whole stream on text — auto never crashes. `true` forces
-   *  binary and errors loudly naming table.column; `false` = text. DDL after start isn't re-probed. */
+   *  binary and errors loudly naming `table.column`; `false` = text. DDL after start isn't re-probed. */
   binary?: boolean | 'auto'
   /** Fills unchanged TOASTed columns into `new` from a REPLICA IDENTITY FULL old row (default
    *  true). `false` keeps the sparse WAL shape where those columns are ABSENT from `new`;
@@ -150,39 +150,39 @@ export interface StartOptions {
    *  so an idle slot doesn't retain WAL forever (default true). */
   idleAck?: boolean
   /** Abort = the consumer's own stop: the iterator finishes cleanly (no throw) and the connection
-   *  closes — same as calling end() while parked in next(). */
+   *  closes — same as calling `end()` while parked in `next()`. */
   signal?: AbortSignal
-  /** Called ONCE when the server accepts START_REPLICATION (CopyBothResponse) — the moment the
-   *  slot shows active in pg_stat_activity. A slot-already-active PgError fires before it; a throw
-   *  from the callback fails the stream's current next(). */
+  /** Called ONCE when the server accepts `START_REPLICATION` (CopyBothResponse) — the moment the
+   *  slot shows active in `pg_stat_activity`. A slot-already-active {@link PgError} fires before
+   *  it; a throw from the callback fails the stream's current `next()`. */
   onReady?: () => void
   /** The library's only warning channel — non-fatal conditions detected before the stream begins
    *  and, for event-triggered diagnostics, as the triggering event decodes. Called synchronously,
    *  zero or more times; absent means not delivered. A throw here goes to stderr while the stream
-   *  keeps going — unlike onReady, whose throw fails the current next(); later diagnostics add new `kind` members here. */
+   *  keeps going — unlike `onReady`, whose throw fails the current `next()`; later diagnostics add new `kind` members here. */
   onWarning?: (w: ReplicationWarning) => void
 }
 
-/** The SERVER ended the replication stream (CopyDone): clean primary shutdown, failover, or a
- *  pooler closing the copy. The consumer must react (re-start() or reconnect) — the slot keeps
+/** The SERVER ended the replication stream (`CopyDone`): clean primary shutdown, failover, or a
+ *  pooler closing the copy. The consumer must react (re-`start()` or reconnect) — the slot keeps
  *  retaining WAL either way — so this is a THROW, not a clean return (`for await` discards return
- *  values). The connection has finished the CopyDone handshake and is reusable for start(). */
+ *  values). The connection has finished the `CopyDone` handshake and is reusable for `start()`. */
 export class ReplicationStreamEnded extends Error {
   readonly reason = 'copy-done' as const
   constructor() { super('minipg: server ended the replication stream (CopyDone) — start() again or reconnect to resume') }
 }
 
-/** A CommandComplete/ReadyForQuery frame arrived during copy mode without a preceding server
- *  CopyDone ('c') — START_REPLICATION was accepted but streaming never began. The one known cause:
- *  PostgreSQL BUG #18754 (open PG14-18) — a second START_REPLICATION on one walsender session never
- *  re-arms the streamingDone flags left set. Unlike ReplicationStreamEnded (reusable), this connection hits the same bug again — reconnect instead. */
+/** A `CommandComplete`/`ReadyForQuery` frame arrived during copy mode without a preceding server
+ *  `CopyDone` (`'c'`) — `START_REPLICATION` was accepted but streaming never began. The one known
+ *  cause: PostgreSQL BUG #18754 (open PG14-18) — a second `START_REPLICATION` on one walsender
+ *  session never re-arms the `streamingDone` flags left set. Unlike {@link ReplicationStreamEnded} (reusable), this connection hits the same bug again — reconnect instead. */
 export class ReplicationSessionSpent extends Error {
   readonly reason = 'session-spent' as const
   constructor() { super("minipg: server ended the session without a CopyDone (PostgreSQL BUG #18754 — a second START_REPLICATION on one walsender connection never re-arms streaming) — reconnect rather than calling start() again on this connection") }
 }
 
 /** No message — not even a keepalive — arrived for `receiveTimeoutMs`: the connection is presumed
- *  dead. The slot keeps retaining WAL; reconnect and start() again, raising receiveTimeoutMs if this fires on a healthy link. */
+ *  dead. The slot keeps retaining WAL; reconnect and `start()` again, raising `receiveTimeoutMs` if this fires on a healthy link. */
 export class ReplicationReceiveTimeout extends Error {
   readonly reason = 'receive-timeout' as const
   constructor(readonly ms: number) { super(`minipg: no message received for ${ms}ms (receiveTimeoutMs) — the connection is presumed dead; reconnect, or raise receiveTimeoutMs relative to the server's wal_sender_timeout`) }
@@ -192,27 +192,27 @@ export class ReplicationReceiveTimeout extends Error {
 // double as a directory name on every OS — rejecting beats escaping (no escape form the walsender grammar accepts).
 const SLOT_NAME = /^[a-z0-9_]{1,63}$/
 
-/** A replication slot name outside Postgres's allowed set ([a-z0-9_], 1-63 chars) — rejected
- *  before any CREATE_REPLICATION_SLOT / DROP_REPLICATION_SLOT / START_REPLICATION command is sent. */
+/** A replication slot name outside Postgres's allowed set (`[a-z0-9_]`, 1-63 chars) — rejected
+ *  before any `CREATE_REPLICATION_SLOT` / `DROP_REPLICATION_SLOT` / `START_REPLICATION` command is sent. */
 export class InvalidSlotName extends Error {
   readonly reason = 'invalid-slot-name' as const
   constructor(readonly slot: string) { super(`minipg: invalid replication slot name ${JSON.stringify(slot)} — Postgres allows only lower-case letters, digits and underscore, 1 to 63 characters`) }
 }
 const checkSlot = (s: string): string => { if (!SLOT_NAME.test(s)) throw new InvalidSlotName(s); return s }
 
-/** command() or a second start() was called while a start() stream holds the connection. A
- *  start() generator reserves the connection from its first next() — not merely once the stream
- *  goes live — because a second start() or command() would drain the same message queue the
- *  reservation's own catalog probes use. Finish the stream or end() the connection, then retry. */
+/** `command()` or a second `start()` was called while a `start()` stream holds the connection. A
+ *  `start()` generator reserves the connection from its first `next()` — not merely once the stream
+ *  goes live — because a second `start()` or `command()` would drain the same message queue the
+ *  reservation's own catalog probes use. Finish the stream or `end()` the connection, then retry. */
 export class ReplicationBusy extends Error {
   readonly reason = 'streaming' as const
   constructor() { super('minipg: a start() stream is already active on this connection — finish the stream (break/return the iterator) or end() the connection before another start() or command()') }
 }
 
-/** A named publication in start()'s publications list does not exist right now — caught by an
- *  unconditional catalog probe before START_REPLICATION is sent, since pgoutput itself only
- *  reports this lazily (PG14-17) or not at all (PG18). See StartOptions.publications for the
- *  historical-snapshot case this probe can't cover. */
+/** A named publication in `start()`'s publications list does not exist right now — caught by an
+ *  unconditional catalog probe before `START_REPLICATION` is sent, since pgoutput itself only
+ *  reports this lazily (PG14-17) or not at all (PG18). See {@link StartOptions.publications} for
+ *  the historical-snapshot case this probe can't cover. */
 export class PublicationMissing extends Error {
   readonly reason = 'publication-missing' as const
   constructor(readonly publications: string[]) {
@@ -221,34 +221,36 @@ export class PublicationMissing extends Error {
 }
 
 /** `start({ publications: [] })` — no publication to subscribe. There is no wire form for this:
- *  pgoutput reads an empty publication_names list as absent. A publication that EXISTS but
- *  publishes no tables is a different, legal case — it warns (see ReplicationWarning) and streams. */
+ *  pgoutput reads an empty `publication_names` list as absent. A publication that EXISTS but
+ *  publishes no tables is a different, legal case — it warns (see {@link ReplicationWarning}) and streams. */
 export class PublicationEmpty extends Error {
   readonly reason = 'publications-empty' as const
   constructor() { super('minipg: publications is empty — pgoutput needs at least one publication to stream') }
 }
 
-/** A `start({ shapes })` entry could not be resolved: a duplicate schema.table, a rejected type
+/** A `start({ shapes })` entry could not be resolved: a duplicate `schema.table`, a rejected type
  *  or decode target, or a `Collect()` group (can't apply to a single replication row). Thrown
- *  before CREATE_REPLICATION_SLOT is sent — a deterministic consumer bug, not one that retries away. */
+ *  before `CREATE_REPLICATION_SLOT` is sent — a deterministic consumer bug, not one that retries away. */
 export class InvalidReplicationShape extends Error {
   readonly reason = 'invalid-shape' as const
   constructor(message: string) { super(message) }
 }
 
 /** A non-fatal condition detected before or during the stream — the library's only warning channel
- *  (see StartOptions.onWarning). `publication-empty`: exists but publishes no tables yet, so the
- *  stream delivers nothing until tables are added. `replica-identity`: an update/delete arrived
- *  without a full old row, so prior state couldn't be reconstructed — fires per table per stream as
- *  the event decodes. `partition-relation`: events arrive under a leaf partition's own name since
- *  its publication doesn't set publish_via_partition_root, at Relation announce. Warned once per table PER KIND. */
+ *  (see {@link StartOptions.onWarning}).
+ *  - `publication-empty`: exists but publishes no tables yet, so the stream delivers nothing until
+ *    tables are added.
+ *  - `replica-identity`: an update/delete arrived without a full old row, so prior state couldn't
+ *    be reconstructed — fires per table per stream as the event decodes.
+ *  - `partition-relation`: events arrive under a leaf partition's own name since its publication
+ *    doesn't set `publish_via_partition_root`, at Relation announce. Warned once per table PER KIND. */
 export type ReplicationWarning =
   | { kind: 'publication-empty'; publication: string; message: string }
   | { kind: 'replica-identity'; schema: string; table: string; replicaIdentity: 'd' | 'n' | 'f' | 'i'; message: string }
   | { kind: 'partition-relation'; schema: string; table: string; publication: string; message: string }
 
 /** Open a logical-replication connection (walsender). One purpose per connection: this cannot
- *  run extended-protocol queries — use a normal connect() alongside it. */
+ *  run extended-protocol queries — use a normal `connect()` alongside it. */
 export async function replication(config: string | ReplicationConfig = {}): Promise<ReplicationConnection> {
   const c = new ReplicationConnection(typeof config === 'string' ? { url: config } : config)
   await c.connect()
@@ -341,7 +343,7 @@ export class ReplicationConnection {
     }
   }
 
-  /** Current stream position (highest LSN seen) and acknowledged position, as 'X/Y' strings. */
+  /** Current stream position (highest LSN seen) and acknowledged position, as `'X/Y'` strings. */
   get lastReceivedLsn(): string { return lsnToString(this.lastReceived) }
   get flushedLsn(): string { return lsnToString(this.flushed) }
 
@@ -414,8 +416,8 @@ export class ReplicationConnection {
     let e = z + 1; while (b[e] !== 0) e++
     this.serverMajor = parseInt(b.toString('latin1', z + 1, e), 10) || 0
   }
-  /** Next protocol message; null once end() was called and the queue is drained — so a parked
-   *  consumer finishes deterministically instead of waiting for a keepalive timer over a dead socket. */
+  /** Next protocol message; null once {@link ReplicationConnection.end} was called and the queue
+   *  is drained — so a parked consumer finishes deterministically instead of waiting for a keepalive timer over a dead socket. */
   private async next(): Promise<RawMessage | null> {
     for (;;) {
       const m = this.q.shift()
@@ -446,7 +448,7 @@ export class ReplicationConnection {
     } catch { /* connection unusable — the command below surfaces the failure */ }
   }
 
-  /** Simple-protocol command: the walsender grammar (IDENTIFY_SYSTEM, CREATE_REPLICATION_SLOT, …)
+  /** Simple-protocol command: the walsender grammar (`IDENTIFY_SYSTEM`, `CREATE_REPLICATION_SLOT`, …)
    *  or plain SQL — the logical walsender accepts both. Rows come back as text. */
   async command(sql: string): Promise<{ columns: string[]; rows: (string | null)[][] }> {
     if (this.streaming) throw new ReplicationBusy()
@@ -482,8 +484,8 @@ export class ReplicationConnection {
 
   /** Create a logical slot (pgoutput). `snapshot: 'export'` returns a snapshot name a normal
    *  connection can pin for a GAPLESS backfill (valid only until this connection's next command).
-   *  Uses the legacy keyword syntax (PG 10-17). 'export' always yields a snapshot name;
-   *  'nothing'/omitted always yields null. */
+   *  Uses the legacy keyword syntax (PG 10-17). `'export'` always yields a snapshot name;
+   *  `'nothing'`/omitted always yields null. */
   async createSlot(name: string, opts: { temporary?: boolean; snapshot: 'export' }): Promise<{ slot: string; consistentPoint: string; snapshot: string }>
   async createSlot(name: string, opts?: { temporary?: boolean; snapshot?: 'nothing' }): Promise<{ slot: string; consistentPoint: string; snapshot: null }>
   async createSlot(name: string, opts: { temporary?: boolean; snapshot?: 'export' | 'nothing' } = {}): Promise<{ slot: string; consistentPoint: string; snapshot: string | null }> {
@@ -500,19 +502,19 @@ export class ReplicationConnection {
   }
 
   /** Consumer acknowledgement: everything <= the value is durably processed — ack a commit's
-   *  `endLsn`. Forgiving: a value inside the LAST delivered commit's record ([lsn, endLsn)) counts
-   *  as that commit's endLsn, so acking `e.lsn` by mistake still fully acks a sequential stream.
-   *  Advances the slot's confirmed_flush (releases WAL) on the next status message. */
+   *  `endLsn`. Forgiving: a value inside the LAST delivered commit's record (`[lsn, endLsn)`) counts
+   *  as that commit's `endLsn`, so acking `e.lsn` by mistake still fully acks a sequential stream.
+   *  Advances the slot's `confirmed_flush` (releases WAL) on the next status message. */
   ack(lsn: string | bigint): void {
     let v = toLsn(lsn)
     if (v >= this.lastDeliveredStart && v < this.lastDeliveredEnd) v = this.lastDeliveredEnd
     if (v > this.flushed) { this.flushed = v; this.sendStatus() }
   }
 
-  /** START_REPLICATION: an async stream of decoded pgoutput events (proto v1 + messages).
-   *  Tuple values decode via the driver's text decoder catalog (config.types honored).
+  /** `START_REPLICATION`: an async stream of decoded {@link ReplicationEvent}s (proto v1 + messages).
+   *  Tuple values decode via the driver's text decoder catalog (`config.types` honored).
    *  At-least-once: unacked events replay after a reconnect — dedupe by commit LSN. */
-  /** Whether the ACTIVE start() stream negotiated binary tuples (resolved 'auto' included). */
+  /** Whether the ACTIVE `start()` stream negotiated binary tuples (resolved `'auto'` included). */
   get binaryTuples(): boolean { return this.binaryMode }
 
   async *start(opts: StartOptions): AsyncGenerator<ReplicationEvent> {
@@ -821,8 +823,8 @@ export class ReplicationConnection {
   }
 
   /** Per-column decoders + output keys for an announced relation. Shape-declared columns decode via
-   *  their declared spec — same resolution as a query() { shape } — keyed by the SHAPE key
-   *  (TableShape.columns maps key -> SQL column when they differ); the rest via pickDecoder's defaults. */
+   *  their declared spec — same resolution as a `query() { shape }` — keyed by the SHAPE key
+   *  ({@link TableShape.columns} maps key -> SQL column when they differ); the rest via {@link pickDecoder}'s defaults. */
   private relEntry(info: ReplicationRelation): RelEntry {
     const shape = this.shaped.get(info.schema + '\0' + info.table)
     const names = info.columns.map((c) => c.name)
@@ -876,7 +878,7 @@ export class ReplicationConnection {
   }
 }
 
-/** done:false carries no commit fields — reading them requires narrowing to done:true, so a
+/** `done:false` carries no commit fields — reading them requires narrowing to `done:true`, so a
  *  mid-transaction ack is a compile error rather than a runtime mistake. */
 export type TransactionBatch =
   | { xid: number; events: ReplicationEvent[]; done: false }
@@ -885,16 +887,16 @@ export type TransactionBatch =
       commitLsn: string; endLsn: string; commitTime: Date; commitTimeUs: number
     }
 
-/** The flat event stream -> per-transaction batches. begin/commit are consumed onto the envelope
- *  (never placed in events[]); commit fields land only on the done:true chunk. A throw
- *  mid-transaction discards buffered events, so nothing partial is ackable.
+/** The flat event stream -> per-transaction {@link TransactionBatch}es. begin/commit are consumed
+ *  onto the envelope (never placed in `events[]`); commit fields land only on the `done:true`
+ *  chunk. A throw mid-transaction discards buffered events, so nothing partial is ackable.
  *
- *  A non-transactional pg_logical_emit_message arrives outside any begin/commit pair, so there is
- *  no batch to hold it and it is DROPPED; a transactional one stays in events[]. maxQueueBytes
- *  bounds the socket's undelivered queue, NOT the assembled batch, so it is not batch memory
- *  safety. Unbounded unless opts.maxEvents is set, which chunks an oversized transaction into
- *  done:false pieces then a final done:true chunk carrying the commit fields — a transaction that
- *  is an exact multiple of maxEvents still ends in an empty done:true chunk to deliver them. */
+ *  A non-transactional `pg_logical_emit_message` arrives outside any begin/commit pair, so there
+ *  is no batch to hold it and it is DROPPED; a transactional one stays in `events[]`.
+ *  `maxQueueBytes` bounds the socket's undelivered queue, NOT the assembled batch, so it is not
+ *  batch memory safety. Unbounded unless `opts.maxEvents` is set, which chunks an oversized
+ *  transaction into `done:false` pieces then a final `done:true` chunk carrying the commit fields
+ *  — a transaction that is an exact multiple of `maxEvents` still ends in an empty `done:true` chunk to deliver them. */
 export async function* batchTransactions(
   stream: AsyncIterable<ReplicationEvent>,
   opts: { maxEvents?: number } = {},
