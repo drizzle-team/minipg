@@ -61,6 +61,17 @@ export interface ReplicateOptions {
    *  and polls until it clears; needs the `pg_signal_backend` grant and fails permanently with
    *  `42501` without it. */
   onSlotBusy?: 'error' | 'evict'
+  /** What to do when a durable slot's health check finds it invalidated. `'error'` (default)
+   *  raises {@link SlotInvalidatedError} straight to `onFatalError`, no behavior change from
+   *  before this option existed. `'recreate'` drops a slot found absent after having been seen,
+   *  `wal-lost`, or with a null `confirmed_flush_lsn`, recreates it with an exported snapshot,
+   *  and fires `backfill` with `isReconnect: true`. Recreate discards everything between the old
+   *  confirmed position and the new start, so it's only for consumers that rebuild their derived
+   *  state from the snapshot. `system-changed` stays terminal under both settings — a promoted
+   *  standby voids every prior LSN assumption and never recreates. A `stop()` racing a recreate
+   *  can leave the durable slot deleted; the next start then finds it absent and creates and
+   *  backfills from scratch. On a temporary slot this option is inert, same as `onSlotBusy`. */
+  onSlotInvalidated?: 'error' | 'recreate'
   /** Fires instead of `backfill` when a durable slot already existed and passed its health check
    *  — nothing to backfill. A throw here routes through `retryDelayMs` like a backfill throw. */
   onResume?: (info: { confirmedFlush: string; restartLsn: string }) => void | Promise<void>
@@ -225,6 +236,22 @@ async function evictAndAwaitClear(conn: ReplicationConnection, name: string, pid
   }
 }
 
+// Same connection, no eviction — the health check's busy branch owns that. 42704 means the goal
+// (the slot is gone) is already reached. 55006 is not in PERMANENT_SQLSTATES, so rethrowing it on
+// deadline routes through the ordinary retry budget instead of failing the session permanently.
+async function dropForRecreate(conn: ReplicationConnection, name: string, signal: AbortSignal): Promise<void> {
+  const deadline = Date.now() + 3000
+  while (true) {
+    try { await conn.dropSlot(name); return }
+    catch (e) {
+      if (e instanceof PgError && e.code === '42704') return
+      if (!(e instanceof PgError && e.code === '55006')) throw e
+      if (Date.now() >= deadline) throw e
+      await sleep(100, signal)
+    }
+  }
+}
+
 // Merges keepAlive: true onto the connect that measured wst = 0 (the one reconnect in run()
 // below), carried onto every later session through derivedKeepAlive once it's known.
 function withDerivedKeepAlive(url: string | ReplicationConfig, forceKeepAlive: boolean): string | ReplicationConfig {
@@ -262,6 +289,10 @@ export function replicate(opts: ReplicateOptions): ReplicateHandle {
   const consumerSetKeepAlive = typeof opts.url !== 'string' && opts.url.keepAlive !== undefined
   const controller = new AbortController() // internal signal: reaches start()'s own signal, so stop() wakes a parked next()
   const effectiveRetryDelayMs = opts.retryDelayMs ?? defaultRetryDelayMs
+  // Shared by both places that decide whether a caught error is a recreate, not a fatal: the
+  // durable-block catch below, and the outer catch's 42704 remap. system-changed never qualifies.
+  const isRecreatable = (e: unknown): e is SlotInvalidatedError =>
+    e instanceof SlotInvalidatedError && e.cause !== 'system-changed' && opts.onSlotInvalidated === 'recreate'
   // The consumer's own signal behaves exactly like calling stop() — same teardown, same
   // idempotency, never onFatalError. Removed in doStop() to avoid leaking this listener.
   const onConsumerAbort = (): void => { stop() }
@@ -328,48 +359,66 @@ export function replicate(opts: ReplicateOptions): ReplicateHandle {
         const name = durableName ?? tempSlotName()
 
         let resumed: { confirmedFlush: string; restartLsn: string } | null = null
+        let recreate: SlotInvalidatedError | null = null // set only by the catch below, consulted by the recreate section further down
 
         if (isDurable) {
-          // Fixed order on every durable connect: the wst probe above, then identify(), then the health check.
-          const identity = await repl.identify()
-          if (lastSystemId !== null && (identity.systemId !== lastSystemId || identity.timeline !== lastTimeline)) {
-            throw new SlotInvalidatedError(name, 'system-changed') // a promoted standby voids every prior LSN assumption
-          }
-          lastSystemId = identity.systemId
-          lastTimeline = identity.timeline
-          if (stopping) throw STOP
-
-          let evictions = 0 // caps S2 -> S2 rounds: two 'evict'-configured consumers pointed at the same slot must not terminate each other forever
-          while (true) { // S2 -> S2 on eviction: re-reads the row over the SAME connection, no reconnect, bounded only by evictAndAwaitClear's own ~3s deadline
-            const row = await readSlotHealth(repl, name)
+          try {
+            // Fixed order on every durable connect: the wst probe above, then identify(), then the health check.
+            const identity = await repl.identify()
+            if (lastSystemId !== null && (identity.systemId !== lastSystemId || identity.timeline !== lastTimeline)) {
+              throw new SlotInvalidatedError(name, 'system-changed') // a promoted standby voids every prior LSN assumption
+            }
+            lastSystemId = identity.systemId
+            lastTimeline = identity.timeline
             if (stopping) throw STOP
-            if (!row) {
-              if (!sawSlot) break // first observation ever: fall through to createSlot below
-              throw new SlotInvalidatedError(name, 'absent') // was there, now gone — never silently recreated
-            }
-            sawSlot = true
-            if (row.wal_status === 'lost') throw new SlotInvalidatedError(name, 'wal-lost')
-            if (row.confirmed_flush_lsn == null) throw new SlotInvalidatedError(name, 'no-confirmed-flush') // guards every LSN use below — this check must run first
-            if (row.active === 't' && row.active_pid != null) {
-              // A holder who keeps re-acquiring after eviction never heals by retrying — cap the rounds instead of terminating backends in an unbounded ping-pong.
-              if (opts.onSlotBusy !== 'evict' || ++evictions > 3) throw new SlotBusyError(name, Number(row.active_pid))
-              await evictAndAwaitClear(repl, name, Number(row.active_pid), opts.onWarning, controller.signal)
+
+            let evictions = 0 // caps S2 -> S2 rounds: two 'evict'-configured consumers pointed at the same slot must not terminate each other forever
+            while (true) { // S2 -> S2 on eviction: re-reads the row over the SAME connection, no reconnect, bounded only by evictAndAwaitClear's own ~3s deadline
+              const row = await readSlotHealth(repl, name)
               if (stopping) throw STOP
-              continue
+              if (!row) {
+                if (!sawSlot) break // first observation ever: fall through to createSlot below
+                throw new SlotInvalidatedError(name, 'absent') // was there, now gone — never silently recreated
+              }
+              sawSlot = true
+              if (row.wal_status === 'lost') throw new SlotInvalidatedError(name, 'wal-lost')
+              if (row.confirmed_flush_lsn == null) throw new SlotInvalidatedError(name, 'no-confirmed-flush') // guards every LSN use below — this check must run first
+              if (row.active === 't' && row.active_pid != null) {
+                // A holder who keeps re-acquiring after eviction never heals by retrying — cap the rounds instead of terminating backends in an unbounded ping-pong.
+                if (opts.onSlotBusy !== 'evict' || ++evictions > 3) throw new SlotBusyError(name, Number(row.active_pid))
+                await evictAndAwaitClear(repl, name, Number(row.active_pid), opts.onWarning, controller.signal)
+                if (stopping) throw STOP
+                continue
+              }
+              resumed = { confirmedFlush: row.confirmed_flush_lsn, restartLsn: row.restart_lsn! }
+              break
             }
-            resumed = { confirmedFlush: row.confirmed_flush_lsn, restartLsn: row.restart_lsn! }
-            break
+          } catch (e) {
+            if (!isRecreatable(e)) throw e
+            recreate = e
           }
         }
         if (stopping) throw STOP
 
+        if (resumed && opts.onResume) {
+          // A throw here routes through retryDelayMs exactly like a backfill throw — it shares this try block's outer catch.
+          await track(Promise.resolve(opts.onResume(resumed)))
+        }
+
+        if (recreate !== null) {
+          attempt++
+          const delay = effectiveRetryDelayMs(attempt, recreate)
+          if (delay == null) { fireFatal(recreate); return }
+          await sleep(delay, controller.signal)
+          if (stopping) throw STOP
+          await dropForRecreate(repl, name, controller.signal)
+          firstBackfill = false // a recreate on a handle's first connect must still report isReconnect: true
+          if (stopping) throw STOP
+        }
+
         let slotForStream: string
         if (resumed) {
           slotForStream = name
-          if (opts.onResume) {
-            // A throw here routes through retryDelayMs exactly like a backfill throw — it shares this try block's outer catch.
-            await track(Promise.resolve(opts.onResume(resumed)))
-          }
         } else {
           const created = await repl.createSlot(name, { temporary: !isDurable, snapshot: 'export' })
           if (isDurable) sawSlot = true
@@ -477,7 +526,10 @@ export function replicate(opts: ReplicateOptions): ReplicateHandle {
         const err: Error = durableName !== null && rawErr instanceof PgError && rawErr.code === '42704'
           ? new SlotInvalidatedError(durableName, 'absent')
           : (rawErr as Error)
-        if (isPermanentFailure(err)) { fireFatal(err); return }
+        // The 42704 remap above manufactures a SlotInvalidatedError on a dead connection, so it
+        // can't be handled in place like the durable block's own catch does — letting it fall
+        // through here lets the next connect's health check see the absence and recreate it.
+        if (isPermanentFailure(err) && !isRecreatable(err)) { fireFatal(err); return }
         attempt++
         const delay = effectiveRetryDelayMs(attempt, err)
         if (delay == null) { fireFatal(err); return }

@@ -835,6 +835,58 @@ test('cdc invalidated: lost, null confirmed_flush, absent after seen, and system
   }
 })
 
+test('cdc recreate: a lost durable slot is dropped, recreated, backfilled with the reconnect flag, and streams', async () => {
+  const backend = cdcBackend({
+    onQuery: (sql) => sql.startsWith('select active,')
+      ? [rowDesc(healthCols), dataRow(['f', null, 'lost', '0/10', '0/8']), ready()]
+      : undefined,
+  })
+  const backfillInfos: { isReconnect: boolean }[] = []
+  const calls: { attempt: number; err: Error }[] = []
+  let fatalErr: Error | undefined
+  const handle = replicate({
+    url: cfg({ socket: backend.socket }),
+    slot: { name: 'durable_recreate' },
+    onSlotInvalidated: 'recreate',
+    publications: ['pub'],
+    backfill: async (info) => { backfillInfos.push({ isReconnect: info.isReconnect }) },
+    onTransaction: async () => {},
+    retryDelayMs: (attempt, err) => { calls.push({ attempt, err }); return 1 },
+    onFatalError: (err) => { fatalErr = err },
+  })
+
+  await until(() => !!backend.latest?.queries.some((q) => q.startsWith('START_REPLICATION')))
+  const queries = backend.latest!.queries
+  const healthIdx = queries.findIndex((q) => q.startsWith('select active,'))
+  const dropIdx = queries.findIndex((q) => q.startsWith('DROP_REPLICATION_SLOT'))
+  const createIdx = queries.findIndex((q) => q.startsWith('CREATE_REPLICATION_SLOT'))
+  const startIdx = queries.findIndex((q) => q.startsWith('START_REPLICATION'))
+  expect(healthIdx).toBeGreaterThanOrEqual(0)
+  expect(dropIdx).toBeGreaterThan(healthIdx)
+  expect(createIdx).toBeGreaterThan(dropIdx)
+  expect(startIdx).toBeGreaterThan(createIdx)
+
+  expect(backfillInfos.length).toBe(1)
+  expect(backfillInfos[0]!.isReconnect).toBe(true)
+
+  expect(calls.length).toBe(1)
+  expect(calls[0]!.attempt).toBe(1)
+  expect(calls[0]!.err).toBeInstanceOf(SlotInvalidatedError)
+  expect((calls[0]!.err as SlotInvalidatedError).cause).toBe('wal-lost')
+
+  const s0 = backend.latest!
+  const relId = 11, commitLsn = 0x20n, endLsn = 0x30n
+  s0.dx.push(pgBegin())
+  s0.dx.push(pgRelation(relId, 'public', 'recreated', 'd', [{ name: 'id', oid: 23, key: true }]))
+  s0.dx.push(pgInsert(relId, [textCell('1')]))
+  s0.dx.push(pgCommit(commitLsn, endLsn))
+  await until(() => lastFlushed(s0.sent) >= endLsn)
+
+  expect(fatalErr).toBeUndefined()
+  expect(backend.sessions.length).toBe(1)
+  await handle.stop()
+})
+
 test('cdc copydone: durable recovery reconnects without createSlot, snapshot, or backfill', async () => {
   const backend = cdcBackend() // default pg_replication_slots row is healthy: active 'f', confirmed_flush '0/10', restart '0/8'
   let backfillCalls = 0
