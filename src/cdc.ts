@@ -201,7 +201,7 @@ async function readSlotHealth(conn: ReplicationConnection, name: string): Promis
 
 // Runs on the replication connection itself, never a second one: terminate the holder, then
 // poll until the slot reads inactive or a ~3s deadline passes. 't'/'f' both mean "keep polling" ('f' is already-gone; 42704 belongs to pg_drop_replication_slot, not this). 42501 propagates untouched for isPermanentFailure() to classify.
-async function evictAndAwaitClear(conn: ReplicationConnection, name: string, pid: number, opts: ReplicateOptions, signal: AbortSignal): Promise<void> {
+async function evictAndAwaitClear(conn: ReplicationConnection, name: string, pid: number, onWarning: ReplicateOptions['onWarning'], signal: AbortSignal): Promise<void> {
   if (!Number.isInteger(pid)) throw new SlotBusyError(name, pid) // the trust boundary: a server-sourced value about to ride into SQL
   await conn.command(`select pg_terminate_backend(${pid})`)
   const deadline = Date.now() + 3000
@@ -209,7 +209,7 @@ async function evictAndAwaitClear(conn: ReplicationConnection, name: string, pid
     const poll = await conn.command(`select active from pg_replication_slots where slot_name = '${name}'`)
     if (poll.rows.length === 0) throw new SlotInvalidatedError(name, 'absent') // dropped mid-poll — never the same as still busy
     if (poll.rows[0]![0] === 'f') {
-      deliverWarning(opts.onWarning, { kind: 'slot-evicted', slot: name, pid, message: `minipg: evicted PID ${pid} holding replication slot ${JSON.stringify(name)}` })
+      deliverWarning(onWarning, { kind: 'slot-evicted', slot: name, pid, message: `minipg: evicted PID ${pid} holding replication slot ${JSON.stringify(name)}` })
       return
     }
     if (Date.now() >= deadline) throw new SlotBusyError(name, pid) // the active flag lags the backend's actual death by a beat — this is what 55006 guards against
@@ -346,7 +346,7 @@ export function replicate(opts: ReplicateOptions): ReplicateHandle {
             if (row.active === 't' && row.active_pid != null) {
               // A holder who keeps re-acquiring after eviction never heals by retrying — cap the rounds instead of terminating backends in an unbounded ping-pong.
               if (opts.onSlotBusy !== 'evict' || ++evictions > 3) throw new SlotBusyError(name, Number(row.active_pid))
-              await evictAndAwaitClear(repl, name, Number(row.active_pid), opts, controller.signal)
+              await evictAndAwaitClear(repl, name, Number(row.active_pid), opts.onWarning, controller.signal)
               if (stopping) throw STOP
               continue
             }
