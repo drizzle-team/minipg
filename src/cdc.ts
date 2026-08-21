@@ -17,10 +17,9 @@ export interface ReplicateOptions {
    *    recreating it. Retains WAL so a disconnected consumer resumes where it left off.
    *  - `{ temporary: true, prefix }`: same as `'temporary'`, but the slot is named
    *    `<prefix>_<8 hex>` instead of `minipg_cdc_<8 hex>`, so the row in `pg_replication_slots`
-   *    identifies the process that owns it. Defaults to `minipg_cdc` when omitted. Validated
-   *    like a durable name, with room held back for the suffix; malformed prefixes throw
-   *    {@link InvalidSlotName} synchronously. */
-  slot: 'temporary' | { name: string } | { temporary: true; prefix?: string }
+   *    identifies the process that owns it. Validated like a durable name, with room held back
+   *    for the suffix; malformed prefixes throw {@link InvalidSlotName} synchronously. */
+  slot: 'temporary' | { name: string } | { temporary: true; prefix: string }
   /** Publications to subscribe — forwarded to `start()`, whose {@link PublicationMissing} probe
    *  applies unchanged. An empty array throws {@link PublicationEmpty} synchronously, before any
    *  session starts. */
@@ -36,8 +35,7 @@ export interface ReplicateOptions {
    *  `0A000`). A throw retries IN PLACE on the same slot/snapshot; a
    *  {@link ReplicateOptions.backfillTimeoutMs} timeout instead goes straight to `onFatalError`,
    *  no retry. `isReconnect` is false only on the handle's first connect ever — true on every
-   *  later connect and on any recreate, sharing its source with {@link ReplicateOptions.onResume}'s
-   *  own `isReconnect`, so the two always agree on which connect this is. */
+   *  later connect and on any recreate. */
   backfill?: (info: { snapshot: string; streamStartLsn: string; isReconnect: boolean; signal: AbortSignal }) => void | Promise<void>
   /** Abandon the session if `backfill` hasn't resolved within this many ms (omitted = unbounded).
    *  Fires {@link BackfillTimeoutError} straight to `onFatalError`, skipping the retry budget —
@@ -69,12 +67,12 @@ export interface ReplicateOptions {
    *  `42501` without it. */
   onSlotBusy?: 'error' | 'evict'
   /** What to do when a durable slot's health check finds it invalidated. `'error'` (default)
-   *  raises {@link SlotInvalidatedError} straight to `onFatalError`, no behavior change from
-   *  before this option existed. `'recreate'` drops a slot found absent after having been seen,
-   *  `wal-lost`, or with a null `confirmed_flush_lsn`, recreates it with an exported snapshot,
-   *  and fires `backfill` with `isReconnect: true`. Recreate discards everything between the old
-   *  confirmed position and the new start, so it's only for consumers that rebuild their derived
-   *  state from the snapshot. `system-changed` stays terminal under both settings — a promoted
+   *  raises {@link SlotInvalidatedError} straight to `onFatalError`. `'recreate'` drops a slot
+   *  found absent after having been seen, `wal-lost`, or with a null `confirmed_flush_lsn`,
+   *  recreates it with an exported snapshot, and fires `backfill` with `isReconnect: true`.
+   *  Recreate discards everything between the old confirmed position and the new start, so it's
+   *  only for consumers that rebuild their derived state from the snapshot. `system-changed`
+   *  stays terminal under both settings — a promoted
    *  standby voids every prior LSN assumption and never recreates. A `stop()` racing a recreate
    *  can leave the durable slot deleted; the next start then finds it absent and creates and
    *  backfills from scratch. On a temporary slot this option is inert, same as `onSlotBusy`. */
@@ -290,7 +288,7 @@ export function replicate(opts: ReplicateOptions): ReplicateHandle {
   // before the handle exists, so a consumer who omitted onFatalError still sees it.
   if (typeof opts.slot !== 'string') {
     if ('name' in opts.slot) validateDurableSlotName(opts.slot.name)
-    else if (opts.slot.prefix !== undefined && !TEMP_SLOT_PREFIX.test(opts.slot.prefix)) throw new InvalidSlotName(opts.slot.prefix)
+    else if (!TEMP_SLOT_PREFIX.test(opts.slot.prefix)) throw new InvalidSlotName(opts.slot.prefix)
   }
   if (opts.publications.length === 0) throw new PublicationEmpty()
   // !(x > 0) catches negative, zero, and NaN in one comparison — a negative value would otherwise fire immediately, aborting every backfill on entry.
@@ -311,14 +309,13 @@ export function replicate(opts: ReplicateOptions): ReplicateHandle {
   let lastSystemId: string | null = null // persisted across connects; a durable slot's systemId/timeline must never move under it
   let lastTimeline: number | null = null
   let derivedKeepAlive = false // true once a connect measures wal_sender_timeout = 0 and the consumer didn't set their own keepAlive
-  let resolveReady!: () => void
-  let rejectReady!: (err: Error) => void; const ready = new Promise<void>((res, rej) => { resolveReady = res; rejectReady = rej })
+  const { promise: ready, resolve: resolveReady, reject: rejectReady } = Promise.withResolvers<void>()
   // run() is a floating promise, so an unawaited ready would otherwise surface an unhandled
   // rejection the moment the first connect fails. Attaching a reaction here marks it handled
   // forever without affecting what a consumer who DOES await it sees.
   ready.catch(() => {})
   const durableName = typeof opts.slot === 'string' || !('name' in opts.slot) ? null : opts.slot.name // captured once, after the synchronous validation above — a later mutation of opts.slot.name is unobservable
-  const tempPrefix = typeof opts.slot !== 'string' && !('name' in opts.slot) ? (opts.slot.prefix ?? 'minipg_cdc') : 'minipg_cdc' // captured once, alongside durableName, for the same reason
+  const tempPrefix = typeof opts.slot !== 'string' && !('name' in opts.slot) ? opts.slot.prefix : 'minipg_cdc' // captured once, alongside durableName, for the same reason
   const consumerSetKeepAlive = typeof opts.url !== 'string' && opts.url.keepAlive !== undefined
   const controller = new AbortController() // internal signal: reaches start()'s own signal, so stop() wakes a parked next()
   const effectiveRetryDelayMs = opts.retryDelayMs ?? defaultRetryDelayMs
@@ -394,9 +391,6 @@ export function replicate(opts: ReplicateOptions): ReplicateHandle {
         const name = durableName ?? tempSlotName(tempPrefix)
 
         let resumed: { confirmedFlush: string; restartLsn: string } | null = null
-        // Set by the catch below (a recreatable SlotInvalidatedError) or by an onResume
-        // 'recreate' verdict (a plain Error) — either way, consulted by the recreate section
-        // further down.
         let recreate: Error | null = null
 
         if (isDurable) {
