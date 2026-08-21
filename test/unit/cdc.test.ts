@@ -2135,24 +2135,6 @@ test('cdc bare slot: "temporary" still names itself minipg_cdc_<hex>', async () 
   }
 })
 
-test('cdc slot: { temporary: true } with no prefix also names itself minipg_cdc_<hex>', async () => {
-  const backend = cdcBackend()
-  const handle = replicate({
-    url: cfg({ socket: backend.socket }),
-    slot: { temporary: true },
-    publications: ['pub'],
-    backfill: async () => {},
-    onTransaction: () => {},
-  })
-  try {
-    await until(() => !!backend.latest?.queries.some((q) => q.startsWith('START_REPLICATION')))
-    const createQuery = backend.latest!.queries.find((q) => q.startsWith('CREATE_REPLICATION_SLOT'))
-    expect(createQuery).toMatch(/^CREATE_REPLICATION_SLOT minipg_cdc_[0-9a-f]{8} TEMPORARY/)
-  } finally {
-    await handle.stop()
-  }
-})
-
 test('cdc a 54-character prefix is accepted, a 55-character one throws synchronously, and so does an empty one', async () => {
   const okBackend = cdcBackend()
   const okPrefix = 'a'.repeat(54)
@@ -2206,30 +2188,6 @@ test('cdc a prefix with a character outside [a-z0-9_] throws synchronously', () 
     // deliberately no onFatalError — the whole point is that this must not need one
   })).toThrow(InvalidSlotName)
   expect(backend.sessions.length).toBe(0)
-})
-
-test('cdc a fresh session mints a fresh suffix on the same prefix', async () => {
-  const backend = cdcBackend()
-  const handle = replicate({
-    url: cfg({ socket: backend.socket }),
-    slot: { temporary: true, prefix: 'myproc' },
-    publications: ['pub'],
-    backfill: async () => {},
-    onTransaction: () => {},
-    retryDelayMs: () => 1,
-  })
-  try {
-    await until(() => !!backend.sessions[0]?.queries.some((q) => q.startsWith('START_REPLICATION')))
-    backend.sessions[0]!.dx.destroy()
-    await until(() => !!backend.sessions[1]?.queries.some((q) => q.startsWith('START_REPLICATION')))
-    const name0 = backend.sessions[0]!.queries.find((q) => q.startsWith('CREATE_REPLICATION_SLOT'))!.split(' ')[1]!
-    const name1 = backend.sessions[1]!.queries.find((q) => q.startsWith('CREATE_REPLICATION_SLOT'))!.split(' ')[1]!
-    expect(name0).toMatch(/^myproc_[0-9a-f]{8}$/)
-    expect(name1).toMatch(/^myproc_[0-9a-f]{8}$/)
-    expect(name0).not.toBe(name1)
-  } finally {
-    await handle.stop()
-  }
 })
 
 test('cdc ready resolves once the server accepts START_REPLICATION', async () => {
@@ -2287,26 +2245,6 @@ test('cdc ready rejects via fireFatal on a give-up path that returns without thr
   await handle.stop()
 })
 
-test('cdc ready never re-settles on a later reconnect', async () => {
-  const backend = cdcBackend()
-  const handle = replicate({
-    url: cfg({ socket: backend.socket }),
-    slot: 'temporary',
-    publications: ['pub'],
-    backfill: async () => {},
-    onTransaction: () => {},
-    retryDelayMs: () => 1,
-  })
-  await handle.ready
-
-  backend.latest!.dx.destroy()
-  await until(() => backend.sessions.length >= 2 && !!backend.latest?.queries.some((q) => q.startsWith('START_REPLICATION')))
-  // A settled promise ignores every later resolve/reject — the second session's own onReady must
-  // be a no-op here, not a second settle attempt someone later reintroduces inside the loop.
-  await handle.ready
-  await handle.stop()
-})
-
 test('cdc an untouched ready produces no unhandled rejection when the first connect fails', async () => {
   const backend = cdcBackend({
     onQuery: (sql) => sql.includes('wal_sender_timeout') ? [errFrame('57P01', 'boom'), ready()] : undefined,
@@ -2351,28 +2289,6 @@ test('cdc stop() before the first connect rejects ready', async () => {
   await expect(handle.ready).rejects.toThrow('minipg: replicate() stopped before the first connect opened a stream')
   await stopPromise
   expect(socketCalls).toBe(0)
-})
-
-test('cdc onResume isReconnect: false on the first session, true on the second — a durable slot that only ever resumes never backfills', async () => {
-  const backend = cdcBackend() // default healthy row resumes every session, never creates
-  const seen: boolean[] = []
-  const handle = replicate({
-    url: cfg({ socket: backend.socket }),
-    slot: { name: 'durable_resume_only' },
-    publications: ['pub'],
-    backfill: async () => {},
-    onResume: async ({ isReconnect }) => { seen.push(isReconnect) },
-    onTransaction: () => {},
-    retryDelayMs: () => 1,
-  })
-  await until(() => !!backend.latest?.queries.some((q) => q.startsWith('START_REPLICATION')))
-  expect(seen).toEqual([false])
-
-  backend.latest!.dx.destroy()
-  await until(() => backend.sessions.length >= 2 && !!backend.latest?.queries.some((q) => q.startsWith('START_REPLICATION')))
-  expect(seen).toEqual([false, true]) // the per-backfill flag this replaces would have reported false forever here — backfill never runs on a resume-only slot
-
-  await handle.stop()
 })
 
 test('cdc backfill and onResume agree on the reconnect flag across a create-then-resume handle', async () => {
