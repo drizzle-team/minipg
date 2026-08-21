@@ -144,6 +144,7 @@
     "fast-check": "^4.8.0",
     "mitata": "^1.0.34",
     "pg": "^8.22.0",
+    "pkg-pr-new": "0.0.88",
     "postgres": "^3.4.9",
     "prettier": "^3.9.1",
     "publint": "^0.3.23",

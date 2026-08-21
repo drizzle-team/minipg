@@ -38,6 +38,8 @@ jobs:
       - run: bun test test/unit
       - run: bun run verify:publish
 
+      # Run from the lockfile, never npx: the tool that uploads a build of this repo should
+      # be the version this repo pinned, not whatever latest resolves to at run time.
       # --previewVersion prevents a preview shadowing the real npm release of the same version.
       # continue-on-error: a pkg.pr.new outage must not fail a commit the gates above passed.
       - name: Publish preview to pkg.pr.new
@@ -46,9 +48,9 @@ jobs:
         run: |
           set -euo pipefail
           if [ "${{ github.event_name }}" = "pull_request" ]; then
-            npx pkg-pr-new publish --json preview.json --previewVersion --comment=update --packageManager=bun,npm
+            bun run pkg-pr-new publish --json preview.json --previewVersion --comment=update --packageManager=bun,npm
           else
-            npx pkg-pr-new publish --json preview.json --previewVersion --comment=off --packageManager=bun,npm
+            bun run pkg-pr-new publish --json preview.json --previewVersion --comment=off --packageManager=bun,npm
           fi
 
       - name: Write install commands to the job summary
