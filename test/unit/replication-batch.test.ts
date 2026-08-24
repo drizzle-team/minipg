@@ -34,7 +34,9 @@ test('batchTransactions: two transactions yield two done-true batches with commi
   expect(batches[1]!.events.length).toBe(1)
 })
 
-test('batchTransactions: an empty begin/commit pair yields an events-empty done-true batch (the DDL case)', async () => {
+// PostgreSQL 15 and newer skip empty transactions in pgoutput, so this pair reaches a client only
+// from PostgreSQL 14 and older. The transform must still handle it.
+test('batchTransactions: an empty begin/commit pair yields an events-empty done-true batch', async () => {
   const events = [beginEvt(1), commitEvt('0/1', '0/2')]
   const batches: TransactionBatch[] = []
   for await (const b of batchTransactions(feed(events))) batches.push(b)
