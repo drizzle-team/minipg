@@ -4,7 +4,8 @@ import type * as tls from 'node:tls'
  *  Required: the event trio + write + end (all a replication connection touches). Optional methods
  *  unlock specific features and degrade loudly, not silently, when absent: `once`/`off` — COPY FROM
  *  drain backpressure; `pause`/`resume` — cursor/stream/copyTo memory bounds (without them the
- *  socket keeps pushing and buffers grow unboundedly); `destroy` — hard teardown on cancel. */
+ *  socket keeps pushing and buffers grow unboundedly); `destroy` — hard teardown on cancel;
+ *  `setKeepAlive` — TCP liveness probes for replication; a transport without it silently skips. */
 export interface MinipgSocket {
   on(event: 'data', listener: (chunk: Buffer | Uint8Array) => void): unknown
   on(event: 'error', listener: (err: Error) => void): unknown
@@ -18,6 +19,7 @@ export interface MinipgSocket {
   pause?(): unknown
   resume?(): unknown
   destroy?(err?: Error): unknown
+  setKeepAlive?(enable: boolean, initialDelayMs?: number): unknown
 }
 import type { Plugin, QueryMetrics } from './plugin.ts'
 import type { ShapeSpec, ParamType } from './spec.ts'

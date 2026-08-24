@@ -21,7 +21,10 @@ Default to using Bun instead of Node.js.
 
 ## Testing
 
-Use `bun test` to run tests.
+Use `bun test` to run tests. It runs unit and integration together; the integration suite needs a
+local cluster from `bun run test:setup` (unix socket, `wal_level=logical` for replication).
+`bun run test:slow` holds a 75s replication regression deliberately gated out of the default run —
+it still needs to pass before publishing.
 
 ```ts#index.test.ts
 import { test, expect } from "bun:test";
