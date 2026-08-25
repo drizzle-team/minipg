@@ -409,14 +409,26 @@ export const isRawParams = (x: unknown): x is RawParams =>
   typeof x === 'object' && x !== null && (x as { __rawParams?: unknown }).__rawParams === true
 
 /** JS value -> JSON-transportable text parameter (the HTTP protocols' request encoding — mirrors the
- *  wire driver's semantics: bytea as \x hex, Date ISO, BigInt decimal string, objects/arrays as JSON
- *  text). Shared by minipg/neon-http and minipg/http. */
-export function encodeJsonParam(v: unknown): unknown {
+ *  wire driver's semantics: bytea as \x hex, Date ISO, BigInt decimal string, ARRAYS as a PG '{…}'
+ *  literal (encodeParam/encodeValueInto do the same — NOT JSON), other objects as JSON text).
+ *  Shared by minipg/neon-http and minipg/http.
+ *
+ *  `declaredOid` is the param's DECLARED type when the caller pinned one (`types: [...]`): a declared
+ *  json/jsonb wins over the value's shape, so a JS array bound to a json param goes out as JSON text —
+ *  exactly what the wire path's binEncoderFor(114/3802) does. */
+export function encodeJsonParam(v: unknown, declaredOid?: number): unknown {
   if (v == null) return null
+  if (declaredOid === 114 || declaredOid === 3802) return typeof v === 'string' ? v : JSON.stringify(v) // declared json/jsonb: a string is already-serialized json
   if (v instanceof Uint8Array) return '\\x' + (Buffer.isBuffer(v) ? v : Buffer.from(v.buffer, v.byteOffset, v.byteLength)).toString('hex') // bytea as hex text
   if (v instanceof Date) return v.toISOString()
   if (typeof v === 'bigint') return v.toString()
-  if (typeof v === 'object') return JSON.stringify(v) // arrays + objects sent as JSON text (matches wire driver)
+  if (Array.isArray(v)) return arrayLiteral(v) // PG array literal '{a,b}'; JSON.stringify here yields 22P02 "malformed array literal"
+  if (typeof v === 'object') return JSON.stringify(v) // plain object -> json/jsonb text
   if (typeof v === 'string' && v.indexOf('\0') !== -1) throw new Error('parameter contains NUL byte (0x00), which PostgreSQL text values cannot represent')
   return v // number | string | boolean
 }
+
+/** encodeJsonParam over a whole param list. Use this instead of `params.map(encodeJsonParam)` — map
+ *  would pass the INDEX as `declaredOid`. `oids` (from resolveParamTypes) is optional and positional. */
+export const encodeJsonParams = (params: readonly unknown[], oids?: readonly number[]): unknown[] =>
+  params.map((v, i) => encodeJsonParam(v, oids?.[i]))

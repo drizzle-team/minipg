@@ -5,6 +5,10 @@
 // Needs a live Neon endpoint. Set NEON_WS_URL to a `postgresql://…neon.tech/db?sslmode=require` string:
 //   NEON_WS_URL='postgresql://user:pass@ep-xxx.region.aws.neon.tech/db?sslmode=require' bun run test:neon-ws
 // Skips entirely when unset, so it never breaks the default `bun test`.
+//
+// The CONNECT-FAILURE block at the bottom is offline (a fake WebSocket constructor) and always runs: the
+// proxy is where things actually go wrong (429/401/ENOTFOUND/TLS, or a hang-up before the session opens)
+// and that error used to be discarded and replaced with one constant string.
 import { test, expect, describe, beforeAll, afterAll } from 'bun:test'
 import { connect, createPool } from '../../src/neon-ws.ts'
 import type { Connection, Pool } from '../../src/neon-ws.ts'
@@ -110,4 +114,120 @@ d('minipg/neon-ws over the Neon WebSocket proxy', () => {
       expect(pool.size).toBe(0)
     }
   })
+})
+
+type Listener = (ev?: unknown) => void
+
+// A WebSocket that never connects anywhere: the test drives its events directly.
+class FakeWS {
+  binaryType = ''
+  readonly url: string
+  private ls = new Map<string, Listener[]>()
+  static last: FakeWS | undefined
+  constructor(url: string) { this.url = url; FakeWS.last = this }
+  addEventListener(type: string, cb: Listener): void { const a = this.ls.get(type) ?? []; a.push(cb); this.ls.set(type, a) }
+  emit(type: string, ev?: unknown): void { for (const cb of this.ls.get(type) ?? []) cb(ev) }
+  send(): void {}
+  close(): void {}
+}
+const ctorThat = (drive: (ws: FakeWS) => void): new (url: string) => FakeWS =>
+  class extends FakeWS { constructor(url: string) { super(url); queueMicrotask(() => drive(this)) } }
+
+const tickWs = () => new Promise((r) => setTimeout(r, 20)) // let the queueMicrotask driver + connect() plumbing run
+
+const cfg = (webSocketConstructor: new (url: string) => FakeWS) =>
+  ({ host: 'ep-test.region.aws.neon.tech', database: 'db', user: 'u', password: 'p', connectTimeout: 3000, webSocketConstructor } as never)
+
+describe('connect failures keep the WebSocket error (offline — a fake WebSocket, no NEON_WS_URL needed)', () => {
+  test("the ErrorEvent's own text (e.g. 'Unexpected server response: 429') reaches the message and the cause", async () => {
+    const cause = new Error('Unexpected server response: 429')
+    const err = await connect(cfg(ctorThat((ws) => ws.emit('error', { error: cause, message: String(cause) })))).catch((e) => e) as Error
+    expect(err.message).toContain('failed to open WebSocket')
+    expect(err.message).toContain('429') // the actionable half, previously replaced by a constant string
+    expect(err.message).toContain('ep-test.region.aws.neon.tech/v2') // still names the address it tried
+    expect(err.cause).toBe(cause)
+  }, 10000)
+
+  test('an ErrorEvent carrying only a message string still surfaces it', async () => {
+    const err = await connect(cfg(ctorThat((ws) => ws.emit('error', { message: 'getaddrinfo ENOTFOUND ep-test.region.aws.neon.tech' })))).catch((e) => e) as Error
+    expect(err.message).toContain('ENOTFOUND')
+  }, 10000)
+
+  test('an event with nothing usable falls back to the plain message (no "undefined" in it)', async () => {
+    const err = await connect(cfg(ctorThat((ws) => ws.emit('error', {})))).catch((e) => e) as Error
+    expect(err.message).toContain('failed to open WebSocket')
+    expect(err.message).not.toContain('undefined')
+  }, 10000)
+
+  test('a close BEFORE open settles the connect promise instead of hanging until connectTimeout', async () => {
+    const started = Date.now()
+    const err = await connect(cfg(ctorThat((ws) => ws.emit('close', { code: 1006, reason: 'abnormal closure' })))).catch((e) => e) as Error
+    expect(err.message).toContain('closed before opening')
+    expect(err.message).toContain('1006')
+    expect(err.message).toContain('abnormal closure')
+    expect(Date.now() - started).toBeLessThan(2000) // NOT the 3s connectTimeout this config allows
+  }, 10000)
+
+  test('an error already rejected is not re-reported by the close that follows it', async () => {
+    const err = await connect(cfg(ctorThat((ws) => {
+      ws.emit('error', { error: new Error('Unexpected server response: 401') })
+      ws.emit('close', { code: 1006 })
+    }))).catch((e) => e) as Error
+    expect(err.message).toContain('401') // the error wins; the close does not overwrite it
+  }, 10000)
+})
+
+// Neon prints `?sslmode=require&channel_binding=require` on EVERY connection string it issues, and that
+// URL used to make this entry unusable: `ssl: false` + `socket` (both mandatory here — the wss tunnel is
+// the TLS, and it IS the transport) tripped the Connection constructor's channel_binding guard, so
+// connect() threw before dialing anything and pool.query() spent the full acquire timeout reporting a
+// database that was "not recovering". No caller could satisfy the parameter on this transport, so it is
+// relaxed to 'prefer' instead of being fatal.
+// This entry RELAXES `require` to 'prefer' — it is deliberately different from minipg/cf and minipg/deno,
+// which refuse it. The reason is that this one points at a single provider: Neon prints
+// `?sslmode=require&channel_binding=require` on every connection string it issues, and its own drivers
+// ignore the parameter — @neondatabase/serverless always selects plain SCRAM-SHA-256 and hardcodes the
+// gs2 header `n,,` (`c=biws`), and never even parses `channel_binding` out of the URL. Refusing would
+// reject Neon's own default connection string; relaxed, minipg puts the identical bytes on the wire.
+describe('channel_binding=require in a provider URL is relaxed, not fatal (offline)', () => {
+  const NEON_URL = 'postgresql://u:p@ep-test.region.aws.neon.tech/verceldb?sslmode=require&channel_binding=require'
+  const opening = () => ctorThat(() => {}) // never opens: the test only cares that a socket was BUILT
+  const built = (): FakeWS | undefined => FakeWS.last // read through a call: a direct `FakeWS.last = undefined` narrows the static to `undefined`
+
+  test('connect() reaches the WebSocket transport instead of throwing at construction', async () => {
+    FakeWS.last = undefined
+    const p = connect({ url: NEON_URL, connectTimeout: 300, webSocketConstructor: opening() } as never).catch((e) => e as Error)
+    await tickWs()
+    expect(built()?.url).toBe('wss://ep-test.region.aws.neon.tech/v2') // a socket was opened => no guard
+    expect(((await p) as Error).message).not.toContain('channel_binding') // it fails on the timeout, not the config
+  }, 10000)
+
+  test('pool.query() reports the real TRANSPORT failure, not a config guard', async () => {
+    // Pre-fix the constructor threw before any socket existed, so the breaker's tripping error — the one
+    // named in the timeout message and in pool.lastError — was the channel_binding guard, and the probe
+    // re-ran that same constructor forever. Now the pool is looking at the WebSocket's own failure, which
+    // is genuinely transient and correctly stays recoverable.
+    const pool = createPool({ url: NEON_URL, max: 1, connectTimeout: 300,
+      reconnect: { baseMs: 20, acquireTimeoutMs: 300 }, webSocketConstructor: ctorThat((ws) => ws.emit('close', { code: 1006, reason: 'gone' })) } as never)
+    const err = await pool.query('select 1', []).catch((e) => e) as Error
+    expect(err.message).not.toContain('channel_binding')
+    expect(pool.lastError?.message).toContain('closed before opening')
+    expect(pool.lastError?.message).toContain('1006')
+    await pool.end()
+  }, 10000)
+
+  test('an explicit channelBinding still wins over the URL (only `require` is downgraded)', async () => {
+    FakeWS.last = undefined
+    // 'disable' is a legitimate stance on this transport and must survive untouched — proven by the
+    // socket still being built (a fatal guard would have stopped us) with no error about the parameter.
+    const p = connect({ url: NEON_URL, channelBinding: 'disable', connectTimeout: 300, webSocketConstructor: opening() } as never).catch((e) => e as Error)
+    await tickWs()
+    expect(built()).toBeDefined()
+    expect(((await p) as Error).message).not.toContain('channel_binding')
+  }, 10000)
+
+  test('it is RELAXED, not refused — minipg/cf and minipg/deno take the opposite path', async () => {
+    const err = await connect({ url: NEON_URL, connectTimeout: 300, webSocketConstructor: opening() } as never).catch((e: Error) => e) as Error
+    expect(err.message).not.toMatch(/cannot be honoured/) // the cf/deno refusal message must NOT appear here
+  }, 10000)
 })
