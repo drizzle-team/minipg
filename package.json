@@ -1,6 +1,6 @@
 {
   "name": "@drizzle-team/minipg",
-  "version": "0.3.4",
+  "version": "0.4.0",
   "description": "A minimal, dependency-free PostgreSQL driver for Node, Bun, Deno, and Cloudflare Workers.",
   "type": "module",
   "license": "MIT",
@@ -56,6 +56,10 @@
       "types": "./dist/replication.d.ts",
       "import": "./dist/replication.js"
     },
+    "./cdc": {
+      "types": "./dist/cdc.d.ts",
+      "import": "./dist/cdc.js"
+    },
     "./neon-ws": {
       "types": "./dist/neon-ws.d.ts",
       "import": "./dist/neon-ws.js"
@@ -99,6 +103,7 @@
     "test": "bun test test/unit test/integration",
     "test:unit": "bun test test/unit",
     "test:integration": "bun test test/integration",
+    "test:slow": "SLOW_TESTS=1 bun test test/integration/replication.test.ts -t 'idle managed'",
     "test:cf": "vitest run --config test/cf/vitest.config.ts",
     "test:neon-ws": "bun test test/integration/neon-ws.test.ts",
     "test:neon-http": "bun test test/integration/neon-http.test.ts test/integration/neon-http-parity.test.ts",
@@ -139,6 +144,7 @@
     "fast-check": "^4.8.0",
     "mitata": "^1.0.34",
     "pg": "^8.22.0",
+    "pkg-pr-new": "0.0.88",
     "postgres": "^3.4.9",
     "prettier": "^3.9.1",
     "publint": "^0.3.23",
