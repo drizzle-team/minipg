@@ -29,6 +29,7 @@
         "npm:fast-check@^4.8.0",
         "npm:mitata@^1.0.34",
         "npm:pg@^8.22.0",
+        "npm:pkg-pr-new@0.0.88",
         "npm:postgres@^3.4.9",
         "npm:prettier@^3.9.1",
         "npm:publint@~0.3.23",
