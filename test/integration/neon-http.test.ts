@@ -7,7 +7,8 @@
 // Skips entirely when unset. Uses uniquely-named real tables (HTTP has no cross-request session, so temp
 // tables don't persist) and drops them in afterAll.
 import { test, expect, describe, beforeAll, afterAll } from 'bun:test'
-import { connect, PgError } from '../../src/neon-http.ts'
+import { connect, createPool as neonClient, PgError } from '../../src/neon-http.ts'
+import type { NeonHttpConfig } from '../../src/neon-http.ts'
 import type { NeonHttpClient } from '../../src/neon-http.ts'
 
 const URL = process.env.NEON_HTTP_URL
@@ -117,5 +118,73 @@ describe('stateless transaction-control guard', () => {
     expect(err?.message).toMatch(/silently break its atomicity/)
     const ok = await db.transaction([{ sql: 'savepoint s' }, { sql: 'rollback to savepoint s' }]).then(() => null, (e: unknown) => e as Error)
     expect(ok?.message).toBe('reached-fetch')
+  })
+})
+
+
+// Offline (no NEON_HTTP_URL needed): a stubbed Neon JSON response drives the decode path directly.
+// decodeSingleRaw scans the raw bytes for "fields": then "rows:" — keep that key order.
+function neonStub(fields: { name: string; dataTypeID: number }[], rows: (string | null)[][], cfg: Partial<NeonHttpConfig> = {}) {
+  const calls: { body: { params?: unknown[] } }[] = []
+  const fetchImpl = (async (_url: Parameters<typeof fetch>[0], init?: RequestInit) => {
+    calls.push({ body: JSON.parse(init!.body as string) })
+    return new Response(JSON.stringify({ command: 'SELECT', rowCount: rows.length, fields, rows }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+  }) as typeof fetch
+  return { db: neonClient({ url: 'postgres://u:p@ep-x.region.aws.neon.tech/db', fetch: fetchImpl, ...cfg }), calls }
+}
+
+describe('minipg/neon-http: column plan + param encoding (offline)', () => {
+  test('minipg/neon-http: unknown columns resolve from fields[].dataTypeID', async () => {
+    const { db } = neonStub(
+      [{ name: 'count', dataTypeID: 23 }, { name: 'j', dataTypeID: 3802 }, { name: 'tags', dataTypeID: 1009 }],
+      [['2', '{"k":1}', '{a,b}']],
+    )
+    const r = await db.query('select …', [], { shape: { count: 'unknown', j: 'unknown', tags: 'unknown' } })
+    expect(r.rows[0]).toEqual({ count: 2, j: { k: 1 }, tags: ['a', 'b'] })
+  })
+
+  test('minipg/neon-http: array params are array literals', async () => {
+    const { db, calls } = neonStub([{ name: 'n', dataTypeID: 23 }], [['1']])
+    await db.query('select $1', [['abc', 'def']])
+    expect(calls[0]!.body.params).toEqual(['{"abc","def"}'])
+  })
+})
+
+// Like minipg/neon-ws, this entry is RELAXED about `channel_binding` — and here it is not even a policy
+// choice: there is no SASL exchange over SQL-over-HTTP at all. The connection string is forwarded verbatim
+// in the Neon-Connection-String header, so the parameter is Neon's to interpret at its own endpoint,
+// exactly as @neondatabase/serverless's HTTP client does. (minipg/cf and minipg/deno REFUSE `require`,
+// because those speak the wire protocol and would otherwise silently authenticate unbound.)
+describe('channel_binding on the HTTP entry (offline)', () => {
+  const NEON_URL = 'postgresql://u:p@ep-test.region.aws.neon.tech/verceldb?sslmode=require&channel_binding=require'
+  const capture = () => {
+    const seen: { url?: string; headers?: Record<string, string> } = {}
+    const f = (async (url: Parameters<typeof fetch>[0], init?: RequestInit) => {
+      seen.url = String(url)
+      seen.headers = Object.fromEntries(new Headers(init?.headers as Record<string, string>).entries())
+      return new Response(JSON.stringify({ command: 'SELECT', rowCount: 1, fields: [{ name: 'n', dataTypeID: 23 }], rows: [['1']] }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } })
+    }) as unknown as typeof fetch
+    return { seen, f }
+  }
+
+  test('a provider URL with channel_binding=require is accepted, not refused', async () => {
+    const { seen, f } = capture()
+    const r = await neonClient({ url: NEON_URL, fetch: f }).query('select 1', [], { mode: 'object' })
+    expect(r.rows[0]).toEqual({ n: 1 })
+    expect(seen.url).toBe('https://api.region.aws.neon.tech/sql') // reached Neon's SQL endpoint
+  })
+
+  test('the parameter is forwarded VERBATIM — minipg does not rewrite or strip it', async () => {
+    const { seen, f } = capture()
+    await neonClient({ url: NEON_URL, fetch: f }).query('select 1', [])
+    const sent = seen.headers?.['neon-connection-string']
+    expect(sent).toBe(NEON_URL) // Neon's endpoint decides what the parameter means, not us
+  })
+
+  test('connect() accepts it too', async () => {
+    const { f } = capture()
+    const c = await connect({ url: NEON_URL, fetch: f } as NeonHttpConfig)
+    expect((await c.query('select 1', [], { mode: 'object' })).rows[0]).toEqual({ n: 1 })
   })
 })

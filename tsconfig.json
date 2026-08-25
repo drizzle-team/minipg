@@ -27,7 +27,8 @@
     "noUnusedParameters": false,
     "noPropertyAccessFromIndexSignature": false
   },
-  // test/cf runs only under @cloudflare/vitest-pool-workers (its own vitest + workerd types); keep it
-  // out of the project-wide `tsc --noEmit` so the core typecheck doesn't require those deps.
-  "exclude": ["test/cf", "dist", "infra"]
+  // test/cf runs only under @cloudflare/vitest-pool-workers (its own vitest + workerd types) and
+  // test/deno only under Deno (its own global types); keep both out of the project-wide `tsc --noEmit`
+  // so the core typecheck doesn't require those deps.
+  "exclude": ["test/cf", "test/deno", "dist", "infra"]
 }

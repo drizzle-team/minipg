@@ -79,7 +79,7 @@ export class MockPgServer {
   private connSeq = 0
   private opts: MockOptions
   private available = true
-  private startupError: { code: string } | null = null
+  private startupError: { code: string; message?: string } | null = null
   private attempts = 0
   private cancels = 0
   private cacheOn = false
@@ -107,7 +107,7 @@ export class MockPgServer {
   /** While false, new TCP connections are refused (destroyed on accept) — simulates a down/restarting server. */
   setAvailable(v: boolean): void { this.available = v }
   /** Send this SQLSTATE as a FATAL at startup and close — simulates auth/config failure (unrecoverable). */
-  failStartupWith(code: string | null): void { this.startupError = code ? { code } : null }
+  failStartupWith(code: string | null, message?: string): void { this.startupError = code ? { code, message } : null }
   /** Total TCP connection attempts seen (use to assert single-flight reconnect). */
   get connectAttempts(): number { return this.attempts }
   /** Number of CancelRequest packets received (use to assert query cancellation). */
@@ -181,7 +181,7 @@ export class MockPgServer {
   }
 
   private doStartup(c: Conn, _body: Buffer): void {
-    if (this.startupError) { c.socket.write(B.error({ code: this.startupError.code, message: this.startupError.code, severity: 'FATAL' })); c.socket.destroy(); return }
+    if (this.startupError) { c.socket.write(B.error({ code: this.startupError.code, message: this.startupError.message ?? this.startupError.code, severity: 'FATAL' })); c.socket.destroy(); return }
     if (this.opts.auth === 'cleartext') { c.socket.write(B.authCleartext()); /* accept any password message later */ }
     c.socket.write(Buffer.concat([
       B.authOk(),

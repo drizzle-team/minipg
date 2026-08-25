@@ -113,7 +113,19 @@ export interface ConnectConfig {
    *  and when it can't bind it sends the honest gs2 'y' flag (downgrade tripwire). 'require'
    *  fails LOUDLY when binding can't happen: no TLS, a custom/cf socket (the server certificate
    *  isn't reachable there), an unsupported cert signature algorithm, or a server without -PLUS.
-   *  Never silently unbound. */
+   *  Never silently unbound.
+   *
+   *  A custom `socket` CAN satisfy 'require' — it just has to expose the certificate; see `socket`.
+   *
+   *  Entries that own their TLS cannot reach the certificate, and split two ways on what to do with
+   *  'require':
+   *   - minipg/neon-ws and minipg/neon-http RELAX it to 'prefer'. They point at one provider whose URLs
+   *     always carry `?channel_binding=require`, and whose own drivers ignore it —
+   *     `@neondatabase/serverless` always picks plain SCRAM-SHA-256 with the gs2 header `n,,`. Refusing
+   *     would reject Neon's own default connection string; relaxed, minipg sends the identical bytes.
+   *   - minipg/cf and minipg/deno REFUSE it, naming the runtime limit (workerd's Socket and Deno's
+   *     TlsConn expose no certificate API). Those dial any Postgres, so a caller who asked for binding
+   *     is told it cannot happen instead of being quietly downgraded. */
   channelBinding?: 'disable' | 'prefer' | 'require'
   /** Connect via a unix-domain socket at this path (e.g. /tmp/.s.PGSQL.5432) instead of
    *  host/port TCP — lower latency / higher throughput on the same machine; SSL is skipped. */
@@ -166,7 +178,13 @@ export interface ConnectConfig {
   /** Custom transport: return an already-connected duplex stream (bypasses net.connect
    *  and SSL). Enables unix sockets, alternative runtimes, and in-process testing.
    *  Structurally typed (see MinipgSocket) — node's Duplex satisfies it, and non-node
-   *  runtimes implement the small surface directly instead of casting. */
+   *  runtimes implement the small surface directly instead of casting.
+   *
+   *  SCRAM channel binding: a transport that terminates its own TLS can support
+   *  `channelBinding: 'require'` by resolving to a stream that also carries
+   *  `getPeerX509Certificate()` or `getPeerCertificate(true)` returning a `raw` DER —
+   *  node's own TLSSocket already does, so `tls.connect({ socket })` works as-is.
+   *  Without one of those, binding is impossible and `'require'` is refused at auth. */
   socket?: () => MinipgSocket | Promise<MinipgSocket>
   /** Telemetry/observability plugins (e.g. otel()/sentry() from 'minipg/telemetry'). They subscribe
    *  to query + connection lifecycle hooks; enabling any plugin turns on per-query timing capture. */
@@ -236,8 +254,11 @@ export interface PoolConfig extends ConnectConfig {
    *  attachDatabasePool() can keep the function instance alive long enough to drain idle connections. */
   idleTimeoutMillis?: number
   /** Single-flight reconnect on connection failure. `false` disables it (fail fast).
-   *  Object tunes backoff (baseMs/maxMs) and how long an acquire waits for recovery. */
-  reconnect?: boolean | { baseMs?: number; maxMs?: number; acquireTimeoutMs?: number }
+   *  Object tunes backoff (baseMs/maxMs) and how long an acquire waits for recovery.
+   *  `probeConnectTimeoutMs` bounds ONE probe attempt (default min(5s, acquireTimeoutMs/2), capped
+   *  by connectTimeout): it must stay well under `acquireTimeoutMs`, or a single stalled attempt
+   *  outlives every waiter and the breaker never re-evaluates. */
+  reconnect?: boolean | { baseMs?: number; maxMs?: number; acquireTimeoutMs?: number; probeConnectTimeoutMs?: number }
   /** Reject an acquire that has waited this long for a free connection (default 30000; 0 = wait forever).
    *  Without it an exhausted pool hangs with no diagnostic — the failure mode every pool has shipped at
    *  some point (pg's connectionTimeoutMillis defaults to off; knex's defaults to 60s). */

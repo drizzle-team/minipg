@@ -8,11 +8,17 @@ interface WebByteStream {
   writable: unknown // WritableStream<Uint8Array>
 }
 
-/** Minimal slice of the Deno global we use (Deno.connect / Deno.connectTls). */
+/** Minimal slice of the Deno global we use (TCP + unix connect, and the STARTTLS upgrade). */
 declare const Deno: {
-  connect(opts: { hostname: string; port: number; transport?: 'tcp' }): Promise<WebByteStream & { close(): void }>
-  connectTls(opts: { hostname: string; port: number }): Promise<WebByteStream & { close(): void }>
+  connect(opts: { hostname: string; port: number; transport?: 'tcp' }): Promise<DenoConn>
+  connect(opts: { transport: 'unix'; path: string }): Promise<DenoConn>
+  connectTls(opts: { hostname: string; port: number }): Promise<DenoConn>
+  /** Upgrade an established plaintext conn to TLS — Postgres' SSLRequest dance needs this, not
+   *  connectTls (the server speaks plaintext until it answers 'S'). */
+  startTls(conn: DenoConn, opts?: { hostname?: string; caCerts?: string[] }): Promise<DenoConn>
 } | undefined
+
+interface DenoConn extends WebByteStream { close(): void }
 
 /** Cloudflare Workers raw-TCP module (requires the `nodejs_compat` flag for Buffer/node:crypto/node:stream). */
 declare module 'cloudflare:sockets' {

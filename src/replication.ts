@@ -315,9 +315,10 @@ export class ReplicationConnection {
 
   constructor(config: ReplicationConfig = {}) {
     const rc = resolveUrl(config)
-    if (rc.channelBinding === 'require') { // satisfiable ONLY on the node TLS transport
-      if (!rc.ssl || rc.ssl === 'disable') throw new Error('minipg: channel_binding=require needs TLS — the binding is a property of the TLS channel; enable ssl or use channel_binding=prefer')
-      if (rc.socket) throw new Error('minipg: channel_binding=require — a custom socket transport cannot expose the server certificate (node TLS only); use channel_binding=prefer')
+    // As in Connection: only "no TLS at all" is decidable up front. A custom `socket` owns its TLS and may
+    // expose the certificate, so scramForChannel decides that case at auth time.
+    if (rc.channelBinding === 'require' && !rc.socket && (!rc.ssl || rc.ssl === 'disable')) {
+      throw new Error('minipg: channel_binding=require needs TLS — the binding is a property of the TLS channel. Enable `ssl`, or use `channel_binding=prefer` to connect unbound.')
     }
     const user = rc.user || process.env.PGUSER || process.env.USER || process.env.USERNAME || 'postgres'
     this.decoders = buildDecoders(rc.types, rc.jsonBigints)

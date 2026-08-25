@@ -30,7 +30,9 @@ The example below queries a local cluster. From a checkout of this repo, provisi
 bun run test:setup
 ```
 
-That starts Postgres on `127.0.0.1:54329` with a `testdb` database and a seeded table `t`.
+That starts Postgres on `127.0.0.1:54329` with a `testdb` database and a seeded table `t`. It uses
+local PostgreSQL binaries when `initdb`/`pg_ctl` are on PATH and a Docker container otherwise (force
+either with `MINIPG_PG_MODE=native|docker`; remove the container with `docker rm -f minipg-test-pg`).
 Any other Postgres works too — point the config below at it.
 
 ```js

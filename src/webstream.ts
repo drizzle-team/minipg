@@ -1,6 +1,6 @@
 import { W } from './protocol.ts'
-type ByteReader = { read(): Promise<{ value?: Uint8Array; done: boolean }>; releaseLock(): void }
-type ByteWriter = { write(b: Uint8Array): Promise<unknown>; releaseLock(): void }
+type ByteReader = { read(): Promise<{ value?: Uint8Array; done: boolean }>; releaseLock(): void; cancel?(reason?: unknown): Promise<void> }
+type ByteWriter = { write(b: Uint8Array): Promise<unknown>; releaseLock(): void; close?(): Promise<void>; abort?(reason?: unknown): Promise<void> }
 
 /** Postgres' STARTTLS exchange over a plaintext socket: send the 8-byte SSLRequest, read the
  *  one-byte reply, fail closed on anything but a bare 'S'. Postgres has NO implicit TLS — a
@@ -29,6 +29,42 @@ export async function negotiateSslRequest(readable: unknown, writable: unknown):
 import { Duplex } from 'node:stream'
 
 export function duplexFromWeb(readable: unknown, writable: unknown): Duplex {
-  // the { readable, writable } overload is valid at runtime but not in the bundled node:stream types
-  return Duplex.from({ readable, writable } as never) as Duplex
+  // Hand-rolled rather than Duplex.from({ readable, writable }): that overload is Node-only — Deno's
+  // node:stream compat rejects it outright (ERR_INVALID_ARG_TYPE, surfacing as the baffling "Cannot read
+  // properties of undefined (reading 'endsWith')"), which made minipg/deno fail on EVERY connect. The
+  // explicit bridge below uses nothing but the Web Streams API and the Duplex constructor.
+  const reader = (readable as { getReader(): ByteReader }).getReader()
+  const writer = (writable as { getWriter(): ByteWriter }).getWriter()
+  let pumping = false
+  const duplex: Duplex = new Duplex({
+    allowHalfOpen: false, // peer EOF finishes both sides and auto-destroys -> the core sees its 'close'
+    read() {
+      if (pumping) return // one pump at a time; a backpressure pause resumes through this same call
+      pumping = true
+      void (async () => {
+        try {
+          for (;;) {
+            const { value, done } = await reader.read()
+            if (done) { pumping = false; duplex.push(null); return }
+            if (value === undefined || value.byteLength === 0) continue
+            // Buffer VIEW over the chunk (no copy) — the protocol Parser copies whatever it retains
+            if (!duplex.push(Buffer.from(value.buffer, value.byteOffset, value.byteLength))) { pumping = false; return }
+          }
+        } catch (e) { pumping = false; if (!duplex.destroyed) duplex.destroy(e as Error) }
+      })()
+    },
+    write(chunk: Buffer, _enc: BufferEncoding, cb: (err?: Error | null) => void) {
+      writer.write(chunk).then(() => cb(), (e: unknown) => cb(e as Error))
+    },
+    final(cb: (err?: Error | null) => void) { // half-close: the peer may already be gone, which is fine
+      if (!writer.close) return cb()
+      writer.close().then(() => cb(), () => cb())
+    },
+    destroy(err: Error | null, cb: (err?: Error | null) => void) {
+      reader.cancel?.().catch(() => { /* already closed */ })
+      writer.abort?.().catch(() => { /* already closed/closing */ })
+      cb(err)
+    },
+  })
+  return duplex
 }

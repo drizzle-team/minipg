@@ -4,7 +4,7 @@
 import { test, expect, describe } from 'bun:test'
 import { Writer } from '../../src/protocol.ts'
 import { writeBindWith } from '../../src/protocol.ts'
-import { compileParamPlan, arrayLiteral } from '../../src/encode.ts'
+import { compileParamPlan, arrayLiteral, encodeParam, encodeJsonParam, encodeJsonParams } from '../../src/encode.ts'
 import { paramTypeOid, resolveParamTypes } from '../../src/spec.ts'
 
 function bindVals(oids: number[], params: unknown[]): { fmts: number[]; vals: (Buffer | null)[] } {
@@ -111,5 +111,34 @@ describe('arrayLiteral', () => {
     expect(arrayLiteral([Buffer.from([0xde, 0xad])])).toBe('{"\\\\xdead"}')
     expect(arrayLiteral([[1], [2]])).toBe('{{1},{2}}')
     expect(arrayLiteral([])).toBe('{}')
+  })
+})
+
+// The HTTP transports' JSON-request encoding (minipg/http + minipg/neon-http). An array used to be
+// JSON.stringify'd here — '["a","b"]' — which Postgres rejects with 22P02 malformed array literal.
+describe('encodeJsonParam / encodeJsonParams (HTTP request encoding)', () => {
+  test('encodeJsonParam matches the wire encoder for arrays, objects, bytea, Date and BigInt', () => {
+    const wire = (v: unknown): string => encodeParam(v).bytes!.toString('utf8')
+    for (const v of [['abc', 'def'], [1, 2, 3], [], [null, 'x'], [['a'], ['b']], [{ a: 1 }]]) {
+      expect(encodeJsonParam(v)).toBe(wire(v)) // '{"abc","def"}', NOT '["abc","def"]'
+    }
+    expect(encodeJsonParam(['abc', 'def'])).toBe('{"abc","def"}') // PG array literal (elements quoted), not JSON
+    expect(encodeJsonParam({ a: 1 })).toBe('{"a":1}') // plain object: still JSON text
+    expect(encodeJsonParam(null)).toBeNull()
+    expect(encodeJsonParam(new Date('2024-01-02T03:04:05Z'))).toBe('2024-01-02T03:04:05.000Z')
+    expect(encodeJsonParam(9007199254740993n)).toBe('9007199254740993')
+    expect(encodeJsonParam(Buffer.from('deadbeef', 'hex'))).toBe('\\xdeadbeef')
+  })
+
+  test("a DECLARED json/jsonb param sends JSON text even when the value is an array (wire parity)", () => {
+    expect(encodeJsonParam(['a'], 3802)).toBe('["a"]')
+    expect(encodeJsonParam(['a'], 114)).toBe('["a"]')
+    expect(encodeJsonParam({ a: 1 }, 3802)).toBe('{"a":1}')
+    expect(encodeJsonParam('{"already":"json"}', 3802)).toBe('{"already":"json"}') // pre-serialized passes through
+  })
+
+  test('encodeJsonParams applies OIDs positionally (and never mistakes the map index for one)', () => {
+    expect(encodeJsonParams([['a'], ['b']], [3802, 1009])).toEqual(['["a"]', '{"b"}'])
+    expect(encodeJsonParams([['a'], ['b']])).toEqual(['{"a"}', '{"b"}'])
   })
 })

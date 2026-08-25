@@ -10,7 +10,7 @@ import type { ConnectConfig, Decoder, Field, MinipgSocket, QueryDebug, QueryOpti
 import { INSTANT_OIDS, BINARY_FAST, tagArrayCol, type CodegenCol } from './decode.ts'
 import { buildMapperFactory, isEvalAvailable, type RowMapper, type RowMapperFactory } from './mapper.ts'
 import { resolveUrl } from './url.ts'
-import { shapeCols, resolveParamTypes, paramTypeOid, type ShapeSpec, type ShapeOf, type ShapeEntries, type ParamType, type PgType } from './spec.ts'
+import { shapeCols, resolveParamTypes, paramTypeOid, mergeUnknownCols as mergeUnknown, type ShapeSpec, type ShapeOf, type ShapeEntries, type ParamType, type PgType } from './spec.ts'
 
 // QueryOptions keys, for the query(sql, opts) arg-shift — an unknown key means "not an options object"
 const OPTION_KEYS = new Set(['name', 'snapshot', 'mode', 'params', 'shape', 'binary', 'metrics', 'debug', 'timeout', 'signal', 'trace'])
@@ -51,7 +51,6 @@ export interface NormalizedConfig {
   plugins: Plugin[]
 }
 
-const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms))
 const RTT_WINDOW = 5 // keep this many most-recent round-trip samples (ms) for connection.rtt
 const DEFAULT_PIPELINE_DEPTH = 100 // max in-flight queries on one connection when pipelining is on (matches postgres.js)
 const FLUSH_THRESHOLD = 64 * 1024  // flush the batch immediately once it reaches this many bytes, even in microtask mode (bounds memory, starts the transfer)
@@ -63,8 +62,11 @@ interface PreparedEntry { sql: string; fields: Field[]; paramOids?: number[]; pl
 // Identity of a Parse on the wire: same name may NOT be reused for different sql OR different declared
 // param types (the parseInflight burst-dedup compares this key).
 // Fill 'unknown' (oid 0) shape columns with the REAL type OIDs from the result, positionally.
-const mergeUnknownCols = (cols: CodegenCol[], fields: Field[]): CodegenCol[] =>
-  cols.map((c, i) => (c.oid === 0 ? { ...c, oid: fields[i]?.dataTypeOid ?? 0 } : c))
+// The merge itself lives in spec.ts so http/neon-http run the SAME one (they used to skip it).
+const mergeUnknownCols = (cols: CodegenCol[], fields: Field[]): CodegenCol[] => mergeUnknown(cols, fields, (f) => f.dataTypeOid)
+
+const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms))
+const firstCstr = (b: Buffer): string => { const z = b.indexOf(0); return b.toString('utf8', 0, z < 0 ? b.length : z) }
 
 const parseKey = (t: Task): string => (t.paramTypes && t.paramTypes.length ? t.sql + '\u0000' + t.paramTypes.join(',') : t.sql)
 
@@ -237,7 +239,6 @@ function readCstrings(buf: Buffer): string[] {
   while (i < buf.length && buf[i] !== 0) { let e = i; while (e < buf.length && buf[e] !== 0) e++; out.push(buf.toString('utf8', i, e)); i = e + 1 }
   return out
 }
-const firstCstr = (buf: Buffer) => { const z = buf.indexOf(0); return buf.toString('utf8', 0, z === -1 ? buf.length : z) }
 
 function makeRow(cells: (Buffer | null)[], body: Buffer, mode: ResultMode, fields: Field[], decoders: Map<number, Decoder>): unknown {
   switch (mode) {
@@ -346,9 +347,12 @@ export class Connection {
 
   constructor(config: ConnectConfig = {}) {
     config = resolveUrl(config) // fold a `url` connection string into defaults (explicit fields still win)
-    if (config.channelBinding === 'require') { // satisfiable ONLY on the node TLS transport — fail the impossible combos at construction
-      if (!config.ssl || config.ssl === 'disable') throw new Error('minipg: channel_binding=require needs TLS — the binding is a property of the TLS channel; enable ssl or use channel_binding=prefer')
-      if (config.socket) throw new Error('minipg: channel_binding=require — a custom socket transport cannot expose the server certificate (node TLS only); use channel_binding=prefer')
+    // Only the no-TLS-at-all case is decidable here. A custom `socket` owns its own TLS (so `ssl: false`
+    // means "I handle it", not "no encryption") and may well expose the certificate — see the `socket`
+    // docs — so whether binding is possible is only known once the transport has connected. scramForChannel
+    // makes that call at auth time, with a more specific message than a blanket refusal could give.
+    if (config.channelBinding === 'require' && !config.socket && (!config.ssl || config.ssl === 'disable')) {
+      throw new Error('minipg: channel_binding=require needs TLS — the binding is a property of the TLS channel. Enable `ssl`, or use `channel_binding=prefer` to connect unbound.')
     }
     const user = config.user || process.env.PGUSER || defaultUser()
     const host = config.host || process.env.PGHOST || 'localhost'
@@ -1584,7 +1588,16 @@ export class Connection {
     this.state = 'closed'
     if (this.connecting) { this.connecting = false; const rj = this.attemptReject; this.attemptResolve = this.attemptReject = undefined; rj?.(e) }
     this.settlePending(e) // never leave an in-flight or queued query hanging
-    await new Promise<void>((r) => { let fin = false; const done = () => { if (!fin) { fin = true; r() } }; try { this.socket?.end(done) } catch { done() } setTimeout(done, 1000) })
+    // The 1s timer is a SAFETY NET for a socket whose end() callback never fires — it must be cleared on
+    // the normal path, or every closed connection leaves a pending timer (Node lingers up to a second
+    // before exiting; Deno's test sanitizer reports it as a leak).
+    await new Promise<void>((r) => {
+      let fin = false
+      let safety: ReturnType<typeof setTimeout> | undefined
+      const done = () => { if (fin) return; fin = true; if (safety !== undefined) clearTimeout(safety); r() }
+      try { this.socket?.end(done) } catch { done() }
+      if (!fin) safety = setTimeout(done, 1000) // end() may have called back synchronously
+    })
     try { this.socket?.destroy() } catch { /* */ }
   }
 }

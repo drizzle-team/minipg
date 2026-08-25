@@ -2,6 +2,7 @@
 // the `url` config field vs real PG. Explicit fields override the URL; pooler auto-detect keys off it.
 import { test, expect, describe, afterEach } from 'bun:test'
 import { connect, createPool, parseConnectionString, Connection } from '../../src/index.ts'
+import { relaxChannelBinding } from '../../src/url.ts'
 
 const URL = 'postgres://postgres:postgres@127.0.0.1:54329/testdb'
 let open: Array<{ end: () => Promise<unknown> }> = []
@@ -28,6 +29,41 @@ describe('parseConnectionString (no connection)', () => {
   test('invalid string / wrong scheme throw', () => {
     expect(() => parseConnectionString('mysql://h/d')).toThrow()
     expect(() => parseConnectionString('not a url')).toThrow()
+  })
+})
+
+describe('relaxChannelBinding (no connection): a transport that owns its TLS cannot honour `require`', () => {
+  // SCRAM channel binding hashes the SERVER CERTIFICATE, which only the node TLS transport hands back.
+  // On minipg/neon-ws, /cf and /deno no caller can satisfy `require` — and Neon prints
+  // `?sslmode=require&channel_binding=require` on every connection string it issues, so rejecting it
+  // rejected the provider's own default URL. Those entries relax it to 'prefer' before Connection sees it.
+  test("`require` from the URL becomes an EXPLICIT 'prefer' (explicit wins over the url in resolveUrl)", () => {
+    const out = relaxChannelBinding({ url: 'postgres://u:p@ep-x.neon.tech/db?sslmode=require&channel_binding=require' })
+    expect(out.channelBinding).toBe('prefer')
+    expect(out.url).toBeTruthy() // the url is left intact — only the resolved stance is overridden
+    expect(parseConnectionString(out.url!).channelBinding).toBe('require') // …and resolveUrl still layers under it
+  })
+
+  test('`require` set as a config FIELD is relaxed the same way', () => {
+    expect(relaxChannelBinding({ channelBinding: 'require' as const }).channelBinding).toBe('prefer')
+  })
+
+  test("'disable' and 'prefer' pass through untouched — this only ever downgrades `require`", () => {
+    expect(relaxChannelBinding({ channelBinding: 'disable' as const }).channelBinding).toBe('disable')
+    expect(relaxChannelBinding({ url: 'postgres://u:p@h/db?channel_binding=disable' }).channelBinding).toBeUndefined()
+    expect(relaxChannelBinding({ channelBinding: 'prefer' as const }).channelBinding).toBe('prefer')
+  })
+
+  test('a config with no channel_binding anywhere is returned as-is', () => {
+    const cfg = { url: 'postgres://u:p@h/db?sslmode=require' }
+    expect(relaxChannelBinding(cfg)).toBe(cfg) // same object: nothing to do
+    expect(relaxChannelBinding({}).channelBinding).toBeUndefined()
+  })
+
+  test('an explicit field still beats the url, in both directions', () => {
+    const url = 'postgres://u:p@h/db?channel_binding=require'
+    expect(relaxChannelBinding({ url, channelBinding: 'disable' as const }).channelBinding).toBe('disable')
+    expect(relaxChannelBinding({ url, channelBinding: 'require' as const }).channelBinding).toBe('prefer')
   })
 })
 
