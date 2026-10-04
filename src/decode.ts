@@ -253,7 +253,9 @@ const readLen = 'l = (b[o] << 24) | (b[o + 1] << 16) | (b[o + 2] << 8) | b[o + 3
 
 // digit-parse straight from ASCII bytes -> JS number (no toString), for integer OIDs. int8 beyond
 // 2^53 loses precision (accumulated in f64) — that's the accepted cost of `bigint:number` (ORM mode).
-const intFromBytes = (v: string) => `{ let p = o, s = false, x = 0; const e = o + l; if (b[p] === 45) { s = true; p++ } for (; p < e; p++) x = x * 10 + (b[p] - 48); ${v} = s ? -x : x }`
+// >16 chars can exceed 15 significant digits, where per-step double rounding DRIFTS (int8 max came
+// out 2000 off vs Number()'s single correct rounding) -> long values take the Number(text) path.
+const intFromBytes = (v: string) => `{ if (l > 16) { ${v} = Number(${lat('o', 'o + l')}) } else { let p = o, s = false, x = 0; const e = o + l; if (b[p] === 45) { s = true; p++ } for (; p < e; p++) x = x * 10 + (b[p] - 48); ${v} = s ? -x : x } }`
 
 // Exact powers of 10 (1e0..1e22) — all exactly representable in f64. Closed over by the compiled
 // builder as `P` for the correctly-rounded fast path below.
@@ -291,7 +293,9 @@ const f64FromBytes = (v: string) => `{ let p = o; const e = o + l; const c0 = b[
 // bytes -> Date.UTC (2-4x faster than new Date(text) AND correct — new Date parses no-tz as LOCAL).
 // ms = first 3 fractional digits (micros truncated; Date is ms-only). Years < 100 / BC: use string.
 export const INSTANT_OIDS = new Set([1082, 1114, 1184]) // date, timestamp, timestamptz
-const tsFromBytes = (v: string, kind: 'date' | 'ms') => `{ let p = o; const e = o + l;
+const tsFromBytes = (v: string, kind: 'date' | 'ms') => `{ let p = o, e = o + l;
+      if (b[p] === 105 || (b[p] === 45 && b[p + 1] === 105)) { ${kind === 'date' ? `${v} = new Date(NaN)` : `${v} = NaN`} } else {
+      let bc = false; if (l >= 3 && b[e - 1] === 67 && b[e - 2] === 66 && b[e - 3] === 32) { bc = true; e -= 3 }
       let Y = 0; for (; p < e; p++) { const c = b[p]; if (c < 48 || c > 57) break; Y = Y * 10 + (c - 48) } p++;
       const Mo = (b[p] - 48) * 10 + (b[p + 1] - 48); p += 3;
       const D = (b[p] - 48) * 10 + (b[p + 1] - 48); p += 2;
@@ -303,7 +307,8 @@ const tsFromBytes = (v: string, kind: 'date' | 'ms') => `{ let p = o; const e = 
         if (p < e && b[p] === 46) { p++; let f = 0, k = 0; for (; p < e && k < 3; p++) { const c = b[p]; if (c < 48 || c > 57) break; f = f * 10 + (c - 48); k++ } while (k < 3) { f *= 10; k++ } ms = f; while (p < e) { const c = b[p]; if (c < 48 || c > 57) break; p++ } }
         if (p < e && (b[p] === 43 || b[p] === 45)) { const sg = b[p] === 45 ? -1 : 1; p++; const th = (b[p] - 48) * 10 + (b[p + 1] - 48); p += 2; let tm = 0, tsc = 0; if (p < e && b[p] === 58) { p++; tm = (b[p] - 48) * 10 + (b[p + 1] - 48); p += 2; if (p < e && b[p] === 58) { p++; tsc = (b[p] - 48) * 10 + (b[p + 1] - 48); p += 2 } } off = sg * ((th * 60 + tm) * 60 + tsc) * 1000 }
       }
-      let ems = Date.UTC(Y, Mo - 1, D, H, Mi, S, ms); if (Y <= 99) { const dd = new Date(ems); dd.setUTCFullYear(Y); ems = dd.getTime() } ems -= off; ${kind === 'date' ? `${v} = new Date(ems)` : `${v} = ems`} }`
+      const yy = bc ? 1 - Y : Y;
+      let ems = Date.UTC(yy, Mo - 1, D, H, Mi, S, ms); if (yy >= 0 && yy <= 99) { const dd = new Date(ems); dd.setUTCFullYear(yy); ems = dd.getTime() } ems -= off; ${kind === 'date' ? `${v} = new Date(ems)` : `${v} = ems`} } }`
 
 // The natural JS target for a wire OID (before any per-column override).
 export function defaultJs(oid: number): 'number' | 'string' | 'bool' | 'json' | 'bytea' | 'helper' {
@@ -600,7 +605,9 @@ const txtBool: CellDecoder = (b, o) => b[o] === 116
 const txtJson: CellDecoder = (b, o, l) => JSON.parse(utf8(b, o, l))
 const txtBytea: CellDecoder = (b, o, l) => { const s = lat1(b, o, l); return s.charCodeAt(0) === 92 && s.charCodeAt(1) === 120 ? Buffer.from(s.slice(2), 'hex') : Buffer.from(s, 'utf8') }
 // digit-parse straight from ASCII bytes -> JS number (int2/int4/oid, and int8/bigint:number)
-const txtInt: CellDecoder = (b, o, l) => { let p = o, s = false, x = 0; const e = o + l; if (b[o] === 45) { s = true; p++ } for (; p < e; p++) x = x * 10 + (b[p]! - 48); return s ? -x : x }
+// long values (>16 chars, can exceed 15 significant digits) go through Number(): per-step double
+// rounding in the digit loop DRIFTS on 19-digit int8s, Number rounds once, correctly
+const txtInt: CellDecoder = (b, o, l) => { if (l > 16) return Number(lat1(b, o, l)); let p = o, s = false, x = 0; const e = o + l; if (b[o] === 45) { s = true; p++ } for (; p < e; p++) x = x * 10 + (b[p]! - 48); return s ? -x : x }
 const txtBigInt: CellDecoder = (b, o, l) => BigInt(lat1(b, o, l)) // int8/bigint -> exact JS BigInt
 
 // (POW10 shared with the JIT section above)
@@ -620,9 +627,13 @@ const txtF64: CellDecoder = (b, o, l) => {
 }
 const txtF4Precise: CellDecoder = (b, o, l) => Math.fround(txtF64(b, o, l) as number) // float4:precise -> exact stored f32
 
-// temporal :date/:ms (direct field parse -> Date.UTC; naive = UTC, tz applies offset; micros -> ms)
+// temporal :date/:ms (direct field parse -> Date.UTC; naive = UTC, tz applies offset; micros -> ms).
+// Mirrors parseInstantMs exactly: ±infinity -> NaN, trailing ' BC' -> astronomical year 1-N.
 function tsParse(b: Buffer, o: number, l: number): number {
-  let p = o; const e = o + l
+  if (b[o] === 105 || (b[o] === 45 && b[o + 1] === 105)) return NaN // 'infinity' / '-infinity'
+  let p = o; let e = o + l
+  let bc = false
+  if (l >= 3 && b[e - 1] === 67 && b[e - 2] === 66 && b[e - 3] === 32) { bc = true; e -= 3 } // strip ' BC'
   let Y = 0; for (; p < e; p++) { const c = b[p]!; if (c < 48 || c > 57) break; Y = Y * 10 + (c - 48) } p++
   const Mo = (b[p]! - 48) * 10 + (b[p + 1]! - 48); p += 3
   const D = (b[p]! - 48) * 10 + (b[p + 1]! - 48); p += 2
@@ -635,8 +646,9 @@ function tsParse(b: Buffer, o: number, l: number): number {
     if (p < e && b[p] === 46) { p++; let f = 0, k = 0; for (; p < e && k < 3; p++) { const c = b[p]!; if (c < 48 || c > 57) break; f = f * 10 + (c - 48); k++ } while (k < 3) { f *= 10; k++ } ms = f; while (p < e) { const c = b[p]!; if (c < 48 || c > 57) break; p++ } }
     if (p < e && (b[p] === 43 || b[p] === 45)) { const sg = b[p] === 45 ? -1 : 1; p++; const th = (b[p]! - 48) * 10 + (b[p + 1]! - 48); p += 2; let tm = 0, tsc = 0; if (p < e && b[p] === 58) { p++; tm = (b[p]! - 48) * 10 + (b[p + 1]! - 48); p += 2; if (p < e && b[p] === 58) { p++; tsc = (b[p]! - 48) * 10 + (b[p + 1]! - 48); p += 2 } } off = sg * ((th * 60 + tm) * 60 + tsc) * 1000 }
   }
-  let ems = Date.UTC(Y, Mo - 1, D, H, Mi, S, ms)
-  if (Y <= 99) { const d = new Date(ems); d.setUTCFullYear(Y); ems = d.getTime() } // Date.UTC remaps years 0-99 to 1900+Y; undo it BEFORE applying the tz offset
+  const year = bc ? 1 - Y : Y // PG 'N BC' -> astronomical year 1-N (44 BC -> -43, 1 BC -> 0)
+  let ems = Date.UTC(year, Mo - 1, D, H, Mi, S, ms)
+  if (year >= 0 && year <= 99) { const d = new Date(ems); d.setUTCFullYear(year); ems = d.getTime() } // Date.UTC remaps years 0-99 to 1900+Y; undo it BEFORE applying the tz offset
   return ems - off
 }
 const tsDate: CellDecoder = (b, o, l) => new Date(tsParse(b, o, l))
