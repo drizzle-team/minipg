@@ -1,15 +1,64 @@
-# nodepg-postgresjs
+# @drizzle-team/minipg
 
-To install dependencies:
+> [!WARNING]
+> Internal Drizzle Team package. Not supported for outside use. Breaking changes can land
+> without notice.
+
+A minimal, dependency-free PostgreSQL driver for Node, Bun, Deno, and Cloudflare Workers. It
+covers the wire protocol directly and ships as ESM only, with 13 subpath entry points for
+each supported runtime and adapter.
+
+## Install
 
 ```bash
-bun install
+pnpm add @drizzle-team/minipg
 ```
-
-To run:
 
 ```bash
-bun run index.ts
+npm install @drizzle-team/minipg
 ```
 
-This project was created using `bun init` in bun v1.3.14. [Bun](https://bun.com) is a fast all-in-one JavaScript runtime.
+```bash
+bun add @drizzle-team/minipg
+```
+
+## Usage
+
+The example below queries a local cluster. From a checkout of this repo, provision one with:
+
+```bash
+bun run test:setup
+```
+
+That starts Postgres on `127.0.0.1:54329` with a `testdb` database and a seeded table `t`. It uses
+local PostgreSQL binaries when `initdb`/`pg_ctl` are on PATH and a Docker container otherwise (force
+either with `MINIPG_PG_MODE=native|docker`; remove the container with `docker rm -f minipg-test-pg`).
+Any other Postgres works too — point the config below at it.
+
+```js
+import { connect } from '@drizzle-team/minipg'
+
+const db = await connect({
+  host: '127.0.0.1',
+  port: 54329,
+  user: 'postgres',
+  password: 'postgres',
+  database: 'testdb',
+})
+
+const result = await db.query('select id, name, n8, amount from t order by id')
+console.log(result.rows)
+
+await db.end()
+```
+
+`n8` (bigint) comes back as a native JS `BigInt`, and `amount` (numeric) comes back as a
+string, since both types can exceed the range a JS number can represent without losing
+precision.
+
+Built-in array columns (`int4[]`, `text[]`, `jsonb[]`, `timestamptz[]`, …) decode to JS
+arrays, with each element following the scalar rules above — so `int8[]` yields `BigInt`s
+and `numeric[]` yields exact strings. Arrays whose element type has a per-database OID
+(`enum[]`, `domain[]`, composite arrays) can't be recognised from the wire OID alone and
+still arrive as the raw `{…}` literal; declare a `shape` for those. To opt back out for a
+given type, override its array OID in `types` (e.g. `types: { 1007: (b) => b.toString() }`).

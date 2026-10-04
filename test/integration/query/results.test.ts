@@ -487,10 +487,10 @@ describe('result-object shape & destructuring contract', () => {
     const row = obj(r)
     expect(row.j).toBeDefined()
     expect(typeof row.j).toBe('object') // json parsed
-    // array_agg yields an array type; decoders leave non-json arrays as the raw text repr (string), not [].
+    // array_agg yields an array type (int4[] here) — the array decoder is bound to that wire OID.
     const agg = await c.query('select array_agg(id order by id) as ids from t', [], { mode: 'object' })
-    expect(typeof obj(agg).ids).toBe('string')
-    expect(obj(agg).ids).toBe('{1,2,3}')
+    expect(Array.isArray(obj(agg).ids)).toBe(true)
+    expect(obj(agg).ids).toEqual([1, 2, 3])
     const adv = await c.query('select pg_try_advisory_lock($1,$2) as locked', [1, 2], { mode: 'object' })
     expect(typeof obj(adv).locked).toBe('boolean')
     await c.query('select pg_advisory_unlock($1,$2)', [1, 2])

@@ -1,6 +1,6 @@
 {
-  "name": "minipg",
-  "version": "0.3.1",
+  "name": "@drizzle-team/minipg",
+  "version": "0.4.1",
   "description": "A minimal, dependency-free PostgreSQL driver for Node, Bun, Deno, and Cloudflare Workers.",
   "type": "module",
   "license": "MIT",
@@ -11,6 +11,10 @@
   "homepage": "https://github.com/drizzle-team/minipg#readme",
   "bugs": {
     "url": "https://github.com/drizzle-team/minipg/issues"
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
   },
   "keywords": [
     "postgres",
@@ -52,6 +56,10 @@
       "types": "./dist/replication.d.ts",
       "import": "./dist/replication.js"
     },
+    "./cdc": {
+      "types": "./dist/cdc.d.ts",
+      "import": "./dist/cdc.js"
+    },
     "./neon-ws": {
       "types": "./dist/neon-ws.d.ts",
       "import": "./dist/neon-ws.js"
@@ -88,12 +96,14 @@
     "node": ">=18"
   },
   "scripts": {
-    "build": "tsdown",
-    "prepublishOnly": "bun run typecheck && bun run build",
+    "build": "bun node_modules/.bin/tsdown",
+    "prepublishOnly": "bun run typecheck && bun run build && bun run verify:publish",
+    "verify:publish": "node scripts/verify-publish.mjs",
     "typecheck": "tsc --noEmit",
     "test": "bun test test/unit test/integration",
     "test:unit": "bun test test/unit",
     "test:integration": "bun test test/integration",
+    "test:slow": "SLOW_TESTS=1 bun test test/integration/replication.test.ts -t 'idle managed'",
     "test:cf": "vitest run --config test/cf/vitest.config.ts",
     "test:neon-ws": "bun test test/integration/neon-ws.test.ts",
     "test:neon-http": "bun test test/integration/neon-http.test.ts test/integration/neon-http-parity.test.ts",
@@ -123,6 +133,7 @@
     "db:studio": "drizzle-kit studio"
   },
   "devDependencies": {
+    "@arethetypeswrong/cli": "^0.18.5",
     "@cloudflare/vitest-pool-workers": "^0.5.2",
     "@mitata/counters": "^0.0.8",
     "@types/bun": "latest",
@@ -133,13 +144,13 @@
     "fast-check": "^4.8.0",
     "mitata": "^1.0.34",
     "pg": "^8.22.0",
+    "pkg-pr-new": "0.0.88",
     "postgres": "^3.4.9",
     "prettier": "^3.9.1",
+    "publint": "^0.3.23",
     "tsdown": "^0.22.3",
+    "typescript": "^5",
     "vitest": "~2.1.9",
     "wrangler": "^3.90.0"
-  },
-  "peerDependencies": {
-    "typescript": "^5"
   }
 }

@@ -170,3 +170,20 @@ function resolveLeaf(name: string, t: TypeSpec | JsonMarker | CustomMarker): Cod
   if (oid === 700) binary = js === 'precise' // float4: only :precise (exact f32) goes binary; bare/:pretty/:string stay text
   return binary ? { name, oid, js, format: 'binary' } : { name, oid, js }
 }
+
+/** Fill 'unknown' (oid 0) shape columns with the REAL type OIDs the server reported, positionally.
+ *  `'unknown'` is the shape contract for "you tell me: use the OID from the result", so EVERY transport
+ *  must run this before planning decoders — otherwise the column decodes as raw text (count(*) as "2",
+ *  `jsonb -> 'k'` as "\"v\"", …). The field shape differs per transport (wire/http: `dataTypeOid`,
+ *  neon-http: `dataTypeID`), so the OID is read through `oidOf`. Allocation-free when nothing defers. */
+export function mergeUnknownCols<F>(cols: CodegenCol[], fields: readonly F[], oidOf: (f: F) => number): CodegenCol[] {
+  for (let i = 0; i < cols.length; i++) {
+    if (cols[i]!.oid !== 0) continue
+    return cols.map((c, j) => { // one deferred column -> resolve them all in a single pass
+      if (c.oid !== 0) return c
+      const f = fields[j]
+      return { ...c, oid: f === undefined ? 0 : oidOf(f) }
+    })
+  }
+  return cols
+}

@@ -23,13 +23,32 @@ interface TxMark { active: boolean }
 // every instance by compat/vercel.ts; this declaration merge puts it on Pool's TYPE.
 export interface Pool extends VercelPoolSurface {}
 
-// Errors that mean "this database will never come back on its own" — don't probe.
+// Errors that mean "this database will never come back on its own" — don't probe. Everything here needs
+// an OPERATOR (or the provider's console) to change something, so retrying only replaces a precise
+// message with a generic timeout. Deliberately NOT here: 53300 too_many_connections, 57P03
+// cannot_connect_now and the ECONNREFUSED family — those DO clear on their own, and `broken` is
+// permanent for the life of the pool, so misclassifying one poisons every later acquire.
+const FATAL_CODES = new Set([
+  '28P01', // invalid_password
+  '28000', // invalid_authorization_specification
+  '3D000', // invalid_catalog_name (no such database)
+  '08004', // server rejected the connection (pg_hba, or a provider refusing this endpoint)
+])
+// Neon/provider control-plane refusals ride in on a generic code with the reason in the message.
+const DISABLED_ENDPOINT = /endpoint (?:is|has been) disabled|disabled endpoint|quota (?:exceeded|exhausted)|exceeded .*quota/i
 function classify(err: unknown): 'fatal' | 'unavailable' {
-  const code = (err as { code?: string } | null)?.code
-  if (code === '28P01' || code === '28000' || code === '3D000') return 'fatal' // bad auth / missing db
+  const e = err as { code?: string; message?: string } | null
+  const code = e?.code
+  if (code !== undefined && FATAL_CODES.has(code)) return 'fatal'
+  // `fatal` is minipg's own marker for "retrying this cannot help": misconfiguration and unusable
+  // transports, which carry no SQLSTATE to key off. Connection already honours it in its reconnect
+  // loop (isFatalAuth); without it here a config error looks like an outage, so the breaker trips,
+  // every acquire waits out the full acquireTimeout, and the probe just re-runs the same failure.
+  if ((err as { fatal?: boolean } | null)?.fatal === true) return 'fatal'
+  if (typeof e?.message === 'string' && DISABLED_ENDPOINT.test(e.message)) return 'fatal'
   return 'unavailable' // ECONNREFUSED/RESET/timeout, 57P0x shutdown, connection terminated, ...
 }
-const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms))
+
 
 const TX_GUARD_MSG =
   'minipg: this pool was used INSIDE its own transaction() callback. That checks out a second connection, so the ' +
@@ -63,6 +82,14 @@ export class Pool {
   private down = false
   private broken: Error | null = null // fatal, unrecoverable (e.g. auth)
   private recovered: (() => void)[] = [] // wake-ups for acquirers waiting on recovery
+  // Why the breaker tripped, and why the latest probe attempt failed. Kept so a recovery timeout can
+  // name a CAUSE — without these the pool reports "timed out waiting for the database to recover" and
+  // the actual ECONNREFUSED / 429 / SCRAM failure is lost.
+  private probeTimer?: ReturnType<typeof setTimeout> // the probe loop's backoff sleep, cleared by end()
+  private probeWake?: () => void
+  private lastDownError: Error | null = null
+  private lastProbeError: Error | null = null
+  private probeConnectMs: number // per-attempt connect timeout for the probe (see startProbe)
 
   // How long an acquire may sit at max before failing (0 = forever, the old behaviour).
   private acquireMs: number
@@ -81,6 +108,12 @@ export class Pool {
     this.base = o.baseMs ?? 50
     this.maxBackoff = o.maxMs ?? 2000
     this.acquireTimeout = o.acquireTimeoutMs ?? 30000
+    // The probe loop must ITERATE inside a waiter's window. With connectTimeout === acquireTimeout
+    // (both 30s by default) a single STALLED attempt — a proxy that accepts the socket then never
+    // finishes startup — outlives every waiter, so the breaker never re-evaluates and the pool never
+    // self-heals. Bound each attempt well under the acquire window instead.
+    const halfWindow = this.acquireTimeout > 0 ? Math.floor(this.acquireTimeout / 2) : 5000
+    this.probeConnectMs = Math.max(1, Math.min(cfg.connectTimeout ?? 30000, o.probeConnectTimeoutMs ?? Math.min(5000, halfWindow)))
     this.acquireMs = cfg.acquireTimeoutMillis ?? 30000
     this.guardTx = cfg.txGuard !== false
     this.idleMs = cfg.idleTimeoutMillis ?? 0
@@ -91,6 +124,9 @@ export class Pool {
   get idleCount(): number { return this.idle.length }
   get waiting(): number { return this.waiters.length }
   get isDown(): boolean { return this.down }
+  /** Why the pool is currently `down` (or last was): the newest probe failure, else the error that
+   *  tripped the breaker. `null` when healthy. The same error rides as `cause` on a recovery timeout. */
+  get lastError(): Error | null { return this.broken ?? this.lastProbeError ?? this.lastDownError }
 
   // idle eviction: a connection sitting in `idle` past idleMs is closed and dropped
   private armIdleTimer(conn: Connection): void {
@@ -178,10 +214,16 @@ export class Pool {
       ' while the first is still held) — use the `tx` handle passed to the callback instead.'
   }
 
-  private async open(): Promise<Connection> {
+  private async open(connectTimeout?: number): Promise<Connection> {
     // Pooled connections are fragile: the POOL owns reconnection (its breaker), so a
     // dead member is evicted, not self-reconnecting. Disable Connection-level reconnect.
-    const conn = new Connection({ ...this.cfg, reconnect: false })
+    // The constructor validates config BEFORE any I/O (bad connection string, an impossible
+    // channel_binding combo, a NUL in `options`), so whatever it throws will throw identically on
+    // every retry — mark it fatal so the breaker fails fast with the real message instead of
+    // reporting a database that is "not recovering".
+    let conn: Connection
+    try { conn = new Connection({ ...this.cfg, reconnect: false, ...(connectTimeout === undefined ? {} : { connectTimeout }) }) }
+    catch (e) { throw Object.assign(e as Error, { fatal: true }) }
     this.all.add(conn)
     try { await conn.connect() } catch (e) { this.all.delete(conn); throw e }
     return conn
@@ -191,6 +233,8 @@ export class Pool {
   private trip(err: Error): void {
     if (classify(err) === 'fatal') { this.broken = err; this.settleBreaker(); return }
     if (this.down || this.closed) return
+    this.lastDownError = err // the cause a recovery timeout will report
+    this.lastProbeError = null
     this.down = true
     this.startProbe()
   }
@@ -200,14 +244,16 @@ export class Pool {
     void (async () => {
       for (let attempt = 0; this.down && !this.closed; attempt++) {
         const backoff = Math.min(this.maxBackoff, this.base * 2 ** attempt)
-        await sleep(backoff * (0.5 + Math.random() * 0.5)) // jitter
+        await this.probeNap(backoff * (0.5 + Math.random() * 0.5)) // jitter; cancelled by end()/recovery
         if (!this.down || this.closed) return
         try {
-          const c = await this.open()
+          const c = await this.open(this.probeConnectMs) // bounded so the loop iterates inside a waiter's window
           this.idle.push(c); this.armIdleTimer(c) // the probe connection becomes the first reusable one
+          this.lastProbeError = null
           this.settleBreaker() // recovered -> release the herd
           return
         } catch (e) {
+          this.lastProbeError = e as Error // keep the newest cause for waitForRecovery's rejection
           if (classify(e as Error) === 'fatal') { this.broken = e as Error; this.settleBreaker(); return }
           // otherwise keep probing with growing backoff
         }
@@ -215,13 +261,33 @@ export class Pool {
     })()
   }
 
+  // The probe's backoff sleep, cancellable. A bare setTimeout here outlives the pool: end() during a
+  // backoff round leaves the timer armed (up to maxBackoff of delayed process exit, and a hard failure
+  // under a leak sanitizer). Cancelling RESOLVES it so the loop wakes and re-checks down/closed.
+  private probeNap(ms: number): Promise<void> {
+    return new Promise<void>((r) => {
+      const wake = () => { this.probeTimer = undefined; this.probeWake = undefined; r() }
+      this.probeWake = wake
+      this.probeTimer = setTimeout(wake, ms)
+    })
+  }
+
+  private cancelProbeNap(): void {
+    if (this.probeTimer !== undefined) clearTimeout(this.probeTimer)
+    this.probeWake?.() // resolves the pending nap; the loop's next `down/closed` check ends it
+  }
+
   // Clear the down flag and wake everyone waiting on recovery (they re-check broken/closed).
   private settleBreaker(): void {
     this.down = false
+    this.cancelProbeNap()
     for (const w of this.recovered.splice(0)) w()
   }
 
   private waitForRecovery(): Promise<void> {
+    // Built HERE, not in the setTimeout callback: a timer-built Error's stack is just Timeout._onTimeout
+    // with no application frame, which is useless for finding the query that was waiting.
+    const timedOut = new Error(`pool acquire timed out after ${this.acquireTimeout}ms waiting for the database to recover`)
     return new Promise<void>((resolve, reject) => {
       let done = false
       const to = setTimeout(() => {
@@ -229,7 +295,9 @@ export class Pool {
         done = true
         const i = this.recovered.indexOf(onRecover)
         if (i >= 0) this.recovered.splice(i, 1)
-        reject(new Error(`pool acquire timed out after ${this.acquireTimeout}ms waiting for the database to recover`))
+        const cause = this.lastProbeError ?? this.lastDownError // the outage's real error, else nothing to add
+        if (cause) { (timedOut as { cause?: unknown }).cause = cause; timedOut.message += ` (last error: ${cause.message})` }
+        reject(timedOut)
       }, this.acquireTimeout)
       const onRecover = () => {
         if (done) return
@@ -381,6 +449,7 @@ export class Pool {
 
   async end(): Promise<void> {
     this.closed = true
+    this.cancelProbeNap() // a probe mid-backoff would otherwise keep its timer armed past end()
     const err = new Error('pool ended')
     this.failWaiters(err)
     for (const w of this.recovered.splice(0)) w() // wake recovery-waiters -> they reject (closed)

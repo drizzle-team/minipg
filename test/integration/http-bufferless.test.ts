@@ -21,7 +21,7 @@ describe('minipg/http without a global Buffer', () => {
       if (typeof globalThis.Buffer !== 'function') throw new Error('polyfill did not install')
       const bytes = Uint8Array.fromBase64(${JSON.stringify(body.toString('base64'))})
       const db = client({
-        url: 'https://gw.example/query', token: 'k',
+        url: 'https://gw.example/query', token: 'k', int8: 'string', // JSON.stringify below would throw on the default BigInt
         fetch: async () => new Response(bytes, { status: 200, headers: { 'Content-Type': 'application/vnd.minipg.pgwire' } }),
       })
       const r = await db.query('select …', [], { mode: 'object' })
@@ -32,6 +32,6 @@ describe('minipg/http without a global Buffer', () => {
     const err = proc.stderr.toString()
     expect(err.includes('ReferenceError')).toBe(false)
     expect(proc.exitCode).toBe(0)
-    expect(JSON.parse(out)).toEqual({ big: '9007199254740993', s: 'café 😀', z: null }) // int8->string default: JSON-safe by design
+    expect(JSON.parse(out)).toEqual({ big: '9007199254740993', s: 'café 😀', z: null }) // int8:'string' -> JSON-safe
   }, TEST_TIMEOUT)
 })

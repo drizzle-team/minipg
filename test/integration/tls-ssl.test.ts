@@ -4,21 +4,21 @@
 // handshake (+ pg_stat_ssl), tls.connect option merging (via a spy that calls
 // through), self-signed / custom-CA verification, malformed cert material, and
 // the N / unexpected-byte / timeout negotiation paths via a stub TCP server.
-import { test, expect, describe, beforeAll, spyOn } from 'bun:test'
+import { test, expect, describe, spyOn } from 'bun:test'
 import net from 'node:net'
 import tls from 'node:tls'
+import { Duplex } from 'node:stream'
 import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
 import { execFileSync } from 'node:child_process'
 import { connect, Connection, PgError } from '../../src/index.ts'
 import { W } from '../../src/protocol.ts'
-import { testConnect, caught } from '../helpers/db.ts'
-
-const PROJECT = '/Users/alexblokh/Development/nodepg-postgresjs'
-const SCRATCH = '/private/tmp/claude-501/-Users-alexblokh-Development-nodepg-postgresjs/c5406bc1-bbcb-4383-9b90-cf83de942bf0/scratchpad'
+import { testConnect, caught, SERVER_CA_PATH, TEST_CONFIG } from '../helpers/db.ts'
 
 // The server's own self-signed cert acts as its own CA (Issuer === Subject === CN=localhost).
 function readServerCa(): string {
-  const raw = fs.readFileSync(`${PROJECT}/test/.pgdata/server.crt`, 'utf8')
+  const raw = fs.readFileSync(SERVER_CA_PATH, 'utf8')
   const m = raw.match(/-----BEGIN CERTIFICATE-----[\s\S]*?-----END CERTIFICATE-----/)
   return m ? m[0] : raw
 }
@@ -26,18 +26,18 @@ const SERVER_CA = readServerCa()
 
 // An UNRELATED self-signed CA generated at runtime, used to prove a cert that is
 // NOT signed by the supplied CA is rejected. Generated lazily; if openssl is
-// unavailable the dependent test is skipped (todo).
-let altCa = ''
-beforeAll(() => {
+// unavailable the dependent test is skipped.
+const altCa: string = (() => {
   try {
-    const key = `${SCRATCH}/alt-ca.key`
-    const crt = `${SCRATCH}/alt-ca.crt`
+    const scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'minipg-tls-'))
+    const key = `${scratch}/alt-ca.key`
+    const crt = `${scratch}/alt-ca.crt`
     execFileSync('openssl', ['req', '-x509', '-newkey', 'rsa:2048', '-nodes',
       '-keyout', key, '-out', crt, '-days', '2', '-subj', '/CN=not-the-server'],
       { stdio: 'ignore' })
-    altCa = fs.readFileSync(crt, 'utf8')
-  } catch { altCa = '' }
-})
+    return fs.readFileSync(crt, 'utf8')
+  } catch { return '' }
+})()
 
 // Stub TCP server that reads the 8-byte SSLRequest then runs `onRequest(sock)`.
 function makeStub(onRequest: (sock: net.Socket) => void): Promise<{ port: number; close: () => void }> {
@@ -263,8 +263,7 @@ describe('self-signed cert + rejectUnauthorized', () => {
     expect((err as Error).message).toMatch(/self[- ]signed|unable to verify|certificate|Hostname/i)
   })
 
-  test('a cert NOT signed by the supplied CA is rejected (wrong/unrelated CA)', async () => {
-    if (!altCa) { return } // openssl unavailable — see todo below
+  test.skipIf(!altCa)('a cert NOT signed by the supplied CA is rejected (wrong/unrelated CA)', async () => {
     const err = await caught(() => testConnect({ ssl: { ca: altCa, rejectUnauthorized: true, servername: 'localhost' } }))
     expect(err).toBeInstanceOf(Error)
     expect((err as Error).message).toMatch(/self[- ]signed|unable to verify|certificate/i)
@@ -393,7 +392,6 @@ describe('roadmap: SSL features not yet implemented', () => {
   test.todo('sslrootcert=system loads OS trust roots for verify-full', () => {})
   test.todo('fused S + ServerHello in one TCP segment (once-data only reads buf[0])', () => {})
   test.todo('SCRAM-SHA-256-PLUS channel binding over TLS', () => {})
-  test.todo('wrong-CA rejection requires openssl to mint an unrelated CA', () => {})
 })
 
 describe('SCRAM channel binding (SCRAM-SHA-256-PLUS, tls-server-end-point)', () => {
@@ -411,9 +409,60 @@ describe('SCRAM channel binding (SCRAM-SHA-256-PLUS, tls-server-end-point)', () 
     try { expect((await plain.query('select 3 as ok', [], { mode: 'object' })).rows[0]).toEqual({ ok: 3 }) } finally { await plain.end() }
   }, 10000)
 
-  test('require + custom socket transport throws at construction (cert unreachable there)', async () => {
-    const err = await caught(() => connect({ ssl: true, channelBinding: 'require', socket: () => { throw new Error('never dialed') } }))
-    expect((err as Error).message).toMatch(/custom socket transport cannot expose the server certificate/)
+  // A custom transport terminates its own TLS, so whether binding is possible depends on what the
+  // factory resolves to — not something the constructor can know. Both directions are covered here.
+  describe('require over a CUSTOM socket transport', () => {
+    // plain TCP -> SSLRequest -> 'S' -> tls.connect on the same socket: what any self-TLS transport does
+    const starttls = () => new Promise<import('node:tls').TLSSocket>((resolve, reject) => {
+      const { host, port } = TEST_CONFIG as { host: string; port: number }
+      const raw = net.connect({ host, port }, () => {
+        const req = Buffer.alloc(8); req.writeInt32BE(8, 0); req.writeInt32BE(80877103, 4)
+        raw.write(req)
+        raw.once('data', (b: Buffer) => {
+          if (b[0] !== 0x53) return reject(new Error('server refused TLS'))
+          const sec = tls.connect({ socket: raw, rejectUnauthorized: false, servername: 'localhost' })
+          sec.once('secureConnect', () => resolve(sec)); sec.once('error', reject)
+        })
+      })
+      raw.once('error', reject)
+    })
+
+    test('CONNECTS when the transport exposes the certificate (node TLSSocket already does)', async () => {
+      // The server recomputes tls-server-end-point from ITS cert inside the signed SCRAM exchange, so
+      // reaching 'ready' at all proves the binding bytes matched — a custom socket really is bound here.
+      const { user, password, database } = TEST_CONFIG as { user: string; password: string; database: string }
+      const c = await connect({ user, password, database, ssl: false, channelBinding: 'require', socket: starttls })
+      try {
+        const r = await c.query('select ssl from pg_stat_ssl where pid = pg_backend_pid()', [], { mode: 'object' })
+        expect(r.rows[0]).toEqual({ ssl: true })
+      } finally { await c.end() }
+    }, 10000)
+
+    test('REFUSED at auth when the transport hides it, naming what a transport must provide', async () => {
+      const hidden = async () => {
+        const sec = await starttls() // same TLS session, stripped of the cert accessors
+        const d = new Duplex({ read() {}, write(chunk, _e, cb) { sec.write(chunk, cb) } })
+        sec.on('data', (b) => d.push(b)); sec.on('close', () => d.push(null)); sec.on('error', (e) => d.destroy(e))
+        return d
+      }
+      const { user, password, database } = TEST_CONFIG as { user: string; password: string; database: string }
+      const err = await caught(() => connect({ user, password, database, ssl: false, channelBinding: 'require', socket: hidden }))
+      const msg = (err as Error).message
+      expect(msg).toMatch(/does not expose the server certificate/)
+      expect(msg).not.toMatch(/node TLS only/) // it is NOT node-TLS-only any more
+      // The remedy is the point of this message, so pin it exactly as styled: the two accessors a
+      // transport may provide, and the stance to fall back to. A looser /getPeerCertificate/ passes
+      // whether or not the identifiers are actually spelled out, which is what it has to prove.
+      expect(msg).toContain('`getPeerX509Certificate()`')
+      expect(msg).toContain('`getPeerCertificate(true)`')
+      expect(msg).toContain('`raw` DER')
+      expect(msg).toContain('`channel_binding=prefer`')
+    }, 10000)
+
+    test('plain TCP with no socket at all is still refused up front (nothing to wait for)', async () => {
+      const err = await caught(() => connect({ ...(TEST_CONFIG as object), ssl: false, channelBinding: 'require' }))
+      expect((err as Error).message).toMatch(/channel_binding=require needs TLS/)
+    })
   })
 
   test('replication() binds too: require over TLS on the walsender', async () => {

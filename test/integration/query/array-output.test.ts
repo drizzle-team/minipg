@@ -73,11 +73,13 @@ describe('OUTPUT array decode — dual-variant (jit == interpreted) + precision 
     expect(Array.isArray(got) && typeof (got as string[])[0] === 'string').toBe(true)
   })
 
-  test('DEFAULT (no shape): array column stays a raw {…} string (no regression)', async () => {
+  test('DEFAULT (no shape): a built-in array OID decodes identically to the declared shape', async () => {
+    const shaped = await decode(`select '{1,2,3}'::int4[] v`, 'int4[]')
     const j = (await jit.query(`select '{1,2,3}'::int4[] v`, [], { mode: 'object' })).rows[0] as { v: unknown }
     const i = (await interp.query(`select '{1,2,3}'::int4[] v`, [], { mode: 'object' })).rows[0] as { v: unknown }
-    expect(j.v).toBe('{1,2,3}')
-    expect(i.v).toBe('{1,2,3}')
+    expect(eq(j.v, [1, 2, 3])).toBe(true)
+    expect(eq(i.v, [1, 2, 3])).toBe(true)
+    expect(eq(j.v, shaped)).toBe(true) // shaped and unshaped agree — same decoder, bound off the wire OID
   })
 })
 

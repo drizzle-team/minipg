@@ -46,8 +46,12 @@ export function nodeTransport(cfg: NormalizedConfig, signal: AbortSignal): Promi
       sock.once('data', (buf: Buffer) => {
         const res = String.fromCharCode(buf[0]!)
         if (res === 'S') {
-          tlsSock = tls.connect({ socket: sock, ...tlsOptions(cfg.ssl as TlsSsl, cfg.host) }, () => resolve(tlsSock!))
-          tlsSock.once('error', reject)
+          // Bound to a `const` so the handshake callback and the error listener both see a
+          // definitely-assigned socket (the outer `let` is only there for the abort listener to
+          // destroy, and TS cannot prove a closure-assigned `let` is set).
+          const secure = tls.connect({ socket: sock, ...tlsOptions(cfg.ssl as TlsSsl, cfg.host) }, () => resolve(secure))
+          tlsSock = secure
+          secure.once('error', reject)
         } else if (res === 'N') {
           reject(Object.assign(new Error('server does not support TLS'), { fatal: true })) // fail closed (no downgrade)
         } else reject(Object.assign(new Error('unexpected SSL response byte: ' + res), { fatal: true }))

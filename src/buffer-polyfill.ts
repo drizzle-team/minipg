@@ -22,7 +22,10 @@ export class MiniBuffer extends Uint8Array {
       const encoding = (a as string) || 'utf8'
       if (encoding === 'hex') { const out = new MiniBuffer(value.length >> 1); for (let i = 0; i < out.length; i++) out[i] = parseInt(value.substr(i * 2, 2), 16); return out }
       if (encoding === 'latin1' || encoding === 'binary' || encoding === 'ascii') { const out = new MiniBuffer(value.length); for (let i = 0; i < value.length; i++) out[i] = value.charCodeAt(i) & 0xff; return out }
-      const u = enc.encode(value); return new MiniBuffer(u.buffer, u.byteOffset, u.byteLength) // utf8
+      // TextEncoder always allocates a FRESH, non-shared ArrayBuffer, but `.buffer` is typed
+      // ArrayBufferLike (ArrayBuffer | SharedArrayBuffer) and the two stopped being interchangeable
+      // once ArrayBuffer gained resize/transfer — so narrow it here rather than widen the constructor.
+      const u = enc.encode(value); return new MiniBuffer(u.buffer as ArrayBuffer, u.byteOffset, u.byteLength) // utf8
     }
     if (value instanceof ArrayBuffer) return new MiniBuffer(value, (a as number) || 0, b) // VIEW (no copy) — matches Buffer.from(ab, off, len)
     const src = value as Uint8Array; const out = new MiniBuffer(src.length); out.set(src); return out // copy

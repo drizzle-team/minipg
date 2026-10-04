@@ -12,7 +12,7 @@
 // `host => `${host}/v2``, `wss://`.
 import { Duplex } from 'node:stream'
 import { connect as coreConnect, createPool as corePool, Connection, Pool, PgError, defaultDecoders } from './core.ts'
-import { resolveUrl } from './url.ts'
+import { relaxChannelBinding, resolveUrl } from './url.ts'
 import type { ConnectConfig, PoolConfig } from './types.ts'
 
 // Minimal structural type for a WHATWG WebSocket — the global on Node ≥22, Bun, Deno, Cloudflare Workers
@@ -22,7 +22,7 @@ interface WSLike {
   send(data: ArrayBufferView | ArrayBuffer): void
   close(code?: number, reason?: string): void
   addEventListener(type: 'open', cb: () => void): void
-  addEventListener(type: 'close', cb: () => void): void
+  addEventListener(type: 'close', cb: (ev: { code?: number; reason?: string }) => void): void
   addEventListener(type: 'error', cb: (ev: unknown) => void): void
   addEventListener(type: 'message', cb: (ev: { data: unknown }) => void): void
 }
@@ -42,6 +42,20 @@ export interface NeonWsExtra {
 
 export type NeonConnectConfig = ConnectConfig & NeonWsExtra
 export type NeonPoolConfig = PoolConfig & NeonWsExtra
+
+// The actionable text a WebSocket error carries. The `ws` package's ErrorEvent puts the real cause on
+// `.error` ("Unexpected server response: 429", "getaddrinfo ENOTFOUND …", TLS failures) with a copy on
+// `.message`; browser/undici events may carry neither. Replacing that with a constant string — as this
+// module used to — is how a connect failure becomes undiagnosable.
+function wsErrorCause(ev: unknown): unknown {
+  const e = ev as { error?: unknown; message?: unknown } | null
+  return e?.error ?? (typeof e?.message === 'string' ? e.message : undefined)
+}
+const causeText = (c: unknown): string => (c instanceof Error ? c.message : typeof c === 'string' ? c : '')
+const withCause = (msg: string, cause: unknown): Error => {
+  const t = causeText(cause)
+  return new Error(t ? `${msg}: ${t}` : msg, cause === undefined ? undefined : { cause })
+}
 
 // WS frame payload -> Buffer. arraybuffer (what we request) and any typed-array (Bun's 'nodebuffer')
 // are handled; a string frame is never expected for the binary PG protocol but is decoded defensively.
@@ -70,7 +84,14 @@ function duplexFromWebSocket(ws: WSLike): Duplex {
   })
   ws.addEventListener('message', (ev) => { duplex.push(toBuffer(ev.data)) })
   ws.addEventListener('close', () => { duplex.push(null) }) // end readable -> (allowHalfOpen:false) auto-destroy -> 'close'
-  ws.addEventListener('error', () => { if (!duplex.destroyed) duplex.destroy(new Error('minipg/neon-ws: websocket error')) })
+  ws.addEventListener('error', (ev) => {
+    if (duplex.destroyed) return
+    // Destroying with an error emits 'error' on the stream — which THROWS (crashing the process) when
+    // nobody is listening yet. Pre-open the duplex has no owner: the connect promise has not resolved
+    // with it, so the core has attached nothing. There the rejection carries the cause instead.
+    if (duplex.listenerCount('error') === 0) duplex.destroy()
+    else duplex.destroy(withCause('minipg/neon-ws: websocket error', wsErrorCause(ev)))
+  })
   return duplex
 }
 
@@ -92,24 +113,38 @@ function neonSocket(config: NeonConnectConfig): () => Promise<Duplex> {
     const duplex = duplexFromWebSocket(ws)
     ws.addEventListener('open', () => { if (!settled) { settled = true; resolve(duplex) } })
     // a socket error before 'open' fails the connect attempt; after 'open' it surfaces via the duplex 'close'
-    ws.addEventListener('error', () => { if (!settled) { settled = true; reject(new Error(`minipg/neon-ws: failed to open WebSocket to ${url}`)) } })
+    ws.addEventListener('error', (ev) => {
+      if (settled) return
+      settled = true
+      reject(withCause(`minipg/neon-ws: failed to open WebSocket to ${url}`, wsErrorCause(ev)))
+    })
+    // A socket that closes WITHOUT ever emitting 'error' (some proxies just hang up) would otherwise
+    // leave this promise pending until connectTimeout — settle it here with the close code instead.
+    ws.addEventListener('close', (ev) => {
+      if (settled) return
+      settled = true
+      reject(new Error(`minipg/neon-ws: WebSocket to ${url} closed before opening (code ${ev?.code ?? 'unknown'}${ev?.reason ? `: ${ev.reason}` : ''})`))
+    })
   })
 }
 
 // ssl is forced off on this path: the wss tunnel already encrypts and Neon's proxy skips PG-level SSL,
 // so no SSLRequest is sent. (Passing config.socket bypasses the net/tls transport entirely regardless.)
+// relaxChannelBinding for the same reason: SCRAM binding needs the server certificate, and this transport
+// has none to expose — the TLS lives in the wss tunnel. Neon prints `channel_binding=require` on every URL
+// it issues, so rejecting it would reject the provider's own default connection string.
 
 /** Open and authenticate a single connection to Neon over its WebSocket proxy. Accepts a config or a
  *  `postgres://…neon.tech/db?sslmode=require` connection string. */
 export function connect(config: string | NeonConnectConfig = {}): Promise<Connection> {
   const c: NeonConnectConfig = typeof config === 'string' ? { url: config } : config
-  return coreConnect({ ...c, ssl: false, socket: neonSocket(c) })
+  return coreConnect({ ...relaxChannelBinding(c), ssl: false, socket: neonSocket(c) })
 }
 
 /** Create a lazy connection pool over Neon's WebSocket proxy. Accepts a config or a connection string. */
 export function createPool(config: string | NeonPoolConfig = {}): Pool {
   const c: NeonPoolConfig = typeof config === 'string' ? { url: config } : config
-  return corePool({ ...c, ssl: false, socket: neonSocket(c) })
+  return corePool({ ...relaxChannelBinding(c), ssl: false, socket: neonSocket(c) })
 }
 
 export { Connection, Pool, PgError, defaultDecoders }

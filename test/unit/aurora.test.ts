@@ -7,6 +7,7 @@
 import { test, expect, describe } from 'bun:test'
 import { signV4 } from '../../src/sigv4.ts'
 import { connect, bind, toParameters, PgError, type AuroraConfig } from '../../src/aurora.ts'
+import { Shape } from '../../src/shape.ts'
 
 describe('SigV4 signer (src/sigv4.ts)', () => {
   test('matches AWS documented vector: GET iam ListUsers 20150830', async () => {
@@ -185,5 +186,99 @@ describe('transaction-control SQL guard', () => {
     }
     const berr = await db.batch('commit', [[]]).then(() => null, (e: unknown) => e as Error)
     expect(berr?.message).toMatch(/bypasses the Data API's transaction threading/)
+  })
+})
+
+// A one-shot result-set response with the given columns/records.
+const rs = (columnMetadata: { name: string; typeName: string }[], records: unknown[][]) =>
+  mockFetch(() => ({ json: { columnMetadata, records } }))
+
+describe('aurora: output shapes', () => {
+  test('a shape picks the decode targets, overriding the Data API typeName', async () => {
+    // Reported as text/int8; the shape asks for int4 and a JS number/string instead.
+    const { fetchImpl } = rs(
+      [{ name: 'n', typeName: 'text' }, { name: 'big', typeName: 'int8' }, { name: 'when', typeName: 'timestamptz' }],
+      [[{ stringValue: '42' }, { stringValue: '9007199254740993' }, { stringValue: '2024-01-15 10:30:45+00' }]],
+    )
+    const db = await connect(CFG(fetchImpl))
+    const r = await db.query('select …', [], { shape: { n: 'int4', big: 'int8:string', when: 'timestamptz:string' } })
+    expect(r.rows[0]).toEqual({ n: 42, big: '9007199254740993', when: '2024-01-15 10:30:45+00' })
+    expect(r.columns).toEqual(['n', 'big', 'when']) // shape keys are the OUTPUT keys
+  })
+
+  test("a shape implies mode:'object', and mode:'array' still wins when asked", async () => {
+    const cols = [{ name: 'a', typeName: 'int4' }, { name: 'b', typeName: 'text' }]
+    const recs = [[{ longValue: 1 }, { stringValue: 'x' }]]
+    const obj = await (await connect(CFG(rs(cols, recs).fetchImpl))).query('select …', [], { shape: { a: 'int4', b: 'text' } })
+    expect(obj.rows[0]).toEqual({ a: 1, b: 'x' })
+    const arr = await (await connect(CFG(rs(cols, recs).fetchImpl))).query('select …', [], { shape: { a: 'int4', b: 'text' }, mode: 'array' })
+    expect(arr.rows[0]).toEqual([1, 'x'])
+  })
+
+  test("'unknown' defers a column to the reported typeName, like the other transports", async () => {
+    const { fetchImpl } = rs(
+      [{ name: 'count', typeName: 'int8' }, { name: 'doc', typeName: 'jsonb' }],
+      [[{ stringValue: '2' }, { stringValue: '{"k":1}' }]],
+    )
+    const db = await connect(CFG(fetchImpl))
+    const r = await db.query('select …', [], { shape: { count: 'unknown', doc: 'unknown' } })
+    expect(r.rows[0]).toEqual({ count: 2n, doc: { k: 1 } })
+  })
+
+  test('a shape can name a type the Data API metadata cannot (enum reported as its own typname)', async () => {
+    const { fetchImpl } = rs([{ name: 'mood', typeName: 'mood_enum' }], [[{ stringValue: 'happy' }]])
+    const db = await connect(CFG(fetchImpl))
+    const r = await db.query('select …', [], { shape: { mood: 'text' } })
+    expect(r.rows[0]).toEqual({ mood: 'happy' })
+  })
+
+  test('a Shape() mapper object is accepted, and its binary format request is downgraded to text', async () => {
+    const { fetchImpl } = rs([{ name: 'id', typeName: 'int4' }, { name: 'nm', typeName: 'text' }], [[{ longValue: 7 }, { stringValue: 'a' }]])
+    const db = await connect(CFG(fetchImpl))
+    const s = Shape({ id: 'int4', nm: 'text' }) // int4 is in BINARY_FAST -> $cols asks for binary
+    expect(s.$cols.some((c) => c.format === 'binary')).toBe(true) // …and the Data API only ever sends text
+    const r = await db.query('select …', [], { shape: s })
+    expect(r.rows[0]).toEqual({ id: 7, nm: 'a' })
+  })
+
+  test('a shape with the wrong column count throws instead of decoding the wrong column', async () => {
+    const { fetchImpl } = rs([{ name: 'a', typeName: 'int4' }, { name: 'b', typeName: 'text' }], [[{ longValue: 1 }, { stringValue: 'x' }]])
+    const db = await connect(CFG(fetchImpl))
+    const err = await db.query('select …', [], { shape: { a: 'int4' } }).catch((e) => e) as Error
+    expect(err.message).toContain('shape declares 1 column(s)')
+    expect(err.message).toContain('returned 2')
+  })
+})
+
+describe('aurora: array columns decode like every other entry', () => {
+  test("pg_type's '_elem' array typenames are recognised and decoded to JS arrays", async () => {
+    const { fetchImpl } = rs(
+      [{ name: 'ints', typeName: '_int4' }, { name: 'bigs', typeName: '_int8' }, { name: 'tags', typeName: '_text' }, { name: 'stamps', typeName: '_timestamptz' }],
+      [[{ stringValue: '{1,2,3}' }, { stringValue: '{1,9007199254740993}' }, { stringValue: '{a,b}' }, { stringValue: '{"2024-01-15 10:30:45+00"}' }]],
+    )
+    const db = await connect(CFG(fetchImpl))
+    const r = await db.query('select …', [], { mode: 'object' }) as { rows: Record<string, unknown>[] }
+    expect(r.rows[0]!.ints).toEqual([1, 2, 3])
+    expect(r.rows[0]!.bigs).toEqual([1n, 9007199254740993n]) // int8[] elements follow the scalar rule
+    expect(r.rows[0]!.tags).toEqual(['a', 'b'])
+    expect((r.rows[0]!.stamps as Date[])[0]).toBeInstanceOf(Date)
+  })
+
+  test('an array type with no known element still arrives as its raw literal (never a wrong guess)', async () => {
+    const { fetchImpl } = rs([{ name: 'moods', typeName: '_mood_enum' }], [[{ stringValue: '{happy,sad}' }]])
+    const db = await connect(CFG(fetchImpl))
+    const r = await db.query('select …', [], { mode: 'object' }) as { rows: Record<string, unknown>[] }
+    expect(r.rows[0]!.moods).toBe('{happy,sad}')
+    // …and a shape is the way out
+    const typed = await (await connect(CFG(rs([{ name: 'moods', typeName: '_mood_enum' }], [[{ stringValue: '{happy,sad}' }]]).fetchImpl)))
+      .query('select …', [], { shape: { moods: 'text[]' } })
+    expect(typed.rows[0]).toEqual({ moods: ['happy', 'sad'] })
+  })
+
+  test("temporal:'string' reaches temporal[] elements too", async () => {
+    const { fetchImpl } = rs([{ name: 'stamps', typeName: '_timestamptz' }], [[{ stringValue: '{"2024-01-15 10:30:45+00"}' }]])
+    const db = await connect({ ...CFG(fetchImpl), temporal: 'string' })
+    const r = await db.query('select …', [], { mode: 'object' }) as { rows: Record<string, unknown>[] }
+    expect(r.rows[0]!.stamps).toEqual(['2024-01-15 10:30:45+00'])
   })
 })

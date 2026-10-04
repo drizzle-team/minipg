@@ -5,7 +5,7 @@
 // Needs the local PG cluster reachable from workerd (`bun run test:setup`, listening on 127.0.0.1:54329).
 // Run with: `bun run test:cf`.
 import { it, expect } from 'vitest'
-import { connect } from '../../src/cf.ts'
+import { connect, createPool } from '../../src/cf.ts'
 
 const CFG = { host: '127.0.0.1', port: 54329, user: 'postgres', password: 'postgres', database: 'testdb' }
 
@@ -66,3 +66,31 @@ it('sslmode=require does the Postgres STARTTLS dance (reaches TLS; self-signed c
   expect(err!.message).toMatch(/TLS handshake failed/)
   expect(err!.message).not.toMatch(/startup|SSLRequest reply/i)
 }, 15000)
+
+it('`channel_binding=require` is refused up front, naming the workerd limit', async () => {
+  // cloudflare:sockets owns the TLS session and its Socket exposes no certificate API, so SCRAM's
+  // tls-server-end-point cannot be computed here by anyone. This entry dials ANY Postgres, so a caller
+  // who asked for binding is told it is impossible rather than silently downgraded to an unbound session.
+  // (minipg/neon-ws relaxes instead — one provider, whose own drivers ignore the parameter.)
+  let err: Error | null = null
+  try { await connect('postgres://postgres:postgres@127.0.0.1:54329/testdb?channel_binding=require') } catch (e) { err = e as Error }
+  expect(err).not.toBeNull()
+  expect(err!.message).toMatch(/channel_binding=require cannot be honoured/)
+  expect(err!.message).toMatch(/cloudflare:sockets/)             // says WHY, not just "unsupported"
+  expect(err!.message).toContain('`channel_binding=prefer`')     // …and what to do instead,
+  expect(err!.message).toContain('`minipg/node`')                // …or where to go for a bound connection
+  expect((err as unknown as { fatal?: boolean }).fatal).toBe(true) // a pool must not retry this
+})
+
+it('createPool refuses it synchronously too — no lazy 30s breaker timeout', () => {
+  expect(() => createPool('postgres://postgres:postgres@127.0.0.1:54329/testdb?channel_binding=require'))
+    .toThrow(/channel_binding=require cannot be honoured/)
+})
+
+it('channel_binding=prefer and disable still connect normally', async () => {
+  for (const mode of ['prefer', 'disable']) {
+    const db = await connect(`postgres://postgres:postgres@127.0.0.1:54329/testdb?channel_binding=${mode}`)
+    try { expect((await db.query('select 1 as ok', [], { mode: 'object' })).rows[0]).toEqual({ ok: 1 }) }
+    finally { await db.end() }
+  }
+})

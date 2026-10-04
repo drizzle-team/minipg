@@ -10,11 +10,17 @@
 //
 // Params: the CALLER owns the SQL and its `:name`/`:pN` placeholders — we never rewrite it. Use `bind()`:
 //   db.query('insert into t (a,b) values (:p1, :uid)', [ bind.bigint(10), bind.uuid(id, 'uid') ])
+//
+// Output shapes work here as on every other entry: `{ shape: { id: 'int4', tags: 'text[]' } }` takes the
+// decode targets from YOUR declaration instead of the Data API's reported typeName — the only way to
+// decode a type its metadata cannot name (enum/domain/composite arrive as their own typname).
 // Interactive transactions work (begin/transaction) via a threaded transactionId. No streaming/cursors
 // (1 MiB response cap), no COPY/LISTEN, no array bind params (pass as text/JSON) — Data API limitations.
 import { buildMapperFactory, type RowMapperFactory } from './mapper.ts'
 import { buildDecoders } from './decode.ts'
-import { INSTANT_OIDS, type CodegenCol } from './decode.ts'
+import { INSTANT_OIDS, tagArrayCol, type CodegenCol } from './decode.ts'
+import { shapeCols, mergeUnknownCols, ARRAY_OID, type ShapeSpec } from './spec.ts'
+import type { ShapeMapper } from './shape.ts'
 import { parseDataRow } from './protocol.ts'
 import { PgError } from './errors.ts'
 import { signRequest, type AwsCredentials } from './sigv4.ts'
@@ -88,6 +94,20 @@ const TYPENAME_OID: Record<string, number> = {
   daterange: 3912, int8range: 3926,
 }
 
+// pg_type names an array type by prefixing its element's name with '_' ('_int4' is int4[]), which is
+// exactly what columnMetadata.typeName carries. Derive those from the scalar map rather than listing
+// them, so the two can never drift.
+function oidForTypeName(t: string): number {
+  const direct = TYPENAME_OID[t]
+  if (direct !== undefined) return direct
+  if (t.charCodeAt(0) === 0x5f) { // '_elem'
+    const elem = TYPENAME_OID[t.slice(1)]
+    const arr = elem === undefined ? undefined : ARRAY_OID[elem]
+    if (arr !== undefined) return arr
+  }
+  return 25 // unknown (enum, domain, composite, …): decode as its raw text, like the wire driver does
+}
+
 interface ColumnMetadata { name?: string; label?: string; typeName: string }
 interface Field { isNull?: boolean; stringValue?: string; longValue?: number; doubleValue?: number; booleanValue?: boolean; blobValue?: string }
 
@@ -130,11 +150,21 @@ export interface AuroraConfig {
   decode?: 'auto' | 'jit' | 'interpreted'
 }
 
-export interface AuroraQueryOptions { mode?: ResultMode; timeout?: number; signal?: AbortSignal }
+const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms))
+
+export interface AuroraQueryOptions {
+  mode?: ResultMode
+  /** Declare the result columns up front (same spec as the wire driver's `shape`): decode targets come
+   *  from YOUR declaration instead of the Data API's reported types, and the mapper is compiled per
+   *  shape. Positional — entry i describes column i. `'unknown'` defers one column to the reported
+   *  type. Implies mode:'object' unless mode says otherwise. */
+  shape?: ShapeSpec | ShapeMapper
+  timeout?: number
+  signal?: AbortSignal
+}
 /** Callback run inside begin()/transaction() with the transaction-scoped client. */
 export type AuroraTxFn<T> = (tx: AuroraClient) => T | Promise<T>
 
-const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms))
 
 // Leading transaction-control keyword. Data API transactions are REAL but threaded via
 // transactionId (begin(fn)) — textual BEGIN/COMMIT either silently auto-commit per statement
@@ -182,6 +212,19 @@ export class AuroraClient {
   }
 
   // ---- transport: sign + POST one Data API operation, with resume/throttle retry ----
+  /** Combine a per-query `timeout` with the caller's `signal` (this entry accepted `timeout` in its
+   *  options but never applied it). Not AbortSignal.any — that needs Node 20.3+, package says >= 18. */
+  private signalFor(o: { timeout?: number; signal?: AbortSignal }): AbortSignal | undefined {
+    if (o.timeout == null) return o.signal
+    if (!o.signal) return AbortSignal.timeout(o.timeout)
+    const ac = new AbortController()
+    const sig = o.signal
+    if (sig.aborted) ac.abort(sig.reason)
+    else sig.addEventListener('abort', () => ac.abort(sig.reason), { once: true })
+    setTimeout(() => ac.abort(Object.assign(new Error(`query timed out after ${o.timeout}ms`), { code: 'QUERY_TIMEOUT' })), o.timeout)
+    return ac.signal
+  }
+
   private async call<T = unknown>(op: string, body: object, signal?: AbortSignal): Promise<T> {
     const url = `${this.endpoint}/${op}`
     const payload = JSON.stringify(body)
@@ -211,17 +254,38 @@ export class AuroraClient {
     }
   }
 
+  /** The column plan for a result set: the declared `shape` when given, else the Data API's own
+   *  columnMetadata. Mirrors http/neon-http — a shape's 'unknown' (oid 0) columns resolve positionally
+   *  against the reported types first, then arrays get tagged and `temporal` is applied. The Data API
+   *  always sends TEXT-shaped values, so a shape's binary format request is downgraded. */
   private resolveCols(cols: CodegenCol[]): CodegenCol[] {
     if (this.temporal !== 'string') return cols
-    return cols.map((c) => (!c.js && !c.json && INSTANT_OIDS.has(c.oid) ? { ...c, js: 'string' as const, format: 'text' as const } : c))
+    return cols.map((c) => (!c.js && !c.json && INSTANT_OIDS.has(c.oid) ? { ...c, js: 'string' as const, format: 'text' as const }
+      : c.array && !c.array.js && INSTANT_OIDS.has(c.array.elem) ? { ...c, array: { ...c.array, js: 'string' as const } } : c))
   }
 
-  private decodeResult(r: { columnMetadata?: ColumnMetadata[]; records?: Field[][]; numberOfRecordsUpdated?: number }, sql: string, mode: ResultMode): QueryResult<never> {
+  /** The column plan for a result set: the declared `shape` when given, else the Data API's own
+   *  columnMetadata. A shape's 'unknown' (oid 0) columns resolve positionally against the reported
+   *  types first, then arrays get tagged and `temporal` is applied. The Data API always sends
+   *  TEXT-shaped values, so a shape's binary format request is downgraded. */
+  private planCols(meta: ColumnMetadata[], shape: ShapeSpec | ShapeMapper | undefined): CodegenCol[] {
+    const cols = shape
+      ? mergeUnknownCols(
+          (typeof shape === 'function' ? (shape.$cols as CodegenCol[]) : shapeCols(shape)).map((c) => (c.format === 'binary' ? { ...c, format: 'text' as const } : c)),
+          meta, (m) => oidForTypeName(m.typeName))
+      : meta.map((c) => ({ name: c.label ?? c.name ?? '?', oid: oidForTypeName(c.typeName) }))
+    return this.resolveCols(cols.map(tagArrayCol))
+  }
+
+  private decodeResult(r: { columnMetadata?: ColumnMetadata[]; records?: Field[][]; numberOfRecordsUpdated?: number }, sql: string, mode: ResultMode, shape?: ShapeSpec | ShapeMapper): QueryResult<never> {
     const meta = r.columnMetadata
     if (!meta || !r.records) { // DML with no result set
       return { rows: [], columns: [], rowCount: r.numberOfRecordsUpdated ?? null, command: firstKeyword(sql) }
     }
-    const cols = this.resolveCols(meta.map((c) => ({ name: c.label ?? c.name ?? '?', oid: TYPENAME_OID[c.typeName] ?? 25 })))
+    const cols = this.planCols(meta, shape)
+    if (shape && cols.length !== meta.length) {
+      throw new Error(`minipg/aurora: shape declares ${cols.length} column(s) but the statement returned ${meta.length} (${meta.map((c) => c.label ?? c.name).join(', ')}) — a shape is positional, so a mismatch would decode the wrong column`)
+    }
     const ncols = cols.length
     const mapper = mode === 'array' || mode === 'object' ? this.mapperFactory(cols, mode, this.decoders) : null
     const rows = r.records.map((rec) => {
@@ -241,8 +305,9 @@ export class AuroraClient {
   }
 
   /** Run one SQL statement via the Data API. `params` may mix raw values and `bind()` markers. */
-  query(sql: string, params: unknown[], opts: { mode: 'object'; timeout?: number; signal?: AbortSignal }): Promise<QueryResult<Record<string, unknown>>>
-  query(sql: string, params?: unknown[], opts?: { mode?: 'array'; timeout?: number; signal?: AbortSignal }): Promise<QueryResult<unknown[]>>
+  query(sql: string, params: unknown[], opts: { shape: ShapeSpec | ShapeMapper; mode?: 'object'; timeout?: number; signal?: AbortSignal }): Promise<QueryResult<Record<string, unknown>>>
+  query(sql: string, params: unknown[], opts: { mode: 'object'; shape?: ShapeSpec | ShapeMapper; timeout?: number; signal?: AbortSignal }): Promise<QueryResult<Record<string, unknown>>>
+  query(sql: string, params?: unknown[], opts?: { mode?: 'array'; shape?: ShapeSpec | ShapeMapper; timeout?: number; signal?: AbortSignal }): Promise<QueryResult<unknown[]>>
   query(sql: string, params: unknown[], opts: { mode: 'buffer'; timeout?: number; signal?: AbortSignal }): Promise<QueryResult<(Buffer | null)[]>>
   query(sql: string, params: unknown[], opts: { mode: 'raw'; timeout?: number; signal?: AbortSignal }): Promise<QueryResult<Buffer>>
   async query(sql: string, params: unknown[] = [], opts: AuroraQueryOptions = {}): Promise<QueryResult<never>> {
@@ -254,8 +319,8 @@ export class AuroraClient {
       includeResultMetadata: true, resultSetOptions: RESULT_SET_OPTIONS,
       ...(this.txId ? { transactionId: this.txId } : {}),
     }
-    const r = await this.call<{ columnMetadata?: ColumnMetadata[]; records?: Field[][]; numberOfRecordsUpdated?: number }>('Execute', body, opts.signal)
-    return this.decodeResult(r, sql, opts.mode ?? 'array')
+    const r = await this.call<{ columnMetadata?: ColumnMetadata[]; records?: Field[][]; numberOfRecordsUpdated?: number }>('Execute', body, this.signalFor(opts))
+    return this.decodeResult(r, sql, opts.mode ?? (opts.shape ? 'object' : 'array'), opts.shape)
   }
 
   /** Bulk-execute ONE statement over many parameter sets (BatchExecuteStatement). For INSERT/UPDATE/DELETE —

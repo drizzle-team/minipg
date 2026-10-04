@@ -2,6 +2,9 @@
 // transformers — composable with cursor.batches(), arrays, anything. Constant memory by construction:
 // one output chunk per input batch, backpressure via the sink's await.
 //   bun playground/export/proto.ts
+import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
 import { connect } from '../../src/index.ts'
 
 type Row = Record<string, unknown>
@@ -114,7 +117,7 @@ export async function* mapRows(src: Batches, fn: (r: Row) => Row | null): AsyncG
 
 // ---- bench ------------------------------------------------------------------------------------
 if (import.meta.main) {
-  const OUT = '/private/tmp/claude-501/-Users-alexblokh-Development-nodepg-postgresjs/64537bcf-5c0a-4f6d-b544-d8755282a28d/scratchpad'
+  const OUT = fs.mkdtempSync(path.join(os.tmpdir(), 'minipg-export-'))
   const c = await connect({ path: '/tmp/minipg_sock/.s.PGSQL.54329', user: 'postgres', database: 'testdb' })
   await c.query('drop table if exists exp')
   await c.query('create table exp(id int8 primary key, name text, qty int4, price float8, flag bool, created_at timestamptz)')

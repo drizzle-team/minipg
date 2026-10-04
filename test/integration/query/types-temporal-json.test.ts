@@ -530,17 +530,12 @@ describe('jsonb[] (array-of-json column)', () => {
     })
   })
 
-  test('reading a jsonb[] column returns raw PG array text (no array decoder)', async () => {
+  test('reading a jsonb[] column parses each element (wire OID 3807 binds the array decoder)', async () => {
     await withConn(async (c) => {
       await c.query('CREATE TEMP TABLE ja2(id int4 primary key, jba jsonb[])')
       await c.query(`INSERT INTO ja2 VALUES (1, ARRAY['{"a":1}'::jsonb, '{"b":2}'::jsonb])`)
       const r = await c.query('SELECT jba FROM ja2 WHERE id = 1')
-      const v = cell(r)
-      expect(typeof v).toBe('string')
-      // raw PG array literal of jsonb elements, e.g. {"{\"a\": 1}","{\"b\": 2}"}
-      expect((v as string).startsWith('{')).toBe(true)
-      expect(v as string).toContain('a')
-      expect(v as string).toContain('b')
+      expect(cell(r)).toEqual([{ a: 1 }, { b: 2 }])
     })
   })
 })

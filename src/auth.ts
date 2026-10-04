@@ -142,9 +142,9 @@ export function scramForChannel(password: string, mechanisms: string[], mode: 'd
   const plusOffered = mechanisms.includes('SCRAM-SHA-256-PLUS')
   const cb = mode !== 'disable' && certDer ? tlsServerEndPoint(certDer) : null
   if (mode === 'require') {
-    if (!certDer) throw new Error('minipg: channel_binding=require — the transport does not expose the server certificate (node TLS only); use channel_binding=prefer')
-    if (!cb) throw new Error('minipg: channel_binding=require — cannot compute tls-server-end-point for this server certificate (unsupported signature algorithm, e.g. Ed25519/RSA-PSS); use channel_binding=prefer')
-    if (!plusOffered) throw new Error('minipg: channel_binding=require — the server did not offer SCRAM-SHA-256-PLUS')
+    if (!certDer) throw new Error('minipg: channel_binding=require — this transport does not expose the server certificate, so tls-server-end-point cannot be computed. The built-in node TLS transport does; a custom `socket` must resolve to a stream carrying `getPeerX509Certificate()` or `getPeerCertificate(true)` with a `raw` DER. Use `channel_binding=prefer` to connect unbound.')
+    if (!cb) throw new Error('minipg: channel_binding=require — cannot compute tls-server-end-point for this server certificate (unsupported signature algorithm, e.g. Ed25519/RSA-PSS). Use `channel_binding=prefer` to connect unbound.')
+    if (!plusOffered) throw new Error('minipg: channel_binding=require — the server did not offer SCRAM-SHA-256-PLUS. Use `channel_binding=prefer` to connect unbound.')
   }
   if (cb && plusOffered) return scram(password, { cbData: cb })
   return scram(password, { gs2: cb ? 'y' : 'n' })
