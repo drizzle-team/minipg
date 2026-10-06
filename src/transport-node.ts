@@ -33,7 +33,7 @@ export function nodeTransport(cfg: NormalizedConfig, signal: AbortSignal): Promi
   // Bundlers can smuggle this module onto workerd via unenv stubs of node:net/node:tls that fail in
   // confusing ways at connect time — replace that with the answer the user actually needs.
   if (typeof navigator !== 'undefined' && navigator.userAgent === 'Cloudflare-Workers') {
-    return Promise.reject(new Error("minipg: the node TCP transport cannot run on Cloudflare Workers — import from 'minipg/cf' (cloudflare:sockets) instead of the root entry"))
+    return Promise.reject(Object.assign(new Error("minipg: the node TCP transport cannot run on Cloudflare Workers — import from 'minipg/cf' (cloudflare:sockets) instead of the root entry"), { fatal: true }))
   }
   return new Promise<Duplex>((resolve, reject) => {
     const sock = cfg.path ? net.connect({ path: cfg.path }) : net.connect({ host: cfg.host, port: cfg.port })
