@@ -94,3 +94,15 @@ it('channel_binding=prefer and disable still connect normally', async () => {
     finally { await db.end() }
   }
 })
+
+// The package root resolves to THIS entry under the `workerd` export condition, so it must expose
+// everything the root does — with its own connect/createPool (cloudflare:sockets), not the core's.
+it('exposes the whole core API, with its own connect/createPool', async () => {
+  const cf = await import('../../src/cf.ts')
+  const core = await import('../../src/core.ts')
+  const missing = Object.keys(core).filter((k) => !(k in cf))
+  expect(missing).toEqual([])
+  expect(cf.connect).not.toBe(core.connect)
+  expect(cf.createPool).not.toBe(core.createPool)
+  expect(cf.Shape).toBe(core.Shape)
+})

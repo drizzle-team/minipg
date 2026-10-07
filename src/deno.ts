@@ -2,7 +2,7 @@
 // Same driver, Deno's TCP transport: Deno.connect (plus Deno.startTls for the SSLRequest upgrade —
 // never connectTls, see below) gives WHATWG streams, bridged to the Node Duplex the core uses.
 // (node:stream + node:crypto come from Deno's Node-compat layer.)
-import { connect as coreConnect, createPool as corePool, Connection, Pool, PgError, defaultDecoders } from './core.ts'
+import { connect as coreConnect, createPool as corePool, type Connection, type Pool } from './core.ts'
 import type { ConnectConfig, PoolConfig } from './types.ts'
 import { refuseChannelBinding, resolveUrl } from './url.ts'
 import { duplexFromWeb, negotiateSslRequest } from './webstream.ts'
@@ -43,5 +43,4 @@ function certList(ca: unknown): string[] | undefined {
 const NO_BINDING = 'Deno.TlsConn exposes only handshake(), and node:tls under Deno returns a certificate with no raw DER'
 export async function connect(config: string | ConnectConfig = {}): Promise<Connection> { const c = typeof config === 'string' ? { url: config } : config; return coreConnect({ ...refuseChannelBinding(c, 'deno', NO_BINDING), socket: denoSocket(c) }) }
 export function createPool(config: string | PoolConfig = {}): Pool { const c = typeof config === 'string' ? { url: config } : config; return corePool({ ...refuseChannelBinding(c, 'deno', NO_BINDING), socket: denoSocket(c) }) }
-export { Connection, Pool, PgError, defaultDecoders }
-export type { ConnectConfig, PoolConfig }
+export * from './api.ts' // the rest of the public API (everything but connect/createPool)
