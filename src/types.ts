@@ -216,9 +216,12 @@ export interface QueryOptions {
   /** Attach the resolved decode plan to the result as `.debug` — statement name, jit/interpreted, the
    *  generated JIT mapper source, and the per-column text/binary format we picked. For inspection/tuning. */
   debug?: boolean
-  /** Cancel the query (out-of-band CancelRequest) after this many milliseconds. */
+  /** Cancel the query (out-of-band CancelRequest) after this many milliseconds. If the query ends
+   *  before the request arrives, the request can stop the next pipelined query. That query fails with
+   *  57014 and `isLateCancel: true`. */
   timeout?: number
-  /** Cancel the query when this AbortSignal fires. */
+  /** Cancel the query when this AbortSignal fires. A late cancel can stop the next pipelined query,
+   *  as described for `timeout`. */
   signal?: AbortSignal
   /** Repropagate error to preserve link to original call stack */
   trace?: boolean

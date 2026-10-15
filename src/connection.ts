@@ -344,6 +344,10 @@ export class Connection {
   // backend after its query ended would stop the next query. See finishTask for how it resolves.
   private pendingCancel: PendingCancel | null = null
   private isRetiring = false // the connection closes as soon as nothing is in flight
+  // The queries that were pipelined behind a canceled query that ended on its own. Its cancel request
+  // can still stop one of them. This outlives pendingCancel, because the cancel connection can close
+  // before the stopped query's error is read.
+  private lateCancel: { pending: PendingCancel; suspects: Set<Task> } | null = null
   private cancelDone?: { promise: Promise<void>; resolve: () => void }
 
   private connecting = false
@@ -991,8 +995,10 @@ export class Connection {
   private endCanceledHead(t: Task): void {
     const pending = this.pendingCancel!
     pending.head = null
+    const isStopped = (t.error as PgError | undefined)?.code === '57014'
+    if (!isStopped && this.inflight.length > 0) this.lateCancel = { pending, suspects: new Set(this.inflight) }
     if (this.isRetiring) return
-    if ((t.error as PgError | undefined)?.code === '57014') return this.clearPendingCancel()
+    if (isStopped) return this.clearPendingCancel()
     this.resolveCanceledHead(pending)
     if (this.pendingCancel === pending && !this.isRetiring) {
       pending.timer = setTimeout(() => { if (this.pendingCancel === pending) { this.isRetiring = true; this.processQueue() } }, Math.min(this.cfg.connectTimeout, 5000))
@@ -1005,6 +1011,21 @@ export class Connection {
     else if (pending.isConfirmed) { this.clearPendingCancel(); this.processQueue() }
   }
 
+  // A cancel request stops at most one query, so only the first 57014 among the suspects is marked.
+  // A statement_timeout or a cancel from another session in the same window is marked too.
+  private checkLateCancel(t: Task): void {
+    const late = this.lateCancel!
+    late.suspects.delete(t)
+    const err = t.error as PgError | undefined
+    if (err?.code === '57014' && !t.settled) {
+      err.isLateCancel = true
+      err.hint = 'A cancel request for an earlier query in the pipeline most likely reached the server after that query ended, and it stopped this query. The server rolled this query back, so it can run again.'
+      late.suspects.clear()
+      if (this.pendingCancel === late.pending && !this.isRetiring) this.clearPendingCancel()
+    }
+    if (late.suspects.size === 0) this.lateCancel = null
+  }
+
   private retire(): void {
     try { this.socket?.write(W.terminate()) } catch { /* */ }
     this.onSocketDown(new Error('minipg: the connection was closed because the server did not confirm a cancel request, and that request could still stop a later query. Run the query again on a new connection.'))
@@ -1013,6 +1034,7 @@ export class Connection {
   private finishTask(): void {
     const t = this.inflight.shift() ?? null // the head completed (its ReadyForQuery arrived); the next in-flight becomes head
     if (!t) { this.processQueue(); return }
+    if (this.lateCancel?.suspects.has(t)) this.checkLateCancel(t)
     if (t === this.pendingCancel?.head) this.endCanceledHead(t)
     // This task wrote the burst's Parse but its cycle errored before the Describe response cached the name:
     // clear the in-flight marker (later first-uses must Parse again) and flag the name stale — if the Parse
@@ -1080,6 +1102,7 @@ export class Connection {
   private settlePending(e: Error): void {
     this.outbuf.reset() // drop any batched-but-unflushed bytes
     this.parseInflight.clear() // any recorded Parse may never have reached the wire
+    this.lateCancel = null
     // Reject every in-flight query. Prefer an informative server error already received for one (e.g. a
     // FATAL 57P01 admin_shutdown that arrives just before the socket closes); the rest take the given error.
     while (this.inflight.length) { const t = this.inflight.shift()!; if (t.timer) clearTimeout(t.timer); if (t.graceTimer) clearTimeout(t.graceTimer); t.signalCleanup?.(); if (!t.settled) { const reason = t.error ?? e; this.fireEnd(t, reason); this.rejectTask(t, reason) } }

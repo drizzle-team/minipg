@@ -176,6 +176,14 @@ gets the cancel request. A statement that waits behind it still runs on the serv
 commit, so do not rely on an interrupt to undo writes in a Pipeline. Inside a transaction, the
 interrupt rolls the whole transaction back.
 
+A cancel request can arrive at the server after its statement has already ended. The request then
+stops the next statement in the Pipeline. This late cancel applies to every Pipeline: an Effect
+interrupt, a `timeout` or `signal` option, and concurrent queries on one `Connection`. The stopped
+statement fails with SQLSTATE 57014, and the server rolls it back. minipg sets `isLateCancel: true`
+on that `PgError`, and you can run the statement again. In the Effect entry point, the error is a
+`StatementTimeoutError` whose `cause` has the flag. No PostgreSQL driver can prevent this, because a
+cancel request cannot target one statement.
+
 `MinipgClient` also has `query` (minipg's query options, such as `mode`, `shape` and `name`),
 `bulkInsert`, `bulkUpdate`, `copyMany`, `copyFrom` (takes a `Stream`), `copyTo` and `cursor`
 (return a `Stream`). Each one runs on the transaction's connection inside `withTransaction`.

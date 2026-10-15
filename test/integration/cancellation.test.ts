@@ -85,6 +85,22 @@ describe('a cancel request that arrives after its query finished', () => {
     } finally { await pool.end(); await proxy.close() }
   }, 10000)
 
+  test('a late cancel that stops a pipelined query marks its error and keeps the connection', async () => {
+    const proxy = await delayCancelProxy(400)
+    const c = await testConnect({ host: '127.0.0.1', port: proxy.port })
+    try {
+      const pid = c.backendKey!.pid
+      const first = caught(() => c.query('select pg_sleep(0.2)', [], { timeout: 50 }))
+      const second = caught(() => c.query('select pg_sleep(0.5), 1'))
+      expect(((await first) as { code?: string }).code).toBe('QUERY_TIMEOUT')
+      const err = (await second) as PgError
+      expect(err.code).toBe('57014')
+      expect(err.isLateCancel).toBe(true)
+      const r = await c.query('select pg_backend_pid()')
+      expect(cell(r, 0)).toBe(pid)
+    } finally { await c.end(); await proxy.close() }
+  }, 10000)
+
   test('a cancel that stops its query keeps the connection', async () => {
     const proxy = await delayCancelProxy(0)
     const c = await testConnect({ host: '127.0.0.1', port: proxy.port })

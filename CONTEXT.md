@@ -31,3 +31,13 @@ _Avoid_: bulk, transaction group
 **Parallel**:
 Several queries fanned out over separate pool connections, so the server runs them at the same time.
 _Avoid_: concurrent, fan-out
+
+### Canceling queries
+
+**Canceled query**:
+A query that timed out or whose abort signal fired while it was running on the server. The driver asks the server to stop it.
+_Avoid_: head (outside the connection code), aborted query
+
+**Late cancel**:
+A cancel request that reaches the server after the canceled query has ended, so that it stops a later query in the same pipeline. That later query fails and is rolled back.
+_Avoid_: stray cancel, collateral cancel, misdirected cancel

@@ -28,6 +28,8 @@ export class PgError extends Error {
   hint?: string
   position?: string
   constraint?: string;
+  /** A cancel request for an earlier query in the pipeline most likely stopped this query. */
+  isLateCancel?: boolean
   [k: string]: unknown
 
   constructor(fields: PgErrorFields) {
