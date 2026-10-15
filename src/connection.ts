@@ -23,7 +23,7 @@ type ConnState = 'idle' | 'connecting' | 'ready' | 'reconnecting' | 'closed'
 // The node:net/tls transport is registered here by the Node entry (minipg/node) so the core never
 // statically imports node:net/tls (which don't exist on workerd). Edge/Deno entries pass config.socket.
 type TransportFactory = (cfg: NormalizedConfig, signal: AbortSignal) => Promise<Duplex>
-type CancelFn = (cfg: NormalizedConfig, key: { pid: number; secret: number }) => void
+type CancelFn = (cfg: NormalizedConfig, key: { pid: number; secret: number }) => Promise<void>
 let defaultTransport: TransportFactory | null = null
 let defaultCancel: CancelFn | null = null
 export function registerDefaultTransport(transport: TransportFactory, cancel: CancelFn): void {
@@ -49,6 +49,7 @@ export interface NormalizedConfig {
   socket?: () => MinipgSocket | Promise<MinipgSocket> // structural (node Duplex satisfies it); internals treat it as Duplex, guarding optional methods
   path?: string
   plugins: Plugin[]
+  isBehindPooler?: boolean
 }
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms))
@@ -170,6 +171,10 @@ function isFatalAuth(err: unknown): boolean {
   return !!(err as { fatal?: boolean } | null)?.fatal
 }
 
+// head: the canceled query until it ends. isConfirmed: the server closed the cancel connection, so the
+// backend already has the signal. hasFailed: the cancel connection errored, so its delivery is unknown.
+interface PendingCancel { head: Task | null; isConfirmed: boolean; hasFailed: boolean; timer?: ReturnType<typeof setTimeout> }
+
 // per-query timing accumulator, attached only when instrumented (plugins present) or metrics requested
 interface TaskPerf { t0: number; tStart?: number; tWrite?: number; tFirst?: number; decodeMs: number; sent: number; recv: number; states?: unknown[]; metrics?: QueryMetrics }
 
@@ -194,6 +199,7 @@ interface Task {
   _shapeCols?: CodegenCol[] // shape with 'unknown' columns: mapper build DEFERRED until real OIDs arrive ('T' or cached fields)
   paramTypes?: readonly number[] // caller-declared param OIDs: sent in Parse + binary plan from the FIRST execution
   copySource?: CopySource // COPY FROM STDIN payload source — marks the task as a copy (simple 'Q', runs solo)
+  stopCopy?: () => void // ends pumpCopy's wait on a source that stalls after the task settled
   _instrDone?: boolean // guard so onQueryEnd/Error fires exactly once across the settle paths
   _wAt?: number // write timestamp (performance.now) — for the always-on live round-trip sample
   _rttDone?: boolean // guard so a query contributes at most one RTT sample (its first response byte)
@@ -334,6 +340,12 @@ export class Connection {
   // query-builder fast path: a chunks array (tagged template / builder) has stable identity, so cache
   private scramState?: Scram
 
+  // The CancelRequest in progress. Nothing new is dispatched while it is set: a cancel that reaches the
+  // backend after its query ended would stop the next query. See finishTask for how it resolves.
+  private pendingCancel: PendingCancel | null = null
+  private isRetiring = false // the connection closes as soon as nothing is in flight
+  private cancelDone?: { promise: Promise<void>; resolve: () => void }
+
   private connecting = false
   private connectAbort?: AbortController // aborted on failAttempt so a pending transport tears down its socket
   private connTimer?: ReturnType<typeof setTimeout>
@@ -387,6 +399,7 @@ export class Connection {
       socket: config.socket,
       path: config.path,
       plugins: config.plugins ?? [],
+      isBehindPooler: pooled,
     }
     this.instrumented = this.cfg.plugins.length > 0
     const hasEval = isEvalAvailable()
@@ -410,6 +423,7 @@ export class Connection {
   }
 
   private rejectTask(t: Task, err: Error): void {
+    t.stopCopy?.()
     if (t.stream) t.streamError?.(err); else t.reject?.(err)
   }
 
@@ -687,6 +701,7 @@ export class Connection {
   // behaviour. A serialize failure rejects that task and the loop moves on (no re-entrancy needed).
   private processQueue(): void {
     if (this.state !== 'ready') return
+    if (this.isRetiring) { if (this.inflight.length === 0) this.retire(); return }
     while (this.queue.length && this.inflight.length < this.cfg.pipelineDepth && !this.writeBackedUp && this.canStartNext()) {
       this.startTask(this.queue.shift()!)
       // Flush mid-burst once the batch is large, so write() backpressure is OBSERVED before we bury the socket's
@@ -716,6 +731,7 @@ export class Connection {
   // pipelined query behind it, so a stream runs SOLO — nothing else in flight while it runs, and it
   // waits for the pipeline to drain before starting. (FIFO: we never dispatch past a queued stream.)
   private canStartNext(): boolean {
+    if (this.pendingCancel) return false
     if (this.inflight.length === 0) return true
     const head = this.inflight[0]!
     if (head.stream || head.copySource) return false // a stream/COPY owns the connection until it ends
@@ -739,9 +755,21 @@ export class Connection {
       if (t.perf) t.perf.sent += bytes.length // CopyData bytes count toward metrics.bytesSent
       await this.writeRaw(bytes)
     }
+    // While the server reads COPY data it holds back cancel requests, so only CopyFail ends the COPY.
+    // A settled task must not wait for its source's next chunk, which may never come.
+    const stopped = new Promise<'stopped'>((resolve) => { t.stopCopy = () => resolve('stopped') })
+    const src = t.copySource!
+    const it: Iterator<string | Uint8Array> | AsyncIterator<string | Uint8Array> =
+      Symbol.asyncIterator in src ? src[Symbol.asyncIterator]() : src[Symbol.iterator]()
     try {
-      for await (const chunk of t.copySource!) {
-        if (t.settled || t.error || t.cancelled) break // timeout/abort/server error -> stop reading; CopyFail below
+      for (;;) {
+        const step = t.settled ? 'stopped' : await Promise.race([it.next(), stopped])
+        if (step === 'stopped' || t.settled || t.error || t.cancelled) {
+          void Promise.resolve(it.return?.()).catch(() => {})
+          break
+        }
+        if (step.done) break
+        const chunk = step.value
         const buf = typeof chunk === 'string' ? Buffer.from(chunk, 'utf8')
           : Buffer.isBuffer(chunk) ? chunk
           : Buffer.from((chunk as Uint8Array).buffer, (chunk as Uint8Array).byteOffset, (chunk as Uint8Array).byteLength)
@@ -915,7 +943,8 @@ export class Connection {
       this.fireEnd(task, reason)
       this.rejectTask(task, reason)
       if (idx === 0) {
-        this.sendCancelRequest()
+        // CopyFail ends a COPY FROM STDIN, and the server ignores a CancelRequest while it reads COPY data.
+        if (!task.copySource) this.sendCancelRequest(task)
         task.graceTimer = setTimeout(() => { try { this.socket?.destroy() } catch { /* */ } }, 5000) // dead-network fallback
       }
     } else {
@@ -927,15 +956,64 @@ export class Connection {
 
   // Best-effort out-of-band CancelRequest. The node transport registers nodeCancel; transports without
   // a registered canceller (e.g. cloudflare:sockets) rely on the grace-timer socket.destroy() fallback.
-  private sendCancelRequest(): void {
+  private sendCancelRequest(head: Task): void {
     const key = this.backendKey
-    if (!key) return
-    defaultCancel?.(this.cfg, key)
+    if (!key || !defaultCancel) return
+    // Two cancels in flight cannot be told apart, so the connection is not reused after the second one.
+    if (this.pendingCancel) this.isRetiring = true
+    const pending: PendingCancel = { head, isConfirmed: false, hasFailed: false }
+    this.pendingCancel = pending
+    defaultCancel(this.cfg, key).then(
+      () => { pending.isConfirmed = true; if (this.pendingCancel === pending && !pending.head) this.resolveCanceledHead(pending) },
+      () => { pending.hasFailed = true; if (this.pendingCancel === pending && !pending.head) this.resolveCanceledHead(pending) },
+    )
+  }
+
+  /** Pending while a canceled query is still draining. Resolves when the connection is safe to reuse,
+   *  or when it was closed because a cancel request might still reach a later query. */
+  get cancelSettled(): Promise<void> | undefined {
+    if (!this.pendingCancel && !this.isRetiring) return undefined
+    if (!this.cancelDone) { let resolve!: () => void; const promise = new Promise<void>((r) => { resolve = r }); this.cancelDone = { promise, resolve } }
+    return this.cancelDone.promise
+  }
+
+  private clearPendingCancel(): void {
+    if (this.pendingCancel?.timer) clearTimeout(this.pendingCancel.timer)
+    this.pendingCancel = null; this.isRetiring = false
+    const done = this.cancelDone; this.cancelDone = undefined; done?.resolve()
+  }
+
+  // The canceled head ended. If it ended with 57014, the cancel was used up. If the server already
+  // closed the cancel connection, the backend got the signal while it was running the head or while
+  // it was idle, and Postgres ignores a cancel that reaches a backend that waits for a command. A
+  // pooler can close that connection before the backend gets the signal, so there it does not count.
+  // Otherwise wait for that confirmation, and retire the connection if it does not come.
+  private endCanceledHead(t: Task): void {
+    const pending = this.pendingCancel!
+    pending.head = null
+    if (this.isRetiring) return
+    if ((t.error as PgError | undefined)?.code === '57014') return this.clearPendingCancel()
+    this.resolveCanceledHead(pending)
+    if (this.pendingCancel === pending && !this.isRetiring) {
+      pending.timer = setTimeout(() => { if (this.pendingCancel === pending) { this.isRetiring = true; this.processQueue() } }, Math.min(this.cfg.connectTimeout, 5000))
+    }
+  }
+
+  private resolveCanceledHead(pending: PendingCancel): void {
+    if (this.isRetiring) return
+    if (pending.hasFailed || (pending.isConfirmed && this.cfg.isBehindPooler)) { this.isRetiring = true; this.processQueue() }
+    else if (pending.isConfirmed) { this.clearPendingCancel(); this.processQueue() }
+  }
+
+  private retire(): void {
+    try { this.socket?.write(W.terminate()) } catch { /* */ }
+    this.onSocketDown(new Error('minipg: the connection was closed because the server did not confirm a cancel request, and that request could still stop a later query. Run the query again on a new connection.'))
   }
 
   private finishTask(): void {
     const t = this.inflight.shift() ?? null // the head completed (its ReadyForQuery arrived); the next in-flight becomes head
     if (!t) { this.processQueue(); return }
+    if (t === this.pendingCancel?.head) this.endCanceledHead(t)
     // This task wrote the burst's Parse but its cycle errored before the Describe response cached the name:
     // clear the in-flight marker (later first-uses must Parse again) and flag the name stale — if the Parse
     // itself DID succeed server-side, the next Parse would 42P05 without a Close first (Close of an absent
@@ -1030,6 +1108,7 @@ export class Connection {
   private onSocketDown(err: Error): void {
     if (this.state === 'closed') return
     if (this.connecting) return this.failAttempt(err)
+    this.clearPendingCancel()
     const dead = this.socket; this.socket = null // claim the death; further events from `dead` are ignored
     try { dead?.destroy() } catch { /* */ }
     this.outbuf.reset() // drop any batched-but-unflushed bytes
@@ -1511,7 +1590,12 @@ export class Connection {
         if (done) return Promise.resolve({ value: undefined, done: true })
         return new Promise<IteratorResult<Row>>((resolve, reject) => { waiting = { resolve, reject } })
       },
-      return(): Promise<IteratorResult<Row>> { t.cancelled = true; if (paused) { paused = false; try { self.socket?.resume() } catch { /* */ } } return Promise.resolve({ value: undefined, done: true }) },
+      return(): Promise<IteratorResult<Row>> {
+        t.cancelled = true
+        if (!done && !err) self.cancelTask(t, Object.assign(new Error('stream closed early'), { name: 'AbortError' }))
+        if (paused) { paused = false; try { self.socket?.resume() } catch { /* */ } }
+        return Promise.resolve({ value: undefined, done: true })
+      },
     }
   }
 
@@ -1584,6 +1668,7 @@ export class Connection {
     this.state = 'closed'
     if (this.connecting) { this.connecting = false; const rj = this.attemptReject; this.attemptResolve = this.attemptReject = undefined; rj?.(e) }
     this.settlePending(e) // never leave an in-flight or queued query hanging
+    this.clearPendingCancel()
     await new Promise<void>((r) => { let fin = false; const done = () => { if (!fin) { fin = true; r() } }; try { this.socket?.end(done) } catch { done() } setTimeout(done, 1000) })
     try { this.socket?.destroy() } catch { /* */ }
   }

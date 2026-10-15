@@ -26,8 +26,9 @@ const hasDist = entries.some((p) => p.startsWith('dist/'))
 
 // Each dist/X.js needs src/X.ts; each dist/X.d.ts needs src/X.ts or src/X.d.ts
 // (dist/runtime.d.ts is an ambient declaration with no .js sibling, covered by the latter).
+// dist/_virtual/ holds the bundler's own helpers (the namespace export of ./effect needs one).
 const orphans = entries
-  .filter((p) => p.startsWith('dist/') && (p.endsWith('.js') || p.endsWith('.d.ts')))
+  .filter((p) => p.startsWith('dist/') && !p.startsWith('dist/_virtual/') && (p.endsWith('.js') || p.endsWith('.d.ts')))
   .filter((p) => {
     if (p.endsWith('.d.ts')) {
       const base = p.replace(/^dist\//, 'src/')

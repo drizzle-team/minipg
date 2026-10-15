@@ -87,6 +87,14 @@
     "./buffer-polyfill": {
       "types": "./dist/buffer-polyfill.d.ts",
       "import": "./dist/buffer-polyfill.js"
+    },
+    "./effect": {
+      "types": "./dist/effect/index.d.ts",
+      "import": "./dist/effect/index.js"
+    },
+    "./effect/core": {
+      "types": "./dist/effect/core.d.ts",
+      "import": "./dist/effect/core.js"
     }
   },
   "files": [
@@ -94,6 +102,14 @@
   ],
   "engines": {
     "node": ">=18"
+  },
+  "peerDependencies": {
+    "effect": "~4.0.5"
+  },
+  "peerDependenciesMeta": {
+    "effect": {
+      "optional": true
+    }
   },
   "scripts": {
     "build": "bun node_modules/.bin/tsdown",
@@ -141,6 +157,7 @@
     "cli-highlight": "^2.1.11",
     "drizzle-kit": "^0.31.10",
     "drizzle-orm": "^0.45.2",
+    "effect": "~4.0.5",
     "fast-check": "^4.8.0",
     "mitata": "^1.0.34",
     "pg": "^8.22.0",

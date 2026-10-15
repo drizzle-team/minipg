@@ -80,3 +80,20 @@ describe('AbortSignal', () => {
     })
   }, 10000)
 })
+
+describe('stream early close', () => {
+  // A real server ignores a cancel that reaches an idle backend, so only the mock can see a needless one.
+  test('a stream that is read to the end sends no CancelRequest', async () => {
+    await withMock(async (m) => {
+      const c = await connect(m.connectConfig())
+      const it = c.stream('select 1')
+      const rows: unknown[] = []
+      for await (const row of it) rows.push(row)
+      await it.return!()
+      await tick(30)
+      expect(rows.length).toBe(1)
+      expect(m.cancelRequests).toBe(0)
+      await c.end()
+    })
+  })
+})

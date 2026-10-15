@@ -56,18 +56,22 @@ export function nodeTransport(cfg: NormalizedConfig, signal: AbortSignal): Promi
   })
 }
 
-/** Best-effort out-of-band CancelRequest on a fresh throwaway connection (mirrors SSL negotiation). */
-export function nodeCancel(cfg: NormalizedConfig, key: { pid: number; secret: number }): void {
-  const cancel = W.cancelRequest(key.pid, key.secret)
-  const send = (s: net.Socket | tls.TLSSocket) => { try { s.write(cancel); s.end() } catch { /* */ } }
-  const plain = net.connect({ host: cfg.host, port: cfg.port }, () => {
-    if (!cfg.ssl) return send(plain)
-    plain.write(W.sslRequest())
-    plain.once('data', (b: Buffer) => {
-      if (String.fromCharCode(b[0]!) === 'S') {
-        const t = tls.connect({ socket: plain, ...tlsOptions(cfg.ssl as TlsSsl, cfg.host) }, () => send(t)); t.on('error', () => { /* */ })
-      } else send(plain) // server declined SSL; try plaintext cancel
+/** Out-of-band CancelRequest on a fresh throwaway connection (mirrors SSL negotiation). Resolves when
+ *  the server closes that connection, which it does only after it has signaled the backend. */
+export function nodeCancel(cfg: NormalizedConfig, key: { pid: number; secret: number }): Promise<void> {
+  return new Promise<void>((resolve, reject) => {
+    const cancel = W.cancelRequest(key.pid, key.secret)
+    const send = (s: net.Socket | tls.TLSSocket) => { try { s.write(cancel); s.end() } catch (e) { reject(e) } }
+    const plain = net.connect(cfg.path ? { path: cfg.path } : { host: cfg.host, port: cfg.port }, () => {
+      if (!cfg.ssl || cfg.path) return send(plain) // like nodeTransport: no SSL on a unix socket
+      plain.write(W.sslRequest())
+      plain.once('data', (b: Buffer) => {
+        if (String.fromCharCode(b[0]!) === 'S') {
+          const t = tls.connect({ socket: plain, ...tlsOptions(cfg.ssl as TlsSsl, cfg.host) }, () => send(t)); t.on('error', reject)
+        } else send(plain) // server declined SSL; try plaintext cancel
+      })
     })
+    plain.on('error', reject)
+    plain.on('close', () => resolve()) // after an 'error', the promise is already rejected
   })
-  plain.on('error', () => { /* best-effort */ })
 }

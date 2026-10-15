@@ -3,11 +3,10 @@
 // propagation, empty/large results, interleaving, named statements, and guards
 // for the intentionally-absent cursor / Readable / cancel surfaces.
 //
-// Grounded in src/connection.ts:291-319 (stream impl) — a hand-rolled
+// Grounded in Connection.stream in src/connection.ts: a hand-rolled
 // AsyncIterableIterator (NOT a Node Readable, NO server-side cursor). Backpressure
 // is TCP socket.pause()/resume() with hysteresis (pause when buf>HWM, resume when
-// buf<HWM/2). Early return() does NOT send a protocol cancel: it drops later rows
-// (t.cancelled) and DRAINS the result server-side before the connection is reusable.
+// buf<HWM/2). Early return() sends a CancelRequest, so the server stops producing rows.
 import { test, expect, describe } from 'bun:test'
 import fc from 'fast-check'
 import { testConnect, withConn, caught, PgError } from '../helpers/db.ts'
@@ -264,6 +263,28 @@ describe('streaming :: early break / cancel / drain semantics', () => {
       expect(cell0(r.rows[0])).toBe(11)
     })
   })
+
+  test('early break stops the query on the server, and the same backend serves the next query', async () => {
+    await withConn(async (c) => {
+      const pid = c.backendKey!.pid
+      let n = 0
+      for await (const _ of c.stream('select g from generate_series(1, 100000000) g')) {
+        if (++n === 10) break
+      }
+      await withConn(async (observer) => {
+        const deadline = Date.now() + 2000
+        let active = 1
+        while (active > 0 && Date.now() < deadline) {
+          await sleep(50)
+          const r = await observer.query("select count(*)::int from pg_stat_activity where pid = $1 and state = 'active'", [pid])
+          active = cell0(r.rows[0]) as number
+        }
+        expect(active).toBe(0)
+      })
+      const r = await c.query('select pg_backend_pid()')
+      expect(cell0(r.rows[0])).toBe(pid)
+    })
+  }, 10000)
 
   test('chaos: 200x open-then-break leaves no wedged in-flight task; every follow-up query works', async () => {
     await withConn(async (c) => {
@@ -546,8 +567,7 @@ describe('streaming :: out-of-scope / roadmap guards', () => {
     })
   })
 
-  // Roadmap / unimplemented — kept as todos (no `signal`/CancelRequest/binary/simple-query surface today).
-  test.todo('PENDING: protocol-level CancelRequest (via backendKey) so early break stops the server instead of draining', () => {})
+  // Roadmap / unimplemented — kept as todos (no binary/simple-query surface today).
   test.todo('PENDING: per-stream timeout + AbortSignal to abort a stalled stream without socket teardown', () => {})
   test.todo('PENDING: binary RESULT-format streaming (Bind result format 1) once binary decoders land', () => {})
   test.todo('PENDING: simple-query-protocol streaming path', () => {})

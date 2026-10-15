@@ -87,6 +87,12 @@ export class Pool {
     this.notifyRelease = installVercelCompat(this, this.idleMs)
   }
 
+  /** The server and database this pool connects to, after the URL and the defaults apply. */
+  get target(): { host: string; port: number; database: string } {
+    const c = new Connection({ ...this.cfg, reconnect: false }).cfg
+    return { host: c.path ?? c.host, port: c.port, database: c.database }
+  }
+
   get size(): number { return this.all.size }
   get idleCount(): number { return this.idle.length }
   get waiting(): number { return this.waiters.length }
@@ -248,6 +254,13 @@ export class Pool {
     if (!this.out.has(conn)) return // double-release / foreign connection
     this.out.delete(conn)
     this.notifyRelease() // attachDatabasePool() listens for 'release' (extends instance life)
+    // A canceled query is still draining: reuse the connection only once it is known to survive the cancel.
+    const settled = conn.cancelSettled
+    if (settled) { void settled.then(() => this.reclaim(conn)); return }
+    this.reclaim(conn)
+  }
+
+  private reclaim(conn: Connection): void {
     if (conn.state === 'closed') { this.all.delete(conn); this.refill(); return }
     if (this.closed) { this.all.delete(conn); void conn.end(); return }
     if (conn.inTransaction) { // never leak tx state across checkouts

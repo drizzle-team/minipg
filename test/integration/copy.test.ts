@@ -81,6 +81,27 @@ describe('copyFrom (raw source)', () => {
   }, TEST_TIMEOUT)
 })
 
+describe('copyFrom abort with a stalled source', () => {
+  test('aborting ends the COPY at once, and the same connection serves the next query', async () => {
+    await withConn(async (c) => {
+      await c.query(`create temp table ${K}_stall(a int4)`)
+      async function* stalled(): AsyncGenerator<string> {
+        yield '1\n'
+        await new Promise(() => {})
+      }
+      const ac = new AbortController()
+      const p = caught(() => c.copyFrom(`copy ${K}_stall from stdin`, stalled(), { signal: ac.signal }))
+      await new Promise((r) => setTimeout(r, 100))
+      const t0 = Date.now()
+      ac.abort()
+      await p
+      const r = await c.query(`select count(*)::int from ${K}_stall`)
+      expect(Date.now() - t0).toBeLessThan(1000)
+      expect(r.rows).toEqual([[0]] as never)
+    })
+  }, 10000)
+})
+
 describe('copyMany', () => {
   test('binary format roundtrips identically to per-row binary-param inserts', async () => {
     await withConn(async (c) => {

@@ -19,6 +19,30 @@ Default to using Bun instead of Node.js.
 - Prefer `Bun.file` over `node:fs`'s readFile/writeFile
 - Bun.$`ls` instead of execa.
 
+## Agent skills
+
+### Issue tracker
+
+Issues live in Beads (`bd`), a local database that is excluded from git. See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+The five default role names are used as Beads labels. See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Single-context: one `CONTEXT.md` and `docs/adr/` at the repo root. See `docs/agents/domain.md`.
+
+## Learning more about Effect
+
+This repository uses the Effect Typescript library.
+
+Before writing any Effect code, first read `node_modules/effect/AGENTS.md`
+**completely**, and follow the links in the file when required.
+
+If you need to learn more about particular Effect apis and concepts that the
+guide doesn't cover, search through the source code in `node_modules/effect/src`.
+
 ## Testing
 
 Use `bun test` to run tests. It runs unit and integration together; the integration suite needs a
