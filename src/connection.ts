@@ -182,7 +182,7 @@ interface TaskPerf { t0: number; tStart?: number; tWrite?: number; tFirst?: numb
 
 interface Task {
   sql: string
-  params: unknown[]
+  params: readonly unknown[]
   name?: string | undefined
   mode: ResultMode
   rows: unknown[]
@@ -438,7 +438,7 @@ export class Connection {
   }
 
   // ---- telemetry helpers (no-ops unless instrumented / metrics requested) ----
-  private beginPerf(t: Task, params: unknown[], metrics: boolean | 'ms' | 'us' | undefined): void {
+  private beginPerf(t: Task, params: readonly unknown[], metrics: boolean | 'ms' | 'us' | undefined): void {
     if (!this.instrumented && !metrics) return
     t.wantMetrics = !!metrics
     t.metricsUnit = metrics === 'us' ? 'us' : 'ms'
@@ -1170,19 +1170,19 @@ export class Connection {
   // ---- public query API ----
   // a shape (without an explicit non-object mode) decodes to objects — matches the runtime default.
   // generic over the shape's column names so editors autocomplete each value to the known type list.
-  query<K extends string>(sql: string, params: unknown[], opts: { shape: ShapeOf<K> | ShapeEntries | ShapeMapper; mode?: 'object'; name?: string; metrics?: boolean | 'ms' | 'us'; debug?: boolean; timeout?: number; signal?: AbortSignal }): Promise<QueryResult<Record<string, unknown>>>
-  query(sql: string, params?: unknown[] | RawParams, opts?: { name?: string; snapshot?: string; params?: readonly ParamType[]; mode?: 'array'; metrics?: boolean | 'ms' | 'us'; debug?: boolean; timeout?: number; signal?: AbortSignal; trace?: boolean; shape?: ShapeSpec | ShapeMapper; binary?: boolean }): Promise<QueryResult<unknown[]>>
-  query(sql: string, params: unknown[] | RawParams, opts: { name?: string; snapshot?: string; params?: readonly ParamType[]; mode: 'object'; metrics?: boolean | 'ms' | 'us'; debug?: boolean; timeout?: number; signal?: AbortSignal; trace?: boolean; shape?: ShapeSpec | ShapeMapper; binary?: boolean }): Promise<QueryResult<Record<string, unknown>>>
+  query<K extends string>(sql: string, params: readonly unknown[], opts: { shape: ShapeOf<K> | ShapeEntries | ShapeMapper; mode?: 'object'; name?: string; metrics?: boolean | 'ms' | 'us'; debug?: boolean; timeout?: number; signal?: AbortSignal }): Promise<QueryResult<Record<string, unknown>>>
+  query(sql: string, params?: readonly unknown[] | RawParams, opts?: { name?: string; snapshot?: string; params?: readonly ParamType[]; mode?: 'array'; metrics?: boolean | 'ms' | 'us'; debug?: boolean; timeout?: number; signal?: AbortSignal; trace?: boolean; shape?: ShapeSpec | ShapeMapper; binary?: boolean }): Promise<QueryResult<unknown[]>>
+  query(sql: string, params: readonly unknown[] | RawParams, opts: { name?: string; snapshot?: string; params?: readonly ParamType[]; mode: 'object'; metrics?: boolean | 'ms' | 'us'; debug?: boolean; timeout?: number; signal?: AbortSignal; trace?: boolean; shape?: ShapeSpec | ShapeMapper; binary?: boolean }): Promise<QueryResult<Record<string, unknown>>>
   // 'wire': the statement's raw backend messages ({T,D,C,E,I}, framing intact) as CONTIGUOUS RUNS —
   // concatenate the entries to get the byte stream; entry count scales with socket chunks, not rows.
   // RESOLVES even when the statement failed (the E frame is data); only connection-level failures reject.
-  query(sql: string, params: unknown[] | RawParams, opts: { name?: string; params?: readonly ParamType[]; mode: 'wire'; metrics?: boolean | 'ms' | 'us'; timeout?: number; signal?: AbortSignal; trace?: boolean }): Promise<Uint8Array[]>
-  query(sql: string, params: unknown[] | RawParams, opts: { name?: string; snapshot?: string; params?: readonly ParamType[]; mode: 'buffer'; metrics?: boolean | 'ms' | 'us'; debug?: boolean; timeout?: number; signal?: AbortSignal; trace?: boolean; binary?: boolean }): Promise<QueryResult<(Buffer | null)[]>>
-  query(sql: string, params: unknown[] | RawParams, opts: { name?: string; snapshot?: string; params?: readonly ParamType[]; mode: 'raw'; metrics?: boolean | 'ms' | 'us'; debug?: boolean; timeout?: number; signal?: AbortSignal; trace?: boolean; binary?: boolean }): Promise<QueryResult<Buffer>>
+  query(sql: string, params: readonly unknown[] | RawParams, opts: { name?: string; params?: readonly ParamType[]; mode: 'wire'; metrics?: boolean | 'ms' | 'us'; timeout?: number; signal?: AbortSignal; trace?: boolean }): Promise<Uint8Array[]>
+  query(sql: string, params: readonly unknown[] | RawParams, opts: { name?: string; snapshot?: string; params?: readonly ParamType[]; mode: 'buffer'; metrics?: boolean | 'ms' | 'us'; debug?: boolean; timeout?: number; signal?: AbortSignal; trace?: boolean; binary?: boolean }): Promise<QueryResult<(Buffer | null)[]>>
+  query(sql: string, params: readonly unknown[] | RawParams, opts: { name?: string; snapshot?: string; params?: readonly ParamType[]; mode: 'raw'; metrics?: boolean | 'ms' | 'us'; debug?: boolean; timeout?: number; signal?: AbortSignal; trace?: boolean; binary?: boolean }): Promise<QueryResult<Buffer>>
   // impl return is `any` ONLY to satisfy every overload (QueryResult<T> shapes + wire's Uint8Array[]);
   // all callers go through the typed overloads above.
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  query(sql: string, params: unknown[] | RawParams = [], opts: QueryOptions = {}): Promise<any> {
+  query(sql: string, params: readonly unknown[] | RawParams = [], opts: QueryOptions = {}): Promise<any> {
     // query(sql, opts) arg-shift for untyped callers: a non-array second argument whose keys are
     // all KNOWN options (and no third argument) is an options object, not a params mistake.
     if (params && !Array.isArray(params) && typeof params === 'object' && Object.keys(opts).length === 0) {
@@ -1593,7 +1593,7 @@ export class Connection {
     }
   }
 
-  stream<Row = unknown[]>(sql: string, params: unknown[] = [], opts: StreamOptions = {}): AsyncIterableIterator<Row> {
+  stream<Row = unknown[]>(sql: string, params: readonly unknown[] = [], opts: StreamOptions = {}): AsyncIterableIterator<Row> {
     const self = this
     const buf: Row[] = []
     let waiting: { resolve: (r: IteratorResult<Row>) => void; reject: (e: Error) => void } | null = null

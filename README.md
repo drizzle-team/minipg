@@ -69,7 +69,8 @@ The root import picks its TCP transport from the runtime, so the same line works
 
 | Runtime | `@drizzle-team/minipg` resolves to | Transport |
 |---|---|---|
-| Node, Bun, Deno | the Node entry | `node:net` / `node:tls` |
+| Node, Bun | the Node entry | `node:net` / `node:tls` |
+| Deno | the Deno entry | `Deno.connect` / `Deno.startTls` |
 | Cloudflare Workers | the Workers entry | `cloudflare:sockets` (needs `nodejs_compat`) |
 
 The choice is made once, by the `exports` conditions in `package.json`, when the module is
@@ -140,11 +141,12 @@ conditions as the root import, and it has no fallback either:
 
 | Runtime | `@drizzle-team/minipg/effect` resolves to | Transport |
 |---|---|---|
-| Node, Bun, Deno | the Node entry | `node:net` / `node:tls` |
+| Node, Bun | the Node entry | `node:net` / `node:tls` |
+| Deno | the Deno entry | `Deno.connect` / `Deno.startTls` |
 | Cloudflare Workers | the Workers entry | `cloudflare:sockets` (needs `nodejs_compat`) |
 
 To force a transport, import `@drizzle-team/minipg/effect/node`, `/effect/cf` or
-`/effect/deno`. The Deno entry uses Deno's own `Deno.connect`. `/effect/core` has no transport:
+`/effect/deno`. `/effect/core` has no transport:
 pass `socket` in the config, or build a pool with another entry point, for example `createPool`
 from `@drizzle-team/minipg/neon-ws`, and pass it to `MinipgClient.layerFromPool`.
 

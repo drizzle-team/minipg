@@ -76,9 +76,19 @@ for (const s of ${JSON.stringify(routedSubpaths)}) {
 `
 fs.writeFileSync(path.join(scratch, 'routed.mjs'), routed)
 
+// The Deno entries load under Node, so the `deno` routing is checked by the resolved path instead.
+const routedDeno = `
+for (const s of ${JSON.stringify(routedSubpaths)}) {
+  const resolved = import.meta.resolve(${JSON.stringify(PKG)} + s)
+  if (!resolved.endsWith(\`/dist\${s}/deno.js\`)) { console.error(\`\${s || 'root'} under --conditions=deno resolved to \${resolved}\`); process.exit(1) }
+}
+`
+fs.writeFileSync(path.join(scratch, 'routed-deno.mjs'), routedDeno)
+
 try {
   execFileSync('node', ['probe.mjs'], { cwd: scratch, stdio: 'inherit' })
   execFileSync('node', ['--conditions=workerd', 'routed.mjs'], { cwd: scratch, stdio: 'inherit' })
+  execFileSync('node', ['--conditions=deno', 'routed-deno.mjs'], { cwd: scratch, stdio: 'inherit' })
   process.exit(0)
 } catch {
   process.exit(1)

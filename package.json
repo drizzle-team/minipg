@@ -35,7 +35,7 @@
     ".": {
       "types": "./dist/index.d.ts",
       "workerd": "./dist/cf.js",
-      "deno": "./dist/index.js",
+      "deno": "./dist/deno.js",
       "bun": "./dist/index.js",
       "node": "./dist/index.js"
     },
@@ -94,7 +94,7 @@
     "./effect": {
       "types": "./dist/effect/index.d.ts",
       "workerd": "./dist/effect/cf.js",
-      "deno": "./dist/effect/index.js",
+      "deno": "./dist/effect/deno.js",
       "bun": "./dist/effect/index.js",
       "node": "./dist/effect/index.js"
     },

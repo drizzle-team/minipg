@@ -1,4 +1,6 @@
 // minipg for Deno — `import { connect, createPool } from 'minipg/deno'`.
+// Also what the ROOT entry resolves to under the `deno` export condition (package.json), so it
+// exposes the whole public API: its own connect/createPool plus everything in ./api.ts.
 // Same driver, Deno's TCP transport: Deno.connect (plus Deno.startTls for the SSLRequest upgrade —
 // never connectTls, see below) gives WHATWG streams, bridged to the Node Duplex the core uses.
 // (node:stream + node:crypto come from Deno's Node-compat layer.)
