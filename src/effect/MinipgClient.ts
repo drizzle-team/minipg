@@ -416,14 +416,14 @@ const classifySqlState = (code: string | undefined, constraint: unknown, props: 
 
 export const layerFrom = <E, R>(
   build: Effect.Effect<MinipgClient, E, R>,
-): Layer.Layer<MinipgClient | Client.SqlClient, E, Exclude<R, Scope.Scope | Reactivity.Reactivity>> =>
+) =>
   Layer.effectContext(
     Effect.map(build, (client) => {
       const context = Context.make(MinipgClient, client).pipe(Context.add(Client.SqlClient, client))
       // The driver can reach the statement span only when Effect propagates it.
       return client.config.metrics ? Context.add(context, Statement.SpanPropagationEnabled, true) : context
     }),
-  ).pipe(Layer.provide(Reactivity.layer)) as never
+  ).pipe(Layer.provide(Reactivity.layer))
 
 /** A layer over a pool that the caller owns. Closing the layer's scope leaves the pool open. */
 export const layerFromPool = (pool: Pool, options?: FromPoolOptions) =>
