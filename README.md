@@ -5,7 +5,7 @@
 > without notice.
 
 A minimal, dependency-free PostgreSQL driver for Node, Bun, Deno, and Cloudflare Workers. It
-covers the wire protocol directly and ships as ESM only, with 15 subpath entry points for
+covers the wire protocol directly and ships as ESM only, with 18 subpath entry points for
 each supported runtime and adapter.
 
 ## Install
@@ -135,11 +135,18 @@ Some things do not move:
 
 ### Runtimes
 
-- `@drizzle-team/minipg/effect` registers the Node transport. Use it on Node and Bun.
-- `@drizzle-team/minipg/effect/core` has no transport, so it loads on Cloudflare Workers,
-  Deno and Neon. Build a pool with that runtime's entry point, for example `createPool` from
-  `@drizzle-team/minipg/cf`, and pass it to `MinipgClient.layerFromPool`. A `socket` in the
-  config also works.
+`@drizzle-team/minipg/effect` picks its transport from the runtime with the same `exports`
+conditions as the root import, and it has no fallback either:
+
+| Runtime | `@drizzle-team/minipg/effect` resolves to | Transport |
+|---|---|---|
+| Node, Bun, Deno | the Node entry | `node:net` / `node:tls` |
+| Cloudflare Workers | the Workers entry | `cloudflare:sockets` (needs `nodejs_compat`) |
+
+To force a transport, import `@drizzle-team/minipg/effect/node`, `/effect/cf` or
+`/effect/deno`. The Deno entry uses Deno's own `Deno.connect`. `/effect/core` has no transport:
+pass `socket` in the config, or build a pool with another entry point, for example `createPool`
+from `@drizzle-team/minipg/neon-ws`, and pass it to `MinipgClient.layerFromPool`.
 
 `layerFromPool` also lets the async and the Effect entry points share one pool. The pool stays
 open when the layer's scope closes:

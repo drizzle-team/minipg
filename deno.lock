@@ -1,5 +1,5 @@
 {
-  "version": "4",
+  "version": "5",
   "specifiers": {
     "jsr:@std/assert@1": "1.0.19",
     "jsr:@std/internal@^1.0.12": "1.0.14"
@@ -26,6 +26,7 @@
         "npm:cli-highlight@^2.1.11",
         "npm:drizzle-kit@~0.31.10",
         "npm:drizzle-orm@~0.45.2",
+        "npm:effect@~4.0.5",
         "npm:fast-check@^4.8.0",
         "npm:mitata@^1.0.34",
         "npm:pg@^8.22.0",

@@ -1,11 +1,11 @@
-// The Effect entry point: Effect's SqlClient contract implemented over the minipg pool and connections.
-import * as Config from 'effect/Config'
+// Effect's SqlClient contract implemented over the minipg pool and connections. This part is the same
+// on every runtime; each runtime's client module adds make, layer and layerConfig with its own pool.
 import * as Context from 'effect/Context'
-import * as Duration from 'effect/Duration'
+import type * as Duration from 'effect/Duration'
 import * as Effect from 'effect/Effect'
 import * as Layer from 'effect/Layer'
 import * as Option from 'effect/Option'
-import * as Redacted from 'effect/Redacted'
+import type * as Redacted from 'effect/Redacted'
 import * as Reactivity from 'effect/reactivity/Reactivity'
 import type * as Scope from 'effect/Scope'
 import * as Stream from 'effect/Stream'
@@ -23,9 +23,9 @@ import type { Connection } from '../connection.ts'
 import { Cursor, type CursorOptions } from '../cursor.ts'
 import { PgError } from '../errors.ts'
 import type { QueryMetrics } from '../plugin.ts'
-import { Pool } from '../pool.ts'
+import type { Pool } from '../pool.ts'
 import type { RawParams } from '../encode.ts'
-import type { ConnectConfig, PoolConfig, QueryOptions as MinipgQueryOptions, QueryResult } from '../types.ts'
+import type { ConnectConfig, QueryOptions as MinipgQueryOptions, QueryResult } from '../types.ts'
 
 export const TypeId: TypeId = '~@drizzle-team/minipg/MinipgClient'
 export type TypeId = '~@drizzle-team/minipg/MinipgClient'
@@ -130,45 +130,6 @@ export interface MinipgClientConfig {
   readonly pipeline?: ConnectConfig['pipeline']
   readonly types?: ConnectConfig['types']
 }
-
-const toPoolConfig = (config: MinipgClientConfig): PoolConfig => {
-  const toMillis = (duration: Duration.Input | undefined) => (duration === undefined ? undefined : Duration.toMillis(duration))
-  return {
-    url: config.url && Redacted.value(config.url),
-    host: config.host,
-    port: config.port,
-    path: config.path,
-    ssl: config.ssl,
-    database: config.database,
-    user: config.username,
-    password: config.password && Redacted.value(config.password),
-    connectTimeout: toMillis(config.connectTimeout),
-    idleTimeoutMillis: toMillis(config.idleTimeout),
-    max: config.maxConnections,
-    applicationName: config.applicationName,
-    socket: config.socket,
-    decode: config.decode,
-    temporal: config.temporal,
-    prepare: config.prepare,
-    pipeline: config.pipeline,
-    types: config.types,
-    // Effect runs transaction statements on the transaction's connection itself.
-    txGuard: false,
-  }
-}
-
-const stripUndefined = <T extends object>(object: T): T =>
-  Object.fromEntries(Object.entries(object).filter(([, value]) => value !== undefined)) as T
-
-/** Creates a client with its own pool. The pool opens now and ends when the scope closes. */
-export const make = (config: MinipgClientConfig): Effect.Effect<MinipgClient, SqlError, Scope.Scope | Reactivity.Reactivity> =>
-  Effect.flatMap(
-    Effect.acquireRelease(
-      Effect.sync(() => new Pool(stripUndefined(toPoolConfig(config)))),
-      (pool) => Effect.promise(() => pool.end()),
-    ),
-    (pool) => makeWithPool(pool, config),
-  )
 
 /** The client settings that apply on top of an existing pool. */
 export type FromPoolOptions = Pick<MinipgClientConfig, 'spanAttributes' | 'transformResultNames' | 'transformQueryNames' | 'transformJson' | 'metrics'>
@@ -469,14 +430,6 @@ export const layerFrom = <E, R>(
       return client.config.metrics ? Context.add(context, Statement.SpanPropagationEnabled, true) : context
     }),
   ).pipe(Layer.provide(Reactivity.layer)) as never
-
-/** A layer with its own pool, opened when the layer is built and ended when its scope closes. */
-export const layer = (config: MinipgClientConfig): Layer.Layer<MinipgClient | Client.SqlClient, SqlError> =>
-  layerFrom(make(config))
-
-/** Like `layer`, with the settings read from Effect Config. */
-export const layerConfig = (config: Config.Wrap<MinipgClientConfig>): Layer.Layer<MinipgClient | Client.SqlClient, Config.ConfigError | SqlError> =>
-  layerFrom(Effect.flatMap(Config.unwrap(config), make))
 
 /** A layer over a pool that the caller owns. Closing the layer's scope leaves the pool open. */
 export const layerFromPool = (pool: Pool, options?: FromPoolOptions): Layer.Layer<MinipgClient | Client.SqlClient, SqlError> =>

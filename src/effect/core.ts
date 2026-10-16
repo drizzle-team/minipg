@@ -1,5 +1,5 @@
-// The Effect entry point without a transport. Pass a pool from another runtime's entry point, or a
-// `socket` in the config. The Node and Bun entry point is ./index.ts.
-import * as MinipgClient from './MinipgClient.ts'
+// The Effect entry point without a transport. Pass `socket` in the config, or a pool from another
+// entry point to `layerFromPool`.
+import * as MinipgClient from './core-client.ts'
 
 export { MinipgClient }

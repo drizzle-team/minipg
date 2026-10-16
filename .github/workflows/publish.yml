@@ -87,7 +87,7 @@ jobs:
           "$PGBIN/postgres" --version
       - run: bun install --frozen-lockfile
       - run: bash test/setup-pg.sh
-      - run: deno test --no-check --allow-net --allow-env --allow-read --allow-sys test/deno/deno.test.ts
+      - run: deno test --no-check --allow-net --allow-env --allow-read --allow-sys test/deno/deno.test.ts test/deno/effect.test.ts
       - if: failure()
         run: cat test/.pgdata/server.log
 

@@ -93,7 +93,22 @@
     },
     "./effect": {
       "types": "./dist/effect/index.d.ts",
-      "import": "./dist/effect/index.js"
+      "workerd": "./dist/effect/cf.js",
+      "deno": "./dist/effect/index.js",
+      "bun": "./dist/effect/index.js",
+      "node": "./dist/effect/index.js"
+    },
+    "./effect/node": {
+      "types": "./dist/effect/node.d.ts",
+      "import": "./dist/effect/node.js"
+    },
+    "./effect/cf": {
+      "types": "./dist/effect/cf.d.ts",
+      "import": "./dist/effect/cf.js"
+    },
+    "./effect/deno": {
+      "types": "./dist/effect/deno.d.ts",
+      "import": "./dist/effect/deno.js"
     },
     "./effect/core": {
       "types": "./dist/effect/core.d.ts",
