@@ -445,11 +445,14 @@ describe('channel_binding (SCRAM without channel binding)', () => {
   test('require over PLAIN TCP throws loudly (binding needs TLS); prefer/disable connect as today', async () => {
     const err = await caught(() => connect(`${base()}?channel_binding=require`))
     expect((err as Error).message).toMatch(/channel_binding=require needs TLS/)
+    expect((err as Error).message).toContain('Enable `ssl`') // names the field to set…
+    expect((err as Error).message).toContain('`channel_binding=prefer`') // …and the stance to fall back to
     const c = await connect(`${base()}?channel_binding=prefer`)
     try { expect((await c.query('select 1 as ok', [], { mode: 'object' })).rows[0]).toEqual({ ok: 1 }) } finally { c.end() }
   })
   test('an unknown channel_binding value fails URL parsing like libpq', async () => {
     const err = await caught(() => connect(`${base()}?channel_binding=maybe`))
     expect((err as Error).message).toMatch(/invalid channel_binding value "maybe"/)
+    expect((err as Error).message).toContain('`disable` | `prefer` | `require`') // lists what IS accepted
   })
 })

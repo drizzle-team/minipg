@@ -14,13 +14,13 @@
 import { buildMapperFactory, type RowMapperFactory } from './mapper.ts'
 import { buildDecoders } from './decode.ts'
 import { INSTANT_OIDS, tagArrayCol, type CodegenCol } from './decode.ts'
-import { shapeCols, type ShapeSpec } from './spec.ts'
+import { shapeCols, mergeUnknownCols, type ShapeSpec } from './spec.ts'
 import type { ShapeMapper } from './shape.ts'
 import { parseDataRow } from './protocol.ts'
 import { PgError } from './errors.ts'
 import { defaultDecoders } from './decode.ts'
 import { resolveUrl } from './url.ts'
-import { encodeJsonParam as encodeParam } from './encode.ts'
+import { encodeJsonParams as encodeParams } from './encode.ts'
 import type { Decoder, ResultMode, QueryResult } from './types.ts'
 
 type JsonBigints = 'number' | 'string' | 'bigint'
@@ -106,6 +106,8 @@ function endOfValue(buf: Buffer, i: number): number {
 }
 function skipWs(buf: Buffer, i: number): number { while (i < buf.length) { const c = buf[i]!; if (c === 0x20 || c === 0x09 || c === 0x0a || c === 0x0d) i++; else break } return i }
 
+const TX_SQL = /^\s*(begin|start\s+transaction|commit|end|rollback(?!\s+to\b)|abort|prepare\s+transaction)\b/i
+
 // A reused scratch that assembles a synthetic wire DataRow body (int16 count + per-cell int32 len + bytes).
 class RowBuf {
   buf = Buffer.allocUnsafe(4096)
@@ -114,6 +116,7 @@ class RowBuf {
   private ensure(n: number): void { if (this.buf.length < this.pos + n) { const nb = Buffer.allocUnsafe(Math.max(this.pos + n, this.buf.length * 2)); this.buf.copy(nb); this.buf = nb } }
   pushNull(): void { this.ensure(4); this.buf.writeInt32BE(-1, this.pos); this.pos += 4 }
   pushSlice(src: Buffer, start: number, end: number): void { const len = end - start; this.ensure(4 + len); this.buf.writeInt32BE(len, this.pos); this.pos += 4; src.copy(this.buf, this.pos, start, end); this.pos += len }
+  pushText(s: string | null): void { if (s == null) { this.pushNull(); return } const b = Buffer.from(s, 'utf8'); this.pushSlice(b, 0, b.length) }
   finish(ncols: number): Buffer { this.buf.writeInt16BE(ncols, 0); return this.buf.subarray(0, this.pos) }
 }
 
@@ -137,7 +140,6 @@ function numField(buf: Buffer, key: string, from: number): number | null {
 // RELEASE / ROLLBACK TO are not listed: inside transaction([...]) they're legit (the batch IS one
 // tx), and standalone the server already errors loudly ("can only be used in transaction blocks").
 // Best-effort lexical check (a leading comment evades it), same spirit as the fn-guard below.
-const TX_SQL = /^\s*(begin|start\s+transaction|commit|end|rollback(?!\s+to\b)|abort|prepare\s+transaction)\b/i
 
 export class NeonHttpClient {
   private endpoint: string
@@ -179,14 +181,13 @@ export class NeonHttpClient {
   }
 
   private signalFor(o: { timeout?: number; signal?: AbortSignal }): AbortSignal | undefined {
-    if (o.timeout == null && !o.signal) return undefined
-    if (o.timeout != null && !o.signal) return AbortSignal.timeout(o.timeout)
-    if (o.signal && o.timeout == null) return o.signal
+    if (o.timeout == null) return o.signal
+    if (!o.signal) return AbortSignal.timeout(o.timeout)
     const ac = new AbortController()
-    const sig = o.signal!
+    const sig = o.signal
     if (sig.aborted) ac.abort(sig.reason)
     else sig.addEventListener('abort', () => ac.abort(sig.reason), { once: true })
-    setTimeout(() => ac.abort(Object.assign(new Error(`query timed out after ${o.timeout}ms`), { code: 'QUERY_TIMEOUT' })), o.timeout!)
+    setTimeout(() => ac.abort(Object.assign(new Error(`query timed out after ${o.timeout}ms`), { code: 'QUERY_TIMEOUT' })), o.timeout)
     return ac.signal
   }
 
@@ -206,7 +207,9 @@ export class NeonHttpClient {
   // temporal:'string' the same way the wire driver's resolveCols does.
   private planCols(fields: NeonField[], shape: ShapeSpec | ShapeMapper | undefined): CodegenCol[] {
     let cols: CodegenCol[]
-    if (shape) cols = (typeof shape === 'function' ? (shape.$cols as CodegenCol[]) : shapeCols(shape)).map((c) => (c.format === 'binary' ? { ...c, format: 'text' as const } : c))
+    // 'unknown' (oid 0) columns defer their type to the result's field list — resolve them BEFORE
+    // tagArrayCol/temporal below, which key off the real OID. (Neon's fields carry `dataTypeID`.)
+    if (shape) cols = mergeUnknownCols((typeof shape === 'function' ? (shape.$cols as CodegenCol[]) : shapeCols(shape)).map((c) => (c.format === 'binary' ? { ...c, format: 'text' as const } : c)), fields, (f) => f.dataTypeID)
     else cols = fields.map((f) => ({ name: f.name, oid: f.dataTypeID }))
     cols = cols.map(tagArrayCol)
     if (this.temporal !== 'string') return cols
@@ -261,7 +264,7 @@ export class NeonHttpClient {
     const rb = new RowBuf()
     const rows = result.rows.map((row) => {
       rb.reset()
-      for (let c = 0; c < ncols; c++) { const s = row[c]; if (s == null) rb.pushNull(); else { const b = Buffer.from(s, 'utf8'); rb.pushSlice(b, 0, b.length) } }
+      for (let c = 0; c < ncols; c++) rb.pushText(row[c] ?? null)
       return this.rowFrom(mode, mapper, rb.finish(ncols))
     })
     return { rows: rows as never[], columns: cols.map((c) => c.name), rowCount: result.rowCount ?? rows.length, command: result.command ?? null }
@@ -278,7 +281,7 @@ export class NeonHttpClient {
     const query = sql
     const tx = TX_SQL.exec(query)
     if (tx) throw new Error(`minipg/neon-http: "${tx[1]!.toUpperCase()}" does NOTHING over stateless HTTP — every query() runs in its OWN session, so hand-rolled BEGIN…COMMIT gives zero atomicity with no error; use transaction([...]) for an atomic batch, or minipg/neon-ws for interactive transactions`)
-    const res = await this.post({ query, params: params.map(encodeParam) }, await this.headers(), this.signalFor(opts))
+    const res = await this.post({ query, params: encodeParams(params) }, await this.headers(), this.signalFor(opts))
     return this.decodeSingleRaw(Buffer.from(await res.arrayBuffer()), mode, opts.shape)
   }
 
@@ -292,7 +295,7 @@ export class NeonHttpClient {
     if (opts.isolation) headers['Neon-Batch-Isolation-Level'] = ISO_HEADER[opts.isolation]
     if (opts.readOnly != null) headers['Neon-Batch-Read-Only'] = String(opts.readOnly)
     if (opts.deferrable != null) headers['Neon-Batch-Deferrable'] = String(opts.deferrable)
-    const body = { queries: queries.map((q) => ({ query: q.sql, params: (q.params ?? []).map(encodeParam) })) }
+    const body = { queries: queries.map((q) => ({ query: q.sql, params: encodeParams(q.params ?? []) })) }
     const res = await this.post(body, headers, this.signalFor(opts))
     const j = (await res.json()) as { results: Array<{ fields: NeonField[]; rows: (string | null)[][]; command?: string | null; rowCount?: number | null }> }
     return j.results.map((r, i) => { const q = queries[i]!; return this.decodeParsed(r, q.mode ?? (q.shape ? 'object' : 'array'), q.shape) })

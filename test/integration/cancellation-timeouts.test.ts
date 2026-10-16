@@ -13,12 +13,15 @@ import { Connection } from '../../src/index.ts'
 
 // A raw-TCP stub: accepts connections and (optionally) runs `onConn` per socket.
 function stubServer(onConn?: (sock: net.Socket) => void): Promise<{ port: number; close: () => Promise<void> }> {
+  // A stub socket that never reads its buffered input does not notice that the client closed, so
+  // srv.close() alone would wait for it forever.
+  const sockets = new Set<net.Socket>()
   return new Promise((resolve) => {
-    const srv = net.createServer((sock) => { sock.on('error', () => { /* ignore client teardown */ }); onConn?.(sock) })
+    const srv = net.createServer((sock) => { sockets.add(sock); sock.on('error', () => { /* ignore client teardown */ }); onConn?.(sock) })
     srv.on('error', () => { /* ignore */ })
     srv.listen(0, '127.0.0.1', () => {
       const addr = srv.address() as net.AddressInfo
-      resolve({ port: addr.port, close: () => new Promise<void>((r) => srv.close(() => r())) })
+      resolve({ port: addr.port, close: () => { for (const s of sockets) s.destroy(); return new Promise<void>((r) => srv.close(() => r())) } })
     })
   })
 }

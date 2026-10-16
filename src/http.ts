@@ -8,17 +8,19 @@
 // No connection string: the bearer token is the whole identity — the gateway owns DATABASE_URL.
 // No protocol headers: row shape (object/array) is a client-side decode choice.
 //
-// Decode default divergence, ON PURPOSE: int8 columns decode to STRING here (lossless AND
-// JSON-serialisable — this entry's common fate is Response.json(rows) in a Worker), not the wire
-// driver's BigInt. `int8: 'bigint'` restores parity; per-column shape targets always win.
+// Decode defaults are the SAME as every other entry (wire, neon-http, aurora): int8 -> BigInt,
+// numeric -> exact string, temporal -> Date. A transport must not change what a value decodes to.
+// This entry's common fate is Response.json(rows) in a Worker, where BigInt throws — set
+// `int8: 'string'` (lossless and JSON-serialisable) or `'number'` (lossy) for that; per-column
+// shape targets always win over both.
 import './buffer-polyfill.ts' // MUST be first: installs Buffer on runtimes without it (no-op elsewhere)
 import { buildMapperFactory, type RowMapperFactory } from './mapper.ts'
 import { buildDecoders, INSTANT_OIDS, tagArrayCol, type CodegenCol } from './decode.ts'
-import { shapeCols, resolveParamTypes, type ShapeSpec, type ParamType } from './spec.ts'
+import { shapeCols, resolveParamTypes, mergeUnknownCols, type ShapeSpec, type ParamType } from './spec.ts'
 import type { ShapeMapper } from './shape.ts'
 import { Parser, parseRowDescription, type RawMessage } from './protocol.ts'
 import { PgError, parseErrorFields } from './errors.ts'
-import { encodeJsonParam } from './encode.ts'
+import { encodeJsonParams } from './encode.ts'
 import type { Decoder, ResultMode, QueryResult, Field } from './types.ts'
 
 type Isolation = 'serializable' | 'repeatable read' | 'read committed' | 'read uncommitted'
@@ -35,7 +37,8 @@ export interface HttpConfig {
   jsonBigints?: 'number' | 'string' | 'bigint'
   /** date/timestamp(tz) default decode: 'date' (JS Date, default) or 'string' (exact PG text). */
   temporal?: 'date' | 'string'
-  /** int8 default for THIS entry: 'string' (default), 'bigint' (wire-driver parity), 'number' (lossy). */
+  /** int8 decode target: 'bigint' (default — same as every other entry), 'string' (lossless and
+   *  JSON-serialisable, for Response.json(rows)) or 'number' (lossy above 2^53). */
   int8?: 'string' | 'bigint' | 'number'
   decode?: 'auto' | 'jit' | 'interpreted'
   /** Descriptor elision (default true): echo a hash of each statement's T frame so the gateway may
@@ -74,10 +77,12 @@ export type HttpPipelineResult = { status: 'fulfilled'; value: QueryResult } | {
 
 // Transaction control never belongs in a statement: the GATEWAY owns the BEGIN…COMMIT boundary
 // (batch mode), and a smuggled COMMIT would end it early. Mirrors the gateway's own rejection.
-const TX_SQL = /^\s*(begin|start\s+transaction|commit|end|rollback(?!\s+to\b)|abort|prepare\s+transaction)\b/i
 
 // FNV-1a 64 over the raw T frame -> 16 lowercase hex chars (the `desc` value). T frames are small
 // (~240B for 8 columns), so the per-byte BigInt walk is irrelevant.
+const TX_SQL = /^\s*(begin|start\s+transaction|commit|end|rollback(?!\s+to\b)|abort|prepare\s+transaction)\b/i
+const firstCstr = (b: Buffer): string => { const z = b.indexOf(0); return b.toString('utf8', 0, z < 0 ? b.length : z) }
+
 const FNV_PRIME = 0x100000001b3n, FNV_MASK = 0xffffffffffffffffn
 function fnv1a64(b: Uint8Array): string {
   let h = 0xcbf29ce484222325n
@@ -88,7 +93,6 @@ function fnv1a64(b: Uint8Array): string {
 // One statement's slice of the stream (PROTOCOL.md "Splitting results": C/E/I terminate, never T).
 interface RawResult { fields: Field[] | null; rows: Buffer[]; command: string | null; rowCount: number | null; error: PgError | null }
 
-const firstCstr = (b: Buffer): string => { const z = b.indexOf(0); return b.toString('utf8', 0, z < 0 ? b.length : z) }
 
 export class HttpClient {
   private cfg: HttpConfig
@@ -123,9 +127,18 @@ export class HttpClient {
     return h
   }
 
+  /** Combine a per-query `timeout` with the caller's `signal`. NOT AbortSignal.any: that is Node 20.3+
+   *  while this package supports Node >= 18, where it is undefined and passing both would throw. The
+   *  driver's own expiry aborts with a tagged error so callers can tell it from an external abort. */
   private signalFor(o: { timeout?: number; signal?: AbortSignal }): AbortSignal | undefined {
     if (o.timeout == null) return o.signal
-    return o.signal ? AbortSignal.any([o.signal, AbortSignal.timeout(o.timeout)]) : AbortSignal.timeout(o.timeout)
+    if (!o.signal) return AbortSignal.timeout(o.timeout)
+    const ac = new AbortController()
+    const sig = o.signal
+    if (sig.aborted) ac.abort(sig.reason)
+    else sig.addEventListener('abort', () => ac.abort(sig.reason), { once: true })
+    setTimeout(() => ac.abort(Object.assign(new Error(`query timed out after ${o.timeout}ms`), { code: 'QUERY_TIMEOUT' })), o.timeout)
+    return ac.signal
   }
 
   private async post(body: unknown, opts: { timeout?: number; signal?: AbortSignal }): Promise<RawMessage[]> {
@@ -178,16 +191,21 @@ export class HttpClient {
   // ---- decode: the SAME column plan + compiled mappers as the wire driver ----
   private planCols(fields: Field[], shape: ShapeSpec | ShapeMapper | undefined): CodegenCol[] {
     let cols: CodegenCol[]
-    if (shape) cols = (typeof shape === 'function' ? (shape.$cols as CodegenCol[]) : shapeCols(shape)).map((c) => (c.format === 'binary' ? { ...c, format: 'text' as const } : c)) // the protocol GUARANTEES text
+    // 'unknown' (oid 0) columns defer their type to the RowDescription — resolve them BEFORE the
+    // array/temporal/int8 passes below, which all key off the real OID.
+    if (shape) cols = mergeUnknownCols((typeof shape === 'function' ? (shape.$cols as CodegenCol[]) : shapeCols(shape)).map((c) => (c.format === 'binary' ? { ...c, format: 'text' as const } : c)), fields, (f) => f.dataTypeOid) // the protocol GUARANTEES text
     else cols = fields.map((f) => ({ name: f.name, oid: f.dataTypeOid }))
     const temporal = this.cfg.temporal ?? 'date'
-    const int8 = this.cfg.int8 ?? 'string'
+    const int8 = this.cfg.int8 ?? 'bigint' // parity with the wire driver's default decoder catalog
     return cols.map((c0) => {
       const c = tagArrayCol(c0)
-      if (!c.js && !c.json) {
-        if (temporal === 'string' && INSTANT_OIDS.has(c.oid)) return { ...c, js: 'string' as const, format: 'text' as const }
-        if (int8 !== 'bigint' && c.oid === 20) return { ...c, js: int8 }
-        if (int8 !== 'bigint' && c.array && c.array.elem === 20 && !c.array.js) return { ...c, array: { ...c.array, js: int8 } }
+      if (temporal === 'string') { // mirrors Connection.resolveCols, temporal[] ELEMENTS included
+        if (!c.js && !c.json && INSTANT_OIDS.has(c.oid)) return { ...c, js: 'string' as const, format: 'text' as const }
+        if (c.array && !c.array.js && INSTANT_OIDS.has(c.array.elem)) return { ...c, array: { ...c.array, js: 'string' as const } }
+      }
+      if (int8 !== 'bigint' && !c.js && !c.json) {
+        if (c.oid === 20) return { ...c, js: int8 }
+        if (c.array && c.array.elem === 20 && !c.array.js) return { ...c, array: { ...c.array, js: int8 } }
       }
       return c
     })
@@ -213,11 +231,13 @@ export class HttpClient {
     if (this.cfg.token == null) return
   }
 
-  private checkTypes(types: readonly ParamType[] | undefined, nParams: number, sql: string): readonly ParamType[] | undefined {
+  // Returns the DECLARED type OIDs (or undefined) — encodeJsonParams needs them so a declared
+  // json/jsonb param serializes as JSON text rather than by the value's own shape.
+  private checkTypes(types: readonly ParamType[] | undefined, nParams: number, sql: string): readonly number[] | undefined {
     if (!types) return undefined
-    resolveParamTypes(types) // local validation: a typo fails HERE with minipg's error, not a gateway round-trip
+    const oids = resolveParamTypes(types) // local validation: a typo fails HERE with minipg's error, not a gateway round-trip
     if (types.length !== nParams) throw new Error(`minipg/http: ${nParams} param value(s) but ${types.length} type(s) declared for ${JSON.stringify(sql.slice(0, 40))}`)
-    return types
+    return oids
   }
 
   // ---- public API ----
@@ -227,9 +247,9 @@ export class HttpClient {
   query(sql: string, params?: unknown[], opts?: HttpQueryOptions): Promise<QueryResult>
   async query(sql: string, params: unknown[] = [], opts: HttpQueryOptions = {}): Promise<QueryResult<never>> {
     this.guard(sql)
-    const types = this.checkTypes(opts.types, params.length, sql)
-    const body: Record<string, unknown> = { sql, params: params.map(encodeJsonParam) }
-    if (types) body.types = types
+    const oids = this.checkTypes(opts.types, params.length, sql)
+    const body: Record<string, unknown> = { sql, params: encodeJsonParams(params, oids) }
+    if (opts.types) body.types = opts.types
     const cached = this.sendDesc ? this.descCache.get(sql) : undefined
     if (cached) body.desc = cached.hash
     const { results, trailing } = this.split(await this.post(body, opts), [sql])
@@ -242,8 +262,8 @@ export class HttpClient {
    *  COMMIT (deferred constraint, serializable 40001) — rejects the whole call with the FIRST error;
    *  every result set is discarded (they describe undone work). */
   async batch(queries: HttpBatchQuery[], opts: HttpBatchOptions = {}): Promise<QueryResult[]> {
-    for (const q of queries) { this.guard(q.sql); this.checkTypes(q.types, (q.params ?? []).length, q.sql) }
-    const body: Record<string, unknown> = { mode: 'batch', queries: queries.map((q) => ({ sql: q.sql, params: (q.params ?? []).map(encodeJsonParam), ...(q.types ? { types: q.types } : {}) })) }
+    const oids = queries.map((q) => { this.guard(q.sql); return this.checkTypes(q.types, (q.params ?? []).length, q.sql) })
+    const body: Record<string, unknown> = { mode: 'batch', queries: queries.map((q, i) => ({ sql: q.sql, params: encodeJsonParams(q.params ?? [], oids[i]), ...(q.types ? { types: q.types } : {}) })) }
     if (opts.isolation) body.isolation = opts.isolation
     if (opts.readOnly != null) body.readOnly = opts.readOnly
     if (opts.deferrable != null) body.deferrable = opts.deferrable
@@ -258,8 +278,8 @@ export class HttpClient {
    *  committed — the full per-statement outcome array is returned (never a whole-call rejection for
    *  a statement error). */
   async pipeline(queries: HttpBatchQuery[], opts: { timeout?: number; signal?: AbortSignal } = {}): Promise<HttpPipelineResult[]> {
-    for (const q of queries) { this.guard(q.sql); this.checkTypes(q.types, (q.params ?? []).length, q.sql) }
-    const body = { mode: 'pipeline', queries: queries.map((q) => ({ sql: q.sql, params: (q.params ?? []).map(encodeJsonParam), ...(q.types ? { types: q.types } : {}) })) }
+    const oids = queries.map((q) => { this.guard(q.sql); return this.checkTypes(q.types, (q.params ?? []).length, q.sql) })
+    const body = { mode: 'pipeline', queries: queries.map((q, i) => ({ sql: q.sql, params: encodeJsonParams(q.params ?? [], oids[i]), ...(q.types ? { types: q.types } : {}) })) }
     const { results, trailing } = this.split(await this.post(body, opts), queries.map((q) => q.sql))
     if (trailing) throw trailing // impossible in autocommit mode — protocol desync if it happens
     if (results.length !== queries.length) throw new Error(`minipg/http: ${queries.length} statements but ${results.length} results — refusing to mis-attribute`)

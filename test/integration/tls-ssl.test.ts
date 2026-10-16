@@ -7,13 +7,14 @@
 import { test, expect, describe, spyOn } from 'bun:test'
 import net from 'node:net'
 import tls from 'node:tls'
+import { Duplex } from 'node:stream'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { execFileSync } from 'node:child_process'
 import { connect, Connection, PgError } from '../../src/index.ts'
 import { W } from '../../src/protocol.ts'
-import { testConnect, caught, SERVER_CA_PATH } from '../helpers/db.ts'
+import { testConnect, caught, SERVER_CA_PATH, TEST_CONFIG } from '../helpers/db.ts'
 
 // The server's own self-signed cert acts as its own CA (Issuer === Subject === CN=localhost).
 function readServerCa(): string {
@@ -408,9 +409,60 @@ describe('SCRAM channel binding (SCRAM-SHA-256-PLUS, tls-server-end-point)', () 
     try { expect((await plain.query('select 3 as ok', [], { mode: 'object' })).rows[0]).toEqual({ ok: 3 }) } finally { await plain.end() }
   }, 10000)
 
-  test('require + custom socket transport throws at construction (cert unreachable there)', async () => {
-    const err = await caught(() => connect({ ssl: true, channelBinding: 'require', socket: () => { throw new Error('never dialed') } }))
-    expect((err as Error).message).toMatch(/custom socket transport cannot expose the server certificate/)
+  // A custom transport terminates its own TLS, so whether binding is possible depends on what the
+  // factory resolves to — not something the constructor can know. Both directions are covered here.
+  describe('require over a CUSTOM socket transport', () => {
+    // plain TCP -> SSLRequest -> 'S' -> tls.connect on the same socket: what any self-TLS transport does
+    const starttls = () => new Promise<import('node:tls').TLSSocket>((resolve, reject) => {
+      const { host, port } = TEST_CONFIG as { host: string; port: number }
+      const raw = net.connect({ host, port }, () => {
+        const req = Buffer.alloc(8); req.writeInt32BE(8, 0); req.writeInt32BE(80877103, 4)
+        raw.write(req)
+        raw.once('data', (b: Buffer) => {
+          if (b[0] !== 0x53) return reject(new Error('server refused TLS'))
+          const sec = tls.connect({ socket: raw, rejectUnauthorized: false, servername: 'localhost' })
+          sec.once('secureConnect', () => resolve(sec)); sec.once('error', reject)
+        })
+      })
+      raw.once('error', reject)
+    })
+
+    test('CONNECTS when the transport exposes the certificate (node TLSSocket already does)', async () => {
+      // The server recomputes tls-server-end-point from ITS cert inside the signed SCRAM exchange, so
+      // reaching 'ready' at all proves the binding bytes matched — a custom socket really is bound here.
+      const { user, password, database } = TEST_CONFIG as { user: string; password: string; database: string }
+      const c = await connect({ user, password, database, ssl: false, channelBinding: 'require', socket: starttls })
+      try {
+        const r = await c.query('select ssl from pg_stat_ssl where pid = pg_backend_pid()', [], { mode: 'object' })
+        expect(r.rows[0]).toEqual({ ssl: true })
+      } finally { await c.end() }
+    }, 10000)
+
+    test('REFUSED at auth when the transport hides it, naming what a transport must provide', async () => {
+      const hidden = async () => {
+        const sec = await starttls() // same TLS session, stripped of the cert accessors
+        const d = new Duplex({ read() {}, write(chunk, _e, cb) { sec.write(chunk, cb) } })
+        sec.on('data', (b) => d.push(b)); sec.on('close', () => d.push(null)); sec.on('error', (e) => d.destroy(e))
+        return d
+      }
+      const { user, password, database } = TEST_CONFIG as { user: string; password: string; database: string }
+      const err = await caught(() => connect({ user, password, database, ssl: false, channelBinding: 'require', socket: hidden }))
+      const msg = (err as Error).message
+      expect(msg).toMatch(/does not expose the server certificate/)
+      expect(msg).not.toMatch(/node TLS only/) // it is NOT node-TLS-only any more
+      // The remedy is the point of this message, so pin it exactly as styled: the two accessors a
+      // transport may provide, and the stance to fall back to. A looser /getPeerCertificate/ passes
+      // whether or not the identifiers are actually spelled out, which is what it has to prove.
+      expect(msg).toContain('`getPeerX509Certificate()`')
+      expect(msg).toContain('`getPeerCertificate(true)`')
+      expect(msg).toContain('`raw` DER')
+      expect(msg).toContain('`channel_binding=prefer`')
+    }, 10000)
+
+    test('plain TCP with no socket at all is still refused up front (nothing to wait for)', async () => {
+      const err = await caught(() => connect({ ...(TEST_CONFIG as object), ssl: false, channelBinding: 'require' }))
+      expect((err as Error).message).toMatch(/channel_binding=require needs TLS/)
+    })
   })
 
   test('replication() binds too: require over TLS on the walsender', async () => {

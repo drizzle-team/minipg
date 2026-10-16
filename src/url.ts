@@ -48,7 +48,7 @@ export function parseConnectionString(url: string): Partial<ConnectConfig> {
   const options = q.get('options'); if (options) out.options = options // '-c key=val …' startup options (URLSearchParams already percent-decoded)
   const cb = q.get('channel_binding')
   if (cb) {
-    if (cb !== 'disable' && cb !== 'prefer' && cb !== 'require') throw new Error(`minipg: invalid channel_binding value ${JSON.stringify(cb)} (expected disable | prefer | require)`)
+    if (cb !== 'disable' && cb !== 'prefer' && cb !== 'require') throw new Error(`minipg: invalid channel_binding value ${JSON.stringify(cb)} (expected \`disable\` | \`prefer\` | \`require\`)`)
     out.channelBinding = cb
   }
   const sslmode = q.get('sslmode') ?? q.get('ssl')
@@ -72,4 +72,45 @@ export function resolveUrl<T extends ConnectConfig>(config: T): T {
     if (v !== undefined) out[k] = v // explicit (defined) fields win over url-derived
   }
   return out as unknown as T
+}
+
+/** The channel_binding stance a config resolves to, from the field or from inside its `url`. */
+function effectiveChannelBinding(config: ConnectConfig): ConnectConfig['channelBinding'] {
+  return config.channelBinding ?? (config.url ? parseConnectionString(config.url).channelBinding : undefined)
+}
+
+/** Drop `channel_binding=require` down to `'prefer'`. SCRAM channel binding hashes the server
+ *  certificate, and behind Neon's WebSocket proxy there is no certificate to hash — the proxy terminates
+ *  TLS and speaks plaintext to the compute, so the server never offers SCRAM-SHA-256-PLUS. Neon also
+ *  prints `?sslmode=require&channel_binding=require` on every connection string it issues, so treating it
+ *  as fatal would reject the provider's own default URL.
+ *
+ *  This is exactly what Neon's own drivers do: `@neondatabase/serverless` always selects plain
+ *  `SCRAM-SHA-256` and hardcodes the gs2 header `n,,` (`c=biws`), and never reads `channel_binding` out of
+ *  the connection string at all. Relaxed, minipg/neon-ws puts the identical bytes on the wire.
+ *
+ *  Only for the Neon entries — a general-purpose transport that cannot bind should say so; see
+ *  `refuseChannelBinding`. `disable`/`prefer` pass through untouched. */
+// The return type widens `channelBinding` back to the union: with `T` preserved as-is, a caller passing
+// a literal `'require'` would be told the result is still `'require'` — the one thing it cannot be.
+export function relaxChannelBinding<T extends ConnectConfig>(config: T): Omit<T, 'channelBinding'> & Pick<ConnectConfig, 'channelBinding'> {
+  return effectiveChannelBinding(config) === 'require' ? { ...config, channelBinding: 'prefer' } : config
+}
+
+/** Refuse `channel_binding=require` on a transport that cannot compute tls-server-end-point, naming the
+ *  runtime limit that makes it impossible. Unlike the Neon entries — which point at one provider whose own
+ *  drivers ignore the parameter — minipg/cf and minipg/deno dial any Postgres, so a caller who asked for
+ *  binding gets told it cannot happen rather than being silently downgraded.
+ *
+ *  Thrown from the entry function, before a Pool exists, so it surfaces immediately; `fatal` keeps the
+ *  breaker from treating it as an outage on any path that does reach a pool. */
+export function refuseChannelBinding<T extends ConnectConfig>(config: T, entry: string, limit: string): T {
+  if (effectiveChannelBinding(config) !== 'require') return config
+  throw Object.assign(
+    new Error(
+      `minipg/${entry}: channel_binding=require cannot be honoured — ${limit}, so SCRAM's tls-server-end-point cannot be computed. ` +
+      'Use `channel_binding=prefer` (or drop the parameter) to connect unbound, or `minipg/node` for a bound connection.',
+    ),
+    { fatal: true },
+  )
 }

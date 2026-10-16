@@ -30,7 +30,9 @@ The example below queries a local cluster. From a checkout of this repo, provisi
 bun run test:setup
 ```
 
-That starts Postgres on `127.0.0.1:54329` with a `testdb` database and a seeded table `t`.
+That starts Postgres on `127.0.0.1:54329` with a `testdb` database and a seeded table `t`. It uses
+local PostgreSQL binaries when `initdb`/`pg_ctl` are on PATH and a Docker container otherwise (force
+either with `MINIPG_PG_MODE=native|docker`; remove the container with `docker rm -f minipg-test-pg`).
 Any other Postgres works too — point the config below at it.
 
 ```js
@@ -60,6 +62,24 @@ and `numeric[]` yields exact strings. Arrays whose element type has a per-databa
 (`enum[]`, `domain[]`, composite arrays) can't be recognised from the wire OID alone and
 still arrive as the raw `{…}` literal; declare a `shape` for those. To opt back out for a
 given type, override its array OID in `types` (e.g. `types: { 1007: (b) => b.toString() }`).
+
+## Runtimes
+
+The root import picks its TCP transport from the runtime, so the same line works everywhere:
+
+| Runtime | `@drizzle-team/minipg` resolves to | Transport |
+|---|---|---|
+| Node, Bun, Deno | the Node entry | `node:net` / `node:tls` |
+| Cloudflare Workers | the Workers entry | `cloudflare:sockets` (needs `nodejs_compat`) |
+
+The choice is made once, by the `exports` conditions in `package.json`, when the module is
+resolved or bundled. There is no fallback on purpose: a target with no TCP (a browser bundle, the
+Vercel Edge runtime) fails to resolve the root import at build time. Use
+`@drizzle-team/minipg/http`, `/neon-http` or `/neon-ws` there.
+
+To force a transport, or when a bundler does not apply runtime conditions, import the explicit
+entry: `@drizzle-team/minipg/node`, `/cf` or `/deno`. Each exposes the same API as the root.
+`/core` has no transport at all; pass `config.socket`.
 
 ## Effect
 
