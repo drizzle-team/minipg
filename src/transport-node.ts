@@ -49,9 +49,16 @@ export function nodeTransport(cfg: NormalizedConfig, signal: AbortSignal): Promi
           // Bound to a `const` so the handshake callback and the error listener both see a
           // definitely-assigned socket (the outer `let` is only there for the abort listener to
           // destroy, and TS cannot prove a closure-assigned `let` is set).
-          const secure = tls.connect({ socket: sock, ...tlsOptions(cfg.ssl as TlsSsl, cfg.host) }, () => resolve(secure))
-          tlsSock = secure
-          secure.once('error', reject)
+          try {
+            const secure = tls.connect({ socket: sock, ...tlsOptions(cfg.ssl as TlsSsl, cfg.host) }, () => resolve(secure))
+            tlsSock = secure
+            secure.once('error', reject)
+          } catch (e) {
+            // tls.connect throws synchronously on a malformed ca/cert/key PEM. Uncaught here, inside a
+            // socket event handler, the throw would crash the process and leave the connect hanging.
+            sock.destroy()
+            reject(Object.assign(e as Error, { fatal: true }))
+          }
         } else if (res === 'N') {
           reject(Object.assign(new Error('server does not support TLS'), { fatal: true })) // fail closed (no downgrade)
         } else reject(Object.assign(new Error('unexpected SSL response byte: ' + res), { fatal: true }))
