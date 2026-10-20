@@ -1,6 +1,6 @@
 {
   "name": "@drizzle-team/minipg",
-  "version": "0.4.1",
+  "version": "0.4.2",
   "description": "A minimal, dependency-free PostgreSQL driver for Node, Bun, Deno, and Cloudflare Workers.",
   "type": "module",
   "license": "MIT",
@@ -111,7 +111,7 @@
     "test:neon-ws": "bun test test/integration/neon-ws.test.ts",
     "test:neon-http": "bun test test/integration/neon-http.test.ts test/integration/neon-http-parity.test.ts",
     "test:aurora": "bun test test/unit/aurora.test.ts",
-    "test:aurora:live": "bun test test/integration/aurora.test.ts",
+    "test:aurora:live": "bun test test/integration/aurora.test.ts test/integration/aurora-parity.test.ts",
     "test:query": "bun test test/integration/query",
     "test:query:interp": "MINIPG_VARIANT=interpreted bun run test:query",
     "test:query:both": "bun run test:query && bun run test:query:interp",
