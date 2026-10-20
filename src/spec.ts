@@ -15,7 +15,7 @@ const TYPE_OID = {
   numeric: 1700, decimal: 1700, money: 790, bool: 16, boolean: 16,
   text: 25, varchar: 1043, bpchar: 1042, char: 18, name: 19,
   json: 114, jsonb: 3802, bytea: 17, uuid: 2950,
-  date: 1082, time: 1083, timestamp: 1114, timestamptz: 1184, interval: 1186, point: 600, line: 628,
+  date: 1082, time: 1083, timestamp: 1114, timestamptz: 1184, interval: 1186, point: 600, line: 628, box: 603,
 } satisfies Record<string, number>
 
 /** A known PG type alias (e.g. 'int4', 'bigint', 'timestamptz'). */
@@ -25,7 +25,7 @@ export type PgType = keyof typeof TYPE_OID
 export const ARRAY_OID: Record<number, number> = {
   16: 1000, 21: 1005, 23: 1007, 26: 1028, 20: 1016, 700: 1021, 701: 1022, 1700: 1231, 790: 791,
   25: 1009, 1043: 1015, 1042: 1014, 18: 1002, 19: 1003, 114: 199, 3802: 3807, 17: 1001, 2950: 2951,
-  1082: 1182, 1083: 1183, 1114: 1115, 1184: 1185, 1186: 1187, 628: 629, 600: 1017,
+  1082: 1182, 1083: 1183, 1114: 1115, 1184: 1185, 1186: 1187, 628: 629, 600: 1017, 603: 1020,
 }
 
 /** A declared param type: a PG alias, its array form, or a raw OID. */
