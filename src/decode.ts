@@ -189,10 +189,10 @@ export function parseArrayLiteral(decodeLeaf: Leaf, delim = ','): (text: string)
  *  array OID is per-database — the shape's declared element drives the decode). */
 export function arrayDecoderForElem(elem: number | undefined, js?: string): Decoder {
   // Resolved here, not at the call sites, so every array path (shape/helper/interpreted) agrees.
-  // Built-in box (603) is the only other non-',' type in PG — give it ';' if it ever joins TYPE_OID.
+  // Built-in box (603) is the only non-',' type in PG: box_out writes commas, so its arrays use ';'.
   const parse = elem === undefined
     ? parseArrayLiteral(strLeaf)
-    : parseArrayLiteral(elemLeafFor(elem, js), customDelimFor(elem) ?? ',')
+    : parseArrayLiteral(elemLeafFor(elem, js), elem === 603 ? ';' : customDelimFor(elem) ?? ',')
   return (b) => parse(b.toString('utf8'))
 }
 /** Same, keyed by a STATIC array OID (built-in types). */

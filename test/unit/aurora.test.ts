@@ -323,6 +323,16 @@ describe('aurora: arrayValue results decode (report #1)', () => {
     const r = await (await connect(CFG(fetchImpl))).query('select …', [], { mode: 'object' })
     expect(r.rows[0]).toEqual({ ip: '{192.168.1.1,10.0.0.0/8}', mood: '{happy,"so so"}', bx: '{(1,1),(0,0);(3,3),(2,2)}' }) // box[] delimits with ';'
   })
+
+  test("a box[] shape splits on ';', never inside a box (1-D and multi-dimensional)", async () => {
+    const { fetchImpl } = rs(
+      [{ name: 'a', typeName: '_box' }, { name: 'm', typeName: '_box' }, { name: 's', typeName: 'box' }],
+      [[{ arrayValue: { stringValues: ['(3,4),(1,2)', '(7,8),(5,6)'] } },
+        { arrayValue: { arrayValues: [{ stringValues: ['(1,1),(0,0)'] }, { stringValues: ['(2,2),(0,0)'] }] } }, { stringValue: '(3,4),(1,2)' }]],
+    )
+    const r = await (await connect(CFG(fetchImpl))).query('select …', [], { shape: { a: 'box[]', m: 'box[]', s: 'box' } })
+    expect(r.rows[0]).toEqual({ a: ['(3,4),(1,2)', '(7,8),(5,6)'], m: [['(1,1),(0,0)'], ['(2,2),(0,0)']], s: '(3,4),(1,2)' })
+  })
 })
 
 describe('aurora: int8 past 2^53 stays exact when the Data API sends a bare JSON number (report #2)', () => {
