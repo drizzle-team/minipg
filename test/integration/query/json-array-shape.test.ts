@@ -18,6 +18,22 @@ describe('scalar arrays inside Json()/Jsonb() shapes', () => {
     } finally { await c.end() }
   }, TEST_TIMEOUT)
 
+  // json[]/jsonb[] COLUMNS (arrays of json values, not a json array): their elements used to be plain
+  // JSON.parse whatever jsonBigints said, so a nested big integer rounded.
+  test('jsonb[] / json[] elements honor jsonBigints, with and without a shape (BOTH engines)', async () => {
+    const sql = `select array['{"x": ${BIG}}', '{"y": [1, -${BIG}]}', null]::jsonb[] as jb, array['{"x": ${BIG}}']::json[] as j`
+    const c = await testConnect({ jsonBigints: 'bigint' })
+    try {
+      const want = { jb: [{ x: BIG }, { y: [1, -BIG] }, null], j: [{ x: BIG }] }
+      expect((await c.query(sql, [], { mode: 'object' })).rows[0]).toEqual(want)
+      expect((await c.query(sql, [], { shape: { jb: 'jsonb[]', j: 'json[]' } })).rows[0]).toEqual(want)
+    } finally { await c.end() }
+    const s = await testConnect({ jsonBigints: 'string' })
+    try {
+      expect((await s.query(sql, [], { mode: 'object' })).rows[0]).toMatchObject({ jb: [{ x: String(BIG) }, { y: [1, '-' + BIG] }, null] })
+    } finally { await s.end() }
+  }, TEST_TIMEOUT)
+
   test.skipIf(VARIANT === 'interpreted')('bigint[] exact under DEFAULT config (jit scanner)', async () => {
     await withConn(async (c) => {
       const r = await c.query(`select row_to_json(x) as row from (select array[${BIG}, 2, 3]::int8[] as ids) x`,
