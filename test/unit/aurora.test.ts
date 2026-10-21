@@ -43,14 +43,15 @@ describe('bind() -> Data API parameters', () => {
 })
 
 // A mock fetch that records the last request and returns a scripted Data API response.
-function mockFetch(script: (op: string, body: any) => { status?: number; headers?: Record<string, string>; json: unknown }) {
+// `raw` sends the body verbatim — JSON.stringify can't produce a number past 2^53 exactly, the Data API can.
+function mockFetch(script: (op: string, body: any) => { status?: number; headers?: Record<string, string>; json?: unknown; raw?: string }) {
   const calls: Array<{ op: string; body: any; headers: Record<string, string> }> = []
   const fetchImpl = (async (url: string, init: RequestInit) => {
     const op = url.split('/').pop()!
     const body = JSON.parse(init.body as string)
     calls.push({ op, body, headers: init.headers as Record<string, string> })
     const s = script(op, body)
-    return new Response(JSON.stringify(s.json), { status: s.status ?? 200, headers: s.headers })
+    return new Response(s.raw ?? JSON.stringify(s.json), { status: s.status ?? 200, headers: s.headers })
   }) as unknown as typeof fetch
   return { fetchImpl, calls }
 }
@@ -280,5 +281,120 @@ describe('aurora: array columns decode like every other entry', () => {
     const db = await connect({ ...CFG(fetchImpl), temporal: 'string' })
     const r = await db.query('select …', [], { mode: 'object' }) as { rows: Record<string, unknown>[] }
     expect(r.rows[0]!.stamps).toEqual(['2024-01-15 10:30:45+00'])
+  })
+})
+
+// Regression tests for minipg-aurora-report.md. Wire payloads are the ones koxudaxi/local-data-api sends.
+describe('aurora: arrayValue results decode (report #1)', () => {
+  test('1-D, multi-dimensional, empty, and every element list type', async () => {
+    const { fetchImpl } = rs(
+      [{ name: 't', typeName: '_text' }, { name: 'i', typeName: '_int4' }, { name: 'm', typeName: '_int4' }, { name: 'z', typeName: '_int4' },
+        { name: 'b', typeName: '_bool' }, { name: 'f', typeName: '_float8' }, { name: 'n', typeName: '_numeric' }, { name: 'j', typeName: '_jsonb' }, { name: 'tm', typeName: '_text' }],
+      [[
+        { arrayValue: { stringValues: ['a', 'b'] } }, { arrayValue: { longValues: [1, 2] } },
+        { arrayValue: { arrayValues: [{ longValues: [1, 2] }, { longValues: [3, 4] }] } }, { arrayValue: { arrayValues: [] } },
+        { arrayValue: { booleanValues: [true, false] } }, { arrayValue: { doubleValues: [1.5, 0.1] } }, { arrayValue: { stringValues: ['1.50'] } },
+        { arrayValue: { stringValues: ['{"a": 1}'] } }, { arrayValue: { arrayValues: [{ stringValues: ['a'] }, { stringValues: ['b'] }] } },
+      ]],
+    )
+    const r = await (await connect(CFG(fetchImpl))).query('select …', [], { mode: 'object' })
+    expect(r.rows[0]).toEqual({ t: ['a', 'b'], i: [1, 2], m: [[1, 2], [3, 4]], z: [], b: [true, false], f: [1.5, 0.1], n: ['1.50'], j: [{ a: 1 }], tm: [['a'], ['b']] })
+  })
+
+  test('string elements are quoted: quotes, backslashes, commas, braces, whitespace and the text NULL survive', async () => {
+    const tricky = ['x"y', 'back\\slash', 'a,b', '{c}', ' sp ', 'NULL', '']
+    const { fetchImpl } = rs([{ name: 't', typeName: '_text' }], [[{ arrayValue: { stringValues: tricky } }]])
+    const r = await (await connect(CFG(fetchImpl))).query('select …', [], { mode: 'object' })
+    expect(r.rows[0]).toEqual({ t: tricky })
+  })
+
+  test("mode:'buffer' gets the PG array literal, quoted only where array_out would", async () => {
+    const { fetchImpl } = rs([{ name: 't', typeName: '_text' }], [[{ arrayValue: { stringValues: ['a', 'b"', 'null', 'c d', 'caf\u00e9\u00a0'] } }]])
+    const r = await (await connect(CFG(fetchImpl))).query('select …', [], { mode: 'buffer' })
+    expect(r.rows[0]![0]!.toString()).toBe('{a,"b\\"","null","c d",caf\u00e9\u00a0}') // NBSP isn't array_out whitespace
+  })
+
+  test('arrays with no element decoder come back as the same raw literal the wire driver returns', async () => {
+    const { fetchImpl } = rs(
+      [{ name: 'ip', typeName: '_inet' }, { name: 'mood', typeName: '_mood_enum' }, { name: 'bx', typeName: '_box' }],
+      [[{ arrayValue: { stringValues: ['192.168.1.1', '10.0.0.0/8'] } }, { arrayValue: { stringValues: ['happy', 'so so'] } },
+        { arrayValue: { stringValues: ['(1,1),(0,0)', '(3,3),(2,2)'] } }]],
+    )
+    const r = await (await connect(CFG(fetchImpl))).query('select …', [], { mode: 'object' })
+    expect(r.rows[0]).toEqual({ ip: '{192.168.1.1,10.0.0.0/8}', mood: '{happy,"so so"}', bx: '{(1,1),(0,0);(3,3),(2,2)}' }) // box[] delimits with ';'
+  })
+
+  test("a box[] shape splits on ';', never inside a box (1-D and multi-dimensional)", async () => {
+    const { fetchImpl } = rs(
+      [{ name: 'a', typeName: '_box' }, { name: 'm', typeName: '_box' }, { name: 's', typeName: 'box' }],
+      [[{ arrayValue: { stringValues: ['(3,4),(1,2)', '(7,8),(5,6)'] } },
+        { arrayValue: { arrayValues: [{ stringValues: ['(1,1),(0,0)'] }, { stringValues: ['(2,2),(0,0)'] }] } }, { stringValue: '(3,4),(1,2)' }]],
+    )
+    const r = await (await connect(CFG(fetchImpl))).query('select …', [], { shape: { a: 'box[]', m: 'box[]', s: 'box' } })
+    expect(r.rows[0]).toEqual({ a: ['(3,4),(1,2)', '(7,8),(5,6)'], m: [['(1,1),(0,0)'], ['(2,2),(0,0)']], s: '(3,4),(1,2)' })
+  })
+})
+
+describe('aurora: int8 past 2^53 stays exact when the Data API sends a bare JSON number (report #2)', () => {
+  test('longValue and longValues keep their digits; a lookalike inside a string is untouched', async () => {
+    const raw = '{"records":[[{"longValue":1000000000000000001},{"longValue": -9007199254740993},{"longValue":42},'
+      + '{"arrayValue":{"longValues":[9007199254740993,1,-1000000000000000001]}},{"stringValue":"\\"longValue\\":12345678901234567890"}]],'
+      + '"columnMetadata":[{"name":"a","typeName":"int8"},{"name":"b","typeName":"int8"},{"name":"c","typeName":"int4"},{"name":"d","typeName":"_int8"},{"name":"e","typeName":"text"}]}'
+    const { fetchImpl } = mockFetch(() => ({ raw }))
+    const r = await (await connect(CFG(fetchImpl))).query('select …', [], { mode: 'object' })
+    expect(r.rows[0]).toEqual({ a: 1000000000000000001n, b: -9007199254740993n, c: 42, d: [9007199254740993n, 1n, -1000000000000000001n], e: '"longValue":12345678901234567890' })
+  })
+})
+
+describe('aurora: JS array params are sent as PG array literals (report #3)', () => {
+  test('raw arrays -> untyped stringValue literal, never JSON', () => {
+    const p = toParameters([['abc', 'def'], [1, 2], [['a"b', null], ['c,d', 'e']], [], { k: [1] }])
+    expect(p[0]).toEqual({ name: 'p1', value: { stringValue: '{"abc","def"}' } })
+    expect(p[1]).toEqual({ name: 'p2', value: { stringValue: '{1,2}' } })
+    expect(p[2]).toEqual({ name: 'p3', value: { stringValue: '{{"a\\"b",NULL},{"c,d","e"}}' } })
+    expect(p[3]).toEqual({ name: 'p4', value: { stringValue: '{}' } })
+    expect(p[4]).toEqual({ name: 'p5', typeHint: 'JSON', value: { stringValue: '{"k":[1]}' } }) // plain objects stay JSON
+  })
+})
+
+describe('aurora: serial/identity columns decode as their integer type (report #4)', () => {
+  test("JDBC 'serial' / 'bigserial' / 'smallserial' typeNames", async () => {
+    const { fetchImpl } = rs(
+      [{ name: 'id', typeName: 'serial' }, { name: 'big', typeName: 'bigserial' }, { name: 'small', typeName: 'smallserial' }],
+      [[{ longValue: 1 }, { longValue: 1 }, { longValue: 1 }]],
+    )
+    const r = await (await connect(CFG(fetchImpl))).query('select …', [], { mode: 'object' })
+    expect(r.rows[0]).toEqual({ id: 1, big: 1n, small: 1 })
+  })
+})
+
+describe('aurora: timestamptz/timetz get their UTC offset back (report #5)', () => {
+  const cols = [{ name: 'tstz', typeName: 'timestamptz' }, { name: 'ttz', typeName: 'timetz' }, { name: 'ts', typeName: 'timestamp' },
+    { name: 'arr', typeName: '_timestamptz' }, { name: 'off', typeName: 'timestamptz' }, { name: 'inf', typeName: 'timestamptz' }, { name: 'bc', typeName: 'timestamptz' }]
+  const recs = [[
+    { stringValue: '2022-01-01 02:00:00.123456' }, { stringValue: '08:00:00' }, { stringValue: '2022-01-01 00:00:00' },
+    { arrayValue: { stringValues: ['2022-01-01 02:00:00.5'] } }, { stringValue: '2022-01-01 02:00:00+05:30' }, { stringValue: 'infinity' }, { stringValue: '0001-01-01 00:00:00 BC' },
+  ]]
+
+  test("temporal:'string' matches the other entries' output", async () => {
+    const db = await connect({ ...CFG(rs(cols, recs).fetchImpl), temporal: 'string' })
+    expect((await db.query('select …', [], { mode: 'object' })).rows[0]).toEqual({
+      tstz: '2022-01-01 02:00:00.123456+00', ttz: '08:00:00+00', ts: '2022-01-01 00:00:00', // plain timestamp untouched
+      arr: ['2022-01-01 02:00:00.5+00'], off: '2022-01-01 02:00:00+05:30', inf: 'infinity', bc: '0001-01-01 00:00:00+00 BC',
+    })
+  })
+
+  test("temporal:'date' still reads the instant as UTC", async () => {
+    const r = await (await connect(CFG(rs(cols.slice(0, 1), [recs[0]!.slice(0, 1)]).fetchImpl))).query('select …', [], { mode: 'object' })
+    expect((r.rows[0] as { tstz: Date }).tstz.toISOString()).toBe('2022-01-01T02:00:00.123Z')
+  })
+})
+
+describe('aurora: error body edge cases', () => {
+  test('a JSON null error body still surfaces as a minipg error, not a TypeError', async () => {
+    const { fetchImpl } = mockFetch(() => ({ status: 500, raw: 'null' }))
+    const err = await (await connect(CFG(fetchImpl))).query('select 1').catch((e) => e) as Error
+    expect(err).not.toBeInstanceOf(TypeError)
+    expect(err.message).toContain('HTTP 500')
   })
 })

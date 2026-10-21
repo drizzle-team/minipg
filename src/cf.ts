@@ -1,9 +1,11 @@
 // minipg for Cloudflare Workers — `import { connect, createPool } from 'minipg/cf'`.
+// Also what the ROOT entry resolves to under the `workerd` export condition (package.json), so it
+// exposes the whole public API: its own connect/createPool plus everything in ./api.ts.
 // Uses Cloudflare's raw-TCP `connect()` from 'cloudflare:sockets'. Requires the `nodejs_compat`
 // compatibility flag (for Buffer, node:crypto, node:stream). TLS uses Postgres' STARTTLS dance:
 // plaintext SSLRequest -> 'S' -> startTls() (Postgres has no implicit TLS; see negotiateSslRequest).
 import { connect as cfConnect } from 'cloudflare:sockets'
-import { connect as coreConnect, createPool as corePool, Connection, Pool, PgError, defaultDecoders } from './core.ts'
+import { connect as coreConnect, createPool as corePool, type Connection, type Pool } from './core.ts'
 import type { ConnectConfig, PoolConfig } from './types.ts'
 import { refuseChannelBinding, resolveUrl } from './url.ts'
 import { duplexFromWeb, negotiateSslRequest } from './webstream.ts'
@@ -37,5 +39,4 @@ function cfSocket(config: ConnectConfig) {
 const NO_BINDING = 'the cloudflare:sockets Socket in workerd exposes no certificate API (only close/closed/opened/readable/startTls/writable)'
 export async function connect(config: string | ConnectConfig = {}): Promise<Connection> { const c = typeof config === 'string' ? { url: config } : config; return coreConnect({ ...refuseChannelBinding(c, 'cf', NO_BINDING), socket: cfSocket(c) }) }
 export function createPool(config: string | PoolConfig = {}): Pool { const c = typeof config === 'string' ? { url: config } : config; return corePool({ ...refuseChannelBinding(c, 'cf', NO_BINDING), socket: cfSocket(c) }) }
-export { Connection, Pool, PgError, defaultDecoders }
-export type { ConnectConfig, PoolConfig }
+export * from './api.ts' // the rest of the public API (everything but connect/createPool)

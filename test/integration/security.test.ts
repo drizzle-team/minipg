@@ -445,10 +445,10 @@ describe('identifier / literal escaping helpers', () => {
 // Out-of-scope security guards (assert absent / fails cleanly).
 // ---------------------------------------------------------------------------
 describe('out-of-scope security guards', () => {
-  test('GUARD: a DSN passed as host is treated as a literal host (no parser), error leaks no password', async () => {
+  test('GUARD: a DSN passed as host is rejected without parsing it, and the error leaks no password', async () => {
     const dsn = 'postgresql://u:DSN_SECRET_PW@db.invalid:5432/x'
     const err = await caught(() => testConnect({ host: dsn, connectTimeout: 2000 }))
-    expect(err).toBeInstanceOf(Error) // lookup failure on the literal host, never parsed for password=
+    expect(err).toBeInstanceOf(Error)
     expect((err as Error).message).not.toContain('DSN_SECRET_PW')
   })
 

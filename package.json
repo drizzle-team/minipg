@@ -1,6 +1,6 @@
 {
   "name": "@drizzle-team/minipg",
-  "version": "0.4.1",
+  "version": "0.4.2",
   "description": "A minimal, dependency-free PostgreSQL driver for Node, Bun, Deno, and Cloudflare Workers.",
   "type": "module",
   "license": "MIT",
@@ -34,66 +34,69 @@
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
-      "import": "./dist/index.js"
+      "workerd": "./dist/cf.js",
+      "deno": "./dist/index.js",
+      "bun": "./dist/index.js",
+      "node": "./dist/index.js"
     },
     "./core": {
       "types": "./dist/core.d.ts",
-      "import": "./dist/core.js"
+      "default": "./dist/core.js"
     },
     "./node": {
       "types": "./dist/node.d.ts",
-      "import": "./dist/node.js"
+      "default": "./dist/node.js"
     },
     "./deno": {
       "types": "./dist/deno.d.ts",
-      "import": "./dist/deno.js"
+      "default": "./dist/deno.js"
     },
     "./cf": {
       "types": "./dist/cf.d.ts",
-      "import": "./dist/cf.js"
+      "default": "./dist/cf.js"
     },
     "./replication": {
       "types": "./dist/replication.d.ts",
-      "import": "./dist/replication.js"
+      "default": "./dist/replication.js"
     },
     "./cdc": {
       "types": "./dist/cdc.d.ts",
-      "import": "./dist/cdc.js"
+      "default": "./dist/cdc.js"
     },
     "./neon-ws": {
       "types": "./dist/neon-ws.d.ts",
-      "import": "./dist/neon-ws.js"
+      "default": "./dist/neon-ws.js"
     },
     "./neon-http": {
       "types": "./dist/neon-http.d.ts",
-      "import": "./dist/neon-http.js"
+      "default": "./dist/neon-http.js"
     },
     "./http": {
       "types": "./dist/http.d.ts",
-      "import": "./dist/http.js"
+      "default": "./dist/http.js"
     },
     "./geometry": {
       "types": "./dist/geometry.d.ts",
-      "import": "./dist/geometry.js"
+      "default": "./dist/geometry.js"
     },
     "./aurora": {
       "types": "./dist/aurora.d.ts",
-      "import": "./dist/aurora.js"
+      "default": "./dist/aurora.js"
     },
     "./telemetry": {
       "types": "./dist/telemetry.d.ts",
-      "import": "./dist/telemetry.js"
+      "default": "./dist/telemetry.js"
     },
     "./buffer-polyfill": {
       "types": "./dist/buffer-polyfill.d.ts",
-      "import": "./dist/buffer-polyfill.js"
+      "default": "./dist/buffer-polyfill.js"
     }
   },
   "files": [
     "dist"
   ],
   "engines": {
-    "node": ">=18"
+    "node": ">=22.12"
   },
   "scripts": {
     "build": "bun node_modules/.bin/tsdown",
@@ -108,7 +111,7 @@
     "test:neon-ws": "bun test test/integration/neon-ws.test.ts",
     "test:neon-http": "bun test test/integration/neon-http.test.ts test/integration/neon-http-parity.test.ts",
     "test:aurora": "bun test test/unit/aurora.test.ts",
-    "test:aurora:live": "bun test test/integration/aurora.test.ts",
+    "test:aurora:live": "bun test test/integration/aurora.test.ts test/integration/aurora-parity.test.ts",
     "test:query": "bun test test/integration/query",
     "test:query:interp": "MINIPG_VARIANT=interpreted bun run test:query",
     "test:query:both": "bun run test:query && bun run test:query:interp",

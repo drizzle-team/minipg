@@ -87,6 +87,37 @@ d('minipg/aurora over the RDS Data API', () => {
     expect(err).toBeInstanceOf(PgError)
   })
 
+  test('array columns decode (arrayValue), incl. multi-dimensional', async () => {
+    const r = await db.query(`select array['a','b"c']::text[] as t, array[1,2]::int4[] as i, array[[1,2],[3,4]]::int4[] as m, array[true,false] as b, '{}'::int4[] as z`, [], { mode: 'object' })
+    expect(r.rows[0]).toEqual({ t: ['a', 'b"c'], i: [1, 2], m: [[1, 2], [3, 4]], b: [true, false], z: [] })
+  })
+
+  test('int8 past 2^53 is exact, scalar and array', async () => {
+    const r = await db.query('select 1000000000000000001::int8 as big, array[9007199254740993]::int8[] as arr', [], { mode: 'object' })
+    expect(r.rows[0]).toEqual({ big: 1000000000000000001n, arr: [9007199254740993n] })
+  })
+
+  test('JS array params bind as PG array literals', async () => {
+    const r = await db.query(`select array['abc','def'] @> :p1 as c, array[1,2] && :p2 as o, :p3::text[] as echo`, [['abc', 'def'], [2, 3], ['x,y', 'z"']], { mode: 'object' })
+    expect(r.rows[0]).toEqual({ c: true, o: true, echo: ['x,y', 'z"'] })
+  })
+
+  test('serial / identity columns decode as their integer types', async () => {
+    const T = `${TBL}_serial`
+    await db.query(`drop table if exists ${T}`)
+    await db.query(`create table ${T} (id serial, big bigserial, small smallserial, ident int generated always as identity)`)
+    try {
+      await db.query(`insert into ${T} default values`)
+      expect((await db.query(`select * from ${T}`, [], { mode: 'object' })).rows[0]).toEqual({ id: 1, big: 1n, small: 1, ident: 1 })
+    } finally { await db.query(`drop table if exists ${T}`) }
+  })
+
+  test("temporal:'string' timestamptz/timetz carry the UTC offset", async () => {
+    const s = await connect({ ...cfg(), temporal: 'string' })
+    const r = await s.query(`select '2022-01-01 00:00:00.123456-02'::timestamptz as tstz, array['2022-01-01 00:00:00-02']::timestamptz[] as arr, '10:00:00+02'::timetz as ttz`, [], { mode: 'object' })
+    expect(r.rows[0]).toEqual({ tstz: '2022-01-01 02:00:00.123456+00', arr: ['2022-01-01 02:00:00+00'], ttz: '08:00:00+00' })
+  })
+
   test('batch insert (BatchExecuteStatement)', async () => {
     await db.batch(`insert into ${TBL} (id, name) values (:id, :nm)`, [
       [bind.bigint(10n, 'id'), bind.text('x', 'nm')],

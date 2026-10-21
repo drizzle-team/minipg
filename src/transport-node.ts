@@ -33,7 +33,7 @@ export function nodeTransport(cfg: NormalizedConfig, signal: AbortSignal): Promi
   // Bundlers can smuggle this module onto workerd via unenv stubs of node:net/node:tls that fail in
   // confusing ways at connect time — replace that with the answer the user actually needs.
   if (typeof navigator !== 'undefined' && navigator.userAgent === 'Cloudflare-Workers') {
-    return Promise.reject(Object.assign(new Error("minipg: the node TCP transport cannot run on Cloudflare Workers — import from 'minipg/cf' (cloudflare:sockets) instead of the root entry"), { fatal: true }))
+    return Promise.reject(Object.assign(new Error("minipg: the node TCP transport cannot run on Cloudflare Workers — import from 'minipg/cf' (cloudflare:sockets); the root entry only routes there when the bundler applies the `workerd` export condition", { fatal: true }))
   }
   return new Promise<Duplex>((resolve, reject) => {
     const sock = cfg.path ? net.connect({ path: cfg.path }) : net.connect({ host: cfg.host, port: cfg.port })
@@ -49,9 +49,16 @@ export function nodeTransport(cfg: NormalizedConfig, signal: AbortSignal): Promi
           // Bound to a `const` so the handshake callback and the error listener both see a
           // definitely-assigned socket (the outer `let` is only there for the abort listener to
           // destroy, and TS cannot prove a closure-assigned `let` is set).
-          const secure = tls.connect({ socket: sock, ...tlsOptions(cfg.ssl as TlsSsl, cfg.host) }, () => resolve(secure))
-          tlsSock = secure
-          secure.once('error', reject)
+          try {
+            const secure = tls.connect({ socket: sock, ...tlsOptions(cfg.ssl as TlsSsl, cfg.host) }, () => resolve(secure))
+            tlsSock = secure
+            secure.once('error', reject)
+          } catch (e) {
+            // tls.connect throws synchronously on a malformed ca/cert/key PEM. Uncaught here, inside a
+            // socket event handler, the throw would crash the process and leave the connect hanging.
+            sock.destroy()
+            reject(Object.assign(e as Error, { fatal: true }))
+          }
         } else if (res === 'N') {
           reject(Object.assign(new Error('server does not support TLS'), { fatal: true })) // fail closed (no downgrade)
         } else reject(Object.assign(new Error('unexpected SSL response byte: ' + res), { fatal: true }))

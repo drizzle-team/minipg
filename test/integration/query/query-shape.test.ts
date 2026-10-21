@@ -64,6 +64,23 @@ describe('query({ shape }) — declared shape decode', () => {
     // @ts-expect-error - not a known PG type alias
     await expect(c.query('select 1', [], { shape: { x: 'notatype' } })).rejects.toThrow(/unknown type "notatype".*in shape/)
   })
+
+  // box is PG's one built-in type whose arrays delimit with ';' (box_out itself writes commas). Declared as
+  // text[] it used to split inside every box: ["(3","4)","(1","2);(7",…].
+  test('box / box[]: arrays split on box\'s own ";" delimiter', async () => {
+    const c = await conn()
+    const sql = `select '(1,2),(3,4)'::box s, array['(1,2),(3,4)'::box, '(5,6),(7,8)'::box] a,
+                        '{{"(1,1),(0,0)"};{"(2,2),(0,0)"}}'::box[] m, '{}'::box[] z, '{"(1,1),(0,0)";NULL}'::box[] n, null::box[] nul`
+    const r = await c.query(sql, [], { shape: { s: 'box', a: 'box[]', m: 'box[]', z: 'box[]', n: 'box[]', nul: 'box[]' } })
+    expect(r.rows[0]).toEqual({
+      s: '(3,4),(1,2)', a: ['(3,4),(1,2)', '(7,8),(5,6)'], m: [['(1,1),(0,0)'], ['(2,2),(0,0)']], z: [], n: ['(1,1),(0,0)', null], nul: null,
+    })
+    // without a shape box[] stays the raw literal, like every array type with no element decoder
+    expect((await c.query(sql, [], { mode: 'object' })).rows[0]).toMatchObject({ a: '{(3,4),(1,2);(7,8),(5,6)}' })
+    // a declared box[] param pins the type; the value is a ';' literal (a JS array is encoded with ',')
+    const p = await c.query('select $1 as v', ['{(3,4),(1,2);(7,8),(5,6)}'], { params: ['box[]'], shape: { v: 'box[]' }, mode: 'object' })
+    expect(p.rows[0]).toEqual({ v: ['(3,4),(1,2)', '(7,8),(5,6)'] })
+  })
 })
 
 describe('temporal targets — :ms / :date', () => {

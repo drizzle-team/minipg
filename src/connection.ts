@@ -356,6 +356,8 @@ export class Connection {
     }
     const user = config.user || process.env.PGUSER || defaultUser()
     const host = config.host || process.env.PGHOST || 'localhost'
+    // The DNS error would repeat the host, and with it any password inside. So the host is not echoed.
+    if (host.includes('@')) throw new Error('minipg: the host contains "@", so it looks like a connection URL or includes credentials. Pass a connection URL as `url`, and credentials as `user` and `password`.')
     const port = config.port || Number(process.env.PGPORT) || 5432
     const pooled = transactionPoolerDetected(host, port) // gates the `prepare` + `pipeline` auto-defaults
     this.cfg = {
