@@ -21,6 +21,17 @@ export interface MinipgSocket {
   destroy?(err?: Error): unknown
   setKeepAlive?(enable: boolean, initialDelayMs?: number): unknown
 }
+
+/** How a connection dials the server and cancels a running query. `connect` resolves to a connected,
+ *  TLS-negotiated socket. `cancel` sends an out-of-band CancelRequest and resolves once the server has
+ *  closed that connection; without `cancel`, a canceled query falls back to closing its socket. */
+export interface Transport {
+  connect(config: TransportTarget, signal: AbortSignal): Promise<MinipgSocket>
+  cancel?(config: TransportTarget, key: { pid: number; secret: number }): Promise<void>
+}
+/** The connection settings that a transport reads, after the URL and the defaults apply. */
+export type TransportTarget = Pick<NormalizedConfig, 'host' | 'port' | 'path' | 'ssl' | 'connectTimeout'>
+import type { NormalizedConfig } from './connection.ts'
 import type { Plugin, QueryMetrics } from './plugin.ts'
 import type { ShapeSpec, ParamType } from './spec.ts'
 import type { ShapeMapper } from './shape.ts'
@@ -158,6 +169,10 @@ export interface ConnectConfig {
    *  Default: auto — off when a pooler is detected (Neon `-pooler` host, Supabase `pooler.supabase.com`
    *  / port 6543, or the Vercel serverless runtime), on otherwise. Explicit value always wins. */
   prepare?: boolean
+  /** Declares whether the connection goes through a transaction-mode pooler, such as PgBouncer. It
+   *  replaces the detection from the host and port that `prepare` describes. Behind a pooler, `prepare`
+   *  and `pipeline` default to off, and a connection whose query was canceled is closed. */
+  pooler?: boolean
   /** Encode params in BINARY wire format for the fast types (int2/int4/int8, float8, bool,
    *  timestamp/timestamptz) when a named prepared statement is REUSED — the param OIDs are then
    *  known from the first round trip's ParameterDescription. A value whose JS type/range doesn't
@@ -186,6 +201,9 @@ export interface ConnectConfig {
    *  node's own TLSSocket already does, so `tls.connect({ socket })` works as-is.
    *  Without one of those, binding is impossible and `'require'` is refused at auth. */
   socket?: () => MinipgSocket | Promise<MinipgSocket>
+  /** Dials and cancels with this transport instead of the one that the Node entry registers for the
+   *  whole process. A `socket` still takes precedence for dialing. */
+  transport?: Transport
   /** Telemetry/observability plugins (e.g. otel()/sentry() from 'minipg/telemetry'). They subscribe
    *  to query + connection lifecycle hooks; enabling any plugin turns on per-query timing capture. */
   plugins?: Plugin[]

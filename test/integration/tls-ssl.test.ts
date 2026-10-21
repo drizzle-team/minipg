@@ -12,7 +12,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { execFileSync } from 'node:child_process'
-import { connect, Connection, PgError } from '../../src/index.ts'
+import { connect, createPool, Connection, PgError } from '../../src/index.ts'
 import { W } from '../../src/protocol.ts'
 import { testConnect, caught, SERVER_CA_PATH, TEST_CONFIG } from '../helpers/db.ts'
 
@@ -85,6 +85,14 @@ describe('SSLRequest packet framing', () => {
 
 // ── Live TLS handshake against the SSL-enabled cluster ──────────────────────
 describe('live TLS handshake + pg_stat_ssl', () => {
+  test('a pool fails fast when verification rejects the self-signed certificate', async () => {
+    const pool = createPool({ ...TEST_CONFIG, ssl: 'verify-full' })
+    const t0 = Date.now()
+    try { expect(await caught(() => pool.acquire())).toMatchObject({ code: 'DEPTH_ZERO_SELF_SIGNED_CERT' }) }
+    finally { await pool.end() }
+    expect(Date.now() - t0).toBeLessThan(3000)
+  })
+
   test('ssl: true completes the handshake and runs SELECT 1 (no `in` TypeError)', async () => {
     const c = await testConnect({ ssl: true })
     try {

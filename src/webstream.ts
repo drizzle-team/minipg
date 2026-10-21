@@ -22,6 +22,19 @@ export async function negotiateSslRequest(readable: unknown, writable: unknown):
   }
 }
 
+/** Sends a CancelRequest and waits until the server closes the connection, which it does only after it
+ *  has signaled the backend. */
+export async function sendCancelRequest(readable: unknown, writable: unknown, key: { pid: number; secret: number }): Promise<void> {
+  const reader = (readable as { getReader(): ByteReader }).getReader()
+  const writer = (writable as { getWriter(): ByteWriter }).getWriter()
+  try {
+    await writer.write(W.cancelRequest(key.pid, key.secret))
+    while (!(await reader.read()).done) { /* the server sends nothing back */ }
+  } finally {
+    reader.releaseLock(); writer.releaseLock()
+  }
+}
+
 // Bridge a runtime's WHATWG Web streams (Deno.Conn / Cloudflare Socket expose `.readable`/`.writable`)
 // into a Node Duplex the core connection uses as its transport. Chunks arrive as Uint8Array; the
 // connection's onData wraps them as Buffer views (no copy). Requires node:stream (present in Node/Bun,

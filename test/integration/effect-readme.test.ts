@@ -1,21 +1,20 @@
-// Runs every TypeScript example in the README's Effect section against the local cluster.
+// Runs every TypeScript example in src/effect/README.md against the local cluster.
 import { test, expect } from 'bun:test'
 import { mkdirSync, rmSync, writeFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 
 const root = fileURLToPath(new URL('../../', import.meta.url))
-const readme = await Bun.file(`${root}README.md`).text()
-const section = readme.slice(readme.indexOf('\n## Effect\n'))
-const examples = [...section.matchAll(/```ts\n([\s\S]*?)```/g)].map((m) => m[1]!)
+const readme = await Bun.file(`${root}src/effect/README.md`).text()
+const examples = [...readme.matchAll(/```ts\n([\s\S]*?)```/g)].map((m) => m[1]!)
 
 const tmp = `${root}test/.readme-examples`
 
-test('the README Effect section has examples', () => {
+test('the Effect README has examples', () => {
   expect(examples.length).toBeGreaterThanOrEqual(4)
 })
 
 for (const [i, code] of examples.entries()) {
-  test(`README Effect example ${i + 1} runs`, async () => {
+  test(`Effect README example ${i + 1} runs`, async () => {
     mkdirSync(tmp, { recursive: true })
     const file = `${tmp}/example-${i}.ts`
     writeFileSync(file, code

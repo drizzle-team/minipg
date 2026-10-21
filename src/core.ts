@@ -1,6 +1,7 @@
 // Runtime-agnostic core entry — connect/createPool + the public API, with NO node:net/tls transport
 // baked in (so it loads on workerd/Deno/edge). The node transport is added by ./index.ts (minipg/node);
-// other runtimes import THIS module and supply config.socket. connect() without a transport throws.
+// other runtimes import THIS module and supply config.transport or config.socket. connect() without
+// either throws.
 import { Connection } from './connection.ts'
 import { Pool } from './pool.ts'
 import type { ConnectConfig, PoolConfig } from './types.ts'

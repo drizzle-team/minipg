@@ -32,6 +32,7 @@ export interface QueryMetrics {
   rowCount: number | null
   columnCount: number
   command: string | null
+  prepared: boolean   // true if this reused a cached prepared statement (Parse skipped)
   error?: Error
 }
 
@@ -46,3 +47,16 @@ export interface Plugin {
   onReconnect?(info: { attempt: number; error: Error }): void
   onDisconnect?(info: { error?: Error | undefined }): void
 }
+
+/** The span attributes for a query's metrics, under the OTel database names where one exists. */
+export const metricAttributes = (m: QueryMetrics) => ({
+  'db.response.returned_rows': m.rowCount ?? 0,
+  'db.client.response.body.size': m.bytesReceived,
+  'minipg.bytes_sent': m.bytesSent,
+  'minipg.queue_wait_ms': m.queueWait,
+  'minipg.ttfb_ms': m.ttfb,
+  'minipg.download_ms': m.download,
+  'minipg.decode_ms': m.decode,
+  'minipg.total_ms': m.total,
+  'minipg.prepared': m.prepared,
+})

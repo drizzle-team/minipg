@@ -106,3 +106,19 @@ it('exposes the whole core API, with its own connect/createPool', async () => {
   expect(cf.createPool).not.toBe(core.createPool)
   expect(cf.Shape).toBe(core.Shape)
 })
+
+// Without a cancel request, the server keeps running pg_sleep(5), so the next query waits about 5 s for it.
+it('a timeout cancels the query on the server, and the same backend serves the next query', async () => {
+  const db = await connect(CFG)
+  try {
+    const pid = db.backendKey!.pid
+    const t0 = Date.now()
+    const err = await db.query('select pg_sleep(5)', [], { timeout: 200 }).then(() => null, (e: Error) => e)
+    expect((err as { code?: string } | null)?.code).toBe('QUERY_TIMEOUT')
+    const r = await db.query('select pg_backend_pid() as pid', [], { mode: 'object' })
+    expect(Date.now() - t0).toBeLessThan(3000)
+    expect((r.rows[0] as { pid: number }).pid).toBe(pid)
+  } finally {
+    await db.end()
+  }
+})

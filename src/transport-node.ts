@@ -1,12 +1,12 @@
 // The node:net/node:tls transport, kept OUT of the shared core so the core module graph never imports
 // them — runtimes that provide their own socket (Cloudflare via cloudflare:sockets, Deno, etc.) never
 // pull node:tls, which doesn't exist on workerd even with nodejs_compat. The Node entry (minipg/node)
-// registers this as the default transport via registerDefaultTransport(); other entries pass config.socket.
+// registers this as the default transport via registerDefaultTransport(); the cf and Deno entries register their own.
 import net from 'node:net'
 import tls from 'node:tls'
 import type { Duplex } from 'node:stream'
 import { W } from './protocol.ts'
-import type { NormalizedConfig } from './connection.ts'
+import type { TransportTarget } from './types.ts'
 
 type TlsSsl = true | 'require' | 'verify-ca' | 'verify-full' | tls.ConnectionOptions
 /** sslmode string (or tls.ConnectionOptions) → options for tls.connect (caller adds `socket`).
@@ -29,7 +29,7 @@ export function tlsOptions(ssl: TlsSsl, host: string): tls.ConnectionOptions {
 /** Open a TCP (or unix) socket, optionally negotiate PG SSLRequest → TLS, and resolve the byte duplex.
  *  On `signal` abort (connect deadline / failed attempt) it destroys the socket so a stalled handshake
  *  can't leak an open connection (the caller can't reach it — it isn't assigned until this resolves). */
-export function nodeTransport(cfg: NormalizedConfig, signal: AbortSignal): Promise<Duplex> {
+export function nodeTransport(cfg: TransportTarget, signal: AbortSignal): Promise<Duplex> {
   // Bundlers can smuggle this module onto workerd via unenv stubs of node:net/node:tls that fail in
   // confusing ways at connect time — replace that with the answer the user actually needs.
   if (typeof navigator !== 'undefined' && navigator.userAgent === 'Cloudflare-Workers') {
@@ -69,7 +69,7 @@ export function nodeTransport(cfg: NormalizedConfig, signal: AbortSignal): Promi
 
 /** Out-of-band CancelRequest on a fresh throwaway connection (mirrors SSL negotiation). Resolves when
  *  the server closes that connection, which it does only after it has signaled the backend. */
-export function nodeCancel(cfg: NormalizedConfig, key: { pid: number; secret: number }): Promise<void> {
+export function nodeCancel(cfg: TransportTarget, key: { pid: number; secret: number }): Promise<void> {
   return new Promise<void>((resolve, reject) => {
     const cancel = W.cancelRequest(key.pid, key.secret)
     const send = (s: net.Socket | tls.TLSSocket) => { try { s.write(cancel); s.end() } catch (e) { reject(e) } }
@@ -82,6 +82,7 @@ export function nodeCancel(cfg: NormalizedConfig, key: { pid: number; secret: nu
         } else send(plain) // server declined SSL; try plaintext cancel
       })
     })
+    plain.setTimeout(cfg.connectTimeout, () => plain.destroy(new Error('cancel request timed out')))
     plain.on('error', reject)
     plain.on('close', () => resolve()) // after an 'error', the promise is already rejected
   })

@@ -16,7 +16,7 @@ import { assertEquals, assertStringIncludes } from 'jsr:@std/assert@1'
 // only the edge entry ships src/buffer-polyfill.ts.)
 import { Buffer } from 'node:buffer'
 ;(globalThis as { Buffer?: unknown }).Buffer ??= Buffer
-import { connect, createPool } from '../../src/deno.ts'
+import { connect, createPool, replication } from '../../src/deno.ts'
 
 const HOST = Deno.env.get('PGTEST_HOST') ?? '127.0.0.1'
 const PORT = Number(Deno.env.get('PGTEST_PORT') ?? 54329)
@@ -144,4 +144,33 @@ Deno.test('prefer and disable still connect normally', async () => {
     try { assertEquals(((await db.query('select 1 as ok', [], { mode: 'object' })).rows[0] as { ok: number }).ok, 1) }
     finally { await db.end() }
   }
+})
+
+// Without a cancel request, the server keeps running pg_sleep(5), so the next query waits about 5 s for it.
+Deno.test('a timeout cancels the query on the server, and the same backend serves the next query', async () => {
+  const db = await connect(URL_)
+  try {
+    const pid = db.backendKey!.pid
+    const t0 = Date.now()
+    const err = await db.query('select pg_sleep(5)', [], { timeout: 200 }).then(() => null, (e: Error) => e)
+    assertEquals((err as { code?: string } | null)?.code, 'QUERY_TIMEOUT')
+    const r = await db.query('select pg_backend_pid() as pid', [], { mode: 'object' })
+    if (Date.now() - t0 >= 3000) throw new Error(`the next query waited ${Date.now() - t0} ms, so the cancel did not stop the sleep`)
+    assertEquals((r.rows[0] as { pid: number }).pid, pid)
+  } finally { await db.end() }
+})
+
+Deno.test('replication dials through the Deno transport', async () => {
+  const repl = await replication(URL_)
+  try { assertEquals((await repl.identify()).dbname, 'testdb') } finally { repl.end() }
+})
+
+Deno.test('a pool fails fast when Deno rejects the self-signed certificate', async () => {
+  const pool = createPool(`${URL_}?sslmode=verify-full`)
+  const t0 = Date.now()
+  try {
+    const err = await pool.acquire().then(() => null, (e: Error) => e)
+    assertStringIncludes(err?.message ?? '', 'invalid peer certificate')
+  } finally { await pool.end() }
+  assertEquals(Date.now() - t0 < 3000, true)
 })

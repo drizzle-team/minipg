@@ -9,6 +9,8 @@ afterEach(async () => { for (const c of open) await c.end().catch(() => {}); ope
 
 describe('prepare auto-detect (no connection)', () => {
   const P = (o: Record<string, unknown>) => new Connection(o).cfg.prepare
+  test('pooler: true → off on any host', () => { expect(P({ host: '127.0.0.1', port: 6432, pooler: true })).toBe(false) })
+  test('pooler: false → on, even on a detected pooler host', () => { expect(P({ host: 'ep-x-pooler.aws.neon.tech', pooler: false })).toBe(true) })
   test('Neon "-pooler" host → off', () => { expect(P({ host: 'ep-cool-name-pooler.us-east-2.aws.neon.tech' })).toBe(false) })
   test('Supabase pooler host / port 6543 → off', () => {
     expect(P({ host: 'aws-0-us-east-1.pooler.supabase.com', port: 6543 })).toBe(false)

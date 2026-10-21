@@ -247,14 +247,23 @@ describe('copyTo — COPY … TO STDOUT raw byte relay', () => {
     } finally { c.end() }
   }, TEST_TIMEOUT)
 
-  test('break detaches without buffering: frames drop, the copy finishes, the connection survives', async () => {
+  test('break cancels the copy, and the connection serves the next query', async () => {
     const c = await testConnect()
     try {
       const it = c.copyTo('copy (select g, repeat(md5(g::text), 10) from generate_series(1, 20000) g) to stdout')
       let first: Uint8Array | null = null
-      for await (const chunk of it) { first = chunk; break } // detach immediately
+      for await (const chunk of it) { first = chunk; break }
       expect(first).not.toBeNull()
-      expect((await c.query('select 42::int4 as x', [], { mode: 'object' })).rows[0]).toEqual({ x: 42 }) // queued behind the draining copy, then runs
+      expect((await c.query('select 42::int4 as x', [], { mode: 'object' })).rows[0]).toEqual({ x: 42 })
+    } finally { c.end() }
+  }, TEST_TIMEOUT)
+
+  test('inside a transaction, break leaves the transaction usable and COMMIT commits', async () => {
+    const c = await testConnect()
+    try {
+      await c.query('begin')
+      for await (const _ of c.copyTo('copy (select g from generate_series(1, 20000) g) to stdout')) break
+      expect((await c.query('commit')).command).toBe('COMMIT')
     } finally { c.end() }
   }, TEST_TIMEOUT)
 })

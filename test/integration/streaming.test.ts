@@ -1,7 +1,7 @@
 // Streaming & backpressure: conn.stream(...) across all result modes, real TCP
 // pause/resume backpressure, early-break/cancel/drain semantics, mid-stream error
 // propagation, empty/large results, interleaving, named statements, and guards
-// for the intentionally-absent cursor / Readable / cancel surfaces.
+// for the intentionally-absent Readable surface.
 //
 // Grounded in Connection.stream in src/connection.ts: a hand-rolled
 // AsyncIterableIterator (NOT a Node Readable, NO server-side cursor). Backpressure
@@ -568,7 +568,16 @@ describe('streaming :: out-of-scope / roadmap guards', () => {
   })
 
   // Roadmap / unimplemented — kept as todos (no binary/simple-query surface today).
-  test.todo('PENDING: per-stream timeout + AbortSignal to abort a stalled stream without socket teardown', () => {})
   test.todo('PENDING: binary RESULT-format streaming (Bind result format 1) once binary decoders land', () => {})
   test.todo('PENDING: simple-query-protocol streaming path', () => {})
+})
+
+describe('streaming :: early close inside a transaction', () => {
+  test('break leaves the transaction usable, and COMMIT commits', async () => {
+    await withConn(async (c) => {
+      await c.query('begin')
+      for await (const _ of c.stream('select g from generate_series(1, 100000) g')) break
+      expect((await c.query('commit')).command).toBe('COMMIT')
+    })
+  })
 })

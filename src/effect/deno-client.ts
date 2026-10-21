@@ -1,13 +1,8 @@
-// The MinipgClient namespace for Deno: its pools dial through Deno.connect.
-import { createPool } from '../deno.ts'
-import { makeRuntime } from './runtime.ts'
+// The MinipgClient namespace for Deno. Its make, layer and layerConfig already provide the
+// transport that dials with Deno.connect.
+import { provideTransport } from './provide-transport.ts'
+import { layer as transport } from './deno-transport.ts'
 
 export * from './MinipgClient.ts'
 
-const runtime = makeRuntime(createPool)
-/** Creates a client with its own pool. The pool opens now and ends when the scope closes. */
-export const make = runtime.make
-/** A layer with its own pool, opened when the layer is built and ended when its scope closes. */
-export const layer = runtime.layer
-/** Like `layer`, with the settings read from Effect Config. */
-export const layerConfig = runtime.layerConfig
+export const { make, layer, layerConfig } = provideTransport(transport)

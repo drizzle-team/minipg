@@ -2,6 +2,7 @@
 import { test, expect, describe } from 'bun:test'
 import { Effect, Exit, Tracer } from 'effect'
 import { SqlClient } from 'effect/sql/SqlClient'
+import { MinipgClient } from '../../src/effect/index.ts'
 import { runTest } from '../helpers/effect.ts'
 
 const TIMINGS = ['minipg.queue_wait_ms', 'minipg.ttfb_ms', 'minipg.download_ms', 'minipg.decode_ms', 'minipg.total_ms', 'minipg.bytes_sent', 'db.client.response.body.size', 'db.response.returned_rows']
@@ -21,6 +22,7 @@ describe('statement span metrics', () => {
     const [span] = await recordSpans('select generate_series(1, 3)', true)
     for (const key of TIMINGS) expect(typeof span!.attributes.get(key)).toBe('number')
     expect(span!.attributes.get('db.response.returned_rows')).toBe(3)
+    expect(typeof span!.attributes.get('minipg.prepared')).toBe('boolean')
   })
 
   test('with the option off, the span has only the base attributes', async () => {
@@ -34,5 +36,19 @@ describe('statement span metrics', () => {
     expect(span!.status._tag).toBe('Ended')
     const exit = (span!.status as { exit: Exit.Exit<unknown, unknown> }).exit
     expect(Exit.isFailure(exit)).toBe(true)
+  })
+})
+
+describe('minipg operation span metrics', () => {
+  test('with the option on, the client.query span carries the timing attributes', async () => {
+    const spans: Tracer.NativeSpan[] = []
+    const tracer = Tracer.make({ span(options) { const s = new Tracer.NativeSpan(options); spans.push(s); return s } })
+    await runTest(Effect.gen(function* () {
+      const client = yield* MinipgClient.MinipgClient
+      yield* client.query('select generate_series(1, 2)')
+    }).pipe(Effect.withTracer(tracer)), { metrics: true })
+    const span = spans.find((s) => s.attributes.get('db.operation.name') === 'query')
+    for (const key of TIMINGS) expect(typeof span!.attributes.get(key)).toBe('number')
+    expect(span!.attributes.get('db.response.returned_rows')).toBe(2)
   })
 })

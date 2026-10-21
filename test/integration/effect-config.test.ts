@@ -1,10 +1,11 @@
 // Building the Effect client from Effect Config, from an existing pool, and with name transforms and json.
 import { test, expect, describe, beforeAll, afterAll } from 'bun:test'
-import { Config, ConfigProvider, Effect, Layer, String as Str } from 'effect'
+import { Config, ConfigProvider, Effect, Exit, Layer, String as Str } from 'effect'
+import * as Reactivity from 'effect/reactivity/Reactivity'
 import { SqlClient } from 'effect/sql/SqlClient'
 import { MinipgClient } from '../../src/effect/index.ts'
 import { TEST_CONFIG, testPool } from '../helpers/db.ts'
-import { runTest } from '../helpers/effect.ts'
+import { runTest, testClientConfig } from '../helpers/effect.ts'
 
 const T = `effect_config_${process.pid}`
 beforeAll(async () => {
@@ -38,6 +39,16 @@ describe('MinipgClient.layerConfig', () => {
   })
 })
 
+describe('ssl', () => {
+  test('ssl: true verifies the certificate, so the layer refuses the self-signed test server', async () => {
+    const exit = await Effect.runPromise(Effect.exit(Effect.provide(
+      Effect.flatMap(Effect.service(SqlClient), (sql) => sql`select 1`),
+      MinipgClient.layer(testClientConfig({ ssl: true })),
+    )))
+    expect(Exit.isFailure(exit)).toBe(true)
+  })
+})
+
 describe('MinipgClient.layerFromPool', () => {
   test('shares the pool and leaves it open when the layer scope closes', async () => {
     const pool = testPool()
@@ -50,6 +61,20 @@ describe('MinipgClient.layerFromPool', () => {
       const after = await pool.query('select 3')
       expect((after.rows[0] as unknown as number[])[0]).toBe(3)
     } finally { await pool.end() }
+  })
+})
+
+describe('MinipgClient.fromPool', () => {
+  test('a pool acquired with acquireRelease ends when the client scope closes', async () => {
+    const pool = testPool()
+    const acquire = Effect.acquireRelease(Effect.succeed(pool), (p) => Effect.promise(() => p.end()))
+    const n = await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      const client = yield* MinipgClient.fromPool({ acquire })
+      const [row] = yield* client<{ n: number }>`select 4 as n`
+      return row!.n
+    })).pipe(Effect.provide(Reactivity.layer)))
+    expect(n).toBe(4)
+    expect(await pool.query('select 1').then(() => 'ran', (e: unknown) => (e as Error).message)).toBe('pool is closed')
   })
 })
 

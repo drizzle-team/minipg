@@ -79,4 +79,18 @@ describe('pipeline', () => {
     expect(result.pids).toEqual([result.txPid, result.txPid])
     expect(await ids()).toEqual([1])
   })
+
+  test('a transaction that fails inside a pipeline does not roll back the other statements', async () => {
+    const exit = await runTest(Effect.exit(Effect.gen(function* () {
+      const client = yield* MinipgClient.MinipgClient
+      const failingTransaction = client.withTransaction(Effect.gen(function* () {
+        yield* insert(2)
+        yield* Effect.sleep('100 millis')
+        return yield* Effect.fail('rollback')
+      }))
+      return yield* client.pipeline([failingTransaction, Effect.andThen(Effect.sleep('20 millis'), insert(1))])
+    })))
+    expect(Exit.isFailure(exit)).toBe(true)
+    expect(await ids()).toEqual([1])
+  })
 })

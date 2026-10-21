@@ -86,11 +86,12 @@ describe('otel() plugin (mock tracer)', () => {
     expect(t.spans.length).toBe(1)
     const s = t.spans[0]
     expect(s.name).toBe('pg.query')
-    expect(s.attrs['db.system']).toBe('postgresql')
+    expect(s.attrs['db.system.name']).toBe('postgresql')
     expect(s.attrs['db.namespace']).toBe('testdb')
     expect(s.attrs['db.operation.name']).toBe('SELECT')
     expect(s.attrs['db.response.returned_rows']).toBe(3)
     expect(s.attrs['minipg.decode_ms']).toBeGreaterThanOrEqual(0)
+    expect(typeof s.attrs['minipg.prepared']).toBe('boolean')
     expect(s.ended).toBe(true)
     expect(s.status).toBeUndefined()
   })

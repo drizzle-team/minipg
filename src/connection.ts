@@ -6,7 +6,7 @@ import { md5Password, scramForChannel, peerCertDer, type Scram } from './auth.ts
 import { encodeValueInto, compileParamPlan, compileBindEncoder, type BindEncoder, copyRowsBinary, copyRowsText, copyBinarySupported, isRawParams, type RawParams } from './encode.ts'
 import { buildDecoders, decoderFor } from './decode.ts'
 import { PgError, parseErrorFields } from './errors.ts'
-import type { ConnectConfig, Decoder, Field, MinipgSocket, QueryDebug, QueryOptions, QueryResult, ResultMode, StreamOptions, TxOptions } from './types.ts'
+import type { ConnectConfig, Decoder, Field, MinipgSocket, QueryDebug, QueryOptions, QueryResult, ResultMode, StreamOptions, Transport, TxOptions } from './types.ts'
 import { INSTANT_OIDS, BINARY_FAST, tagArrayCol, type CodegenCol } from './decode.ts'
 import { buildMapperFactory, isEvalAvailable, type RowMapper, type RowMapperFactory } from './mapper.ts'
 import { resolveUrl } from './url.ts'
@@ -21,7 +21,8 @@ import { Cursor, type CursorOptions } from './cursor.ts'
 type ConnState = 'idle' | 'connecting' | 'ready' | 'reconnecting' | 'closed'
 
 // The node:net/tls transport is registered here by the Node entry (minipg/node) so the core never
-// statically imports node:net/tls (which don't exist on workerd). Edge/Deno entries pass config.socket.
+// statically imports node:net/tls (which don't exist on workerd). A config.transport or config.socket
+// takes precedence over it: the cf and Deno entries and the Effect entry point dial that way.
 type TransportFactory = (cfg: NormalizedConfig, signal: AbortSignal) => Promise<Duplex>
 type CancelFn = (cfg: NormalizedConfig, key: { pid: number; secret: number }) => Promise<void>
 let defaultTransport: TransportFactory | null = null
@@ -29,7 +30,7 @@ let defaultCancel: CancelFn | null = null
 export function registerDefaultTransport(transport: TransportFactory, cancel: CancelFn): void {
   defaultTransport = transport; defaultCancel = cancel
 }
-/** The registered transport (node net/tls, or null on runtimes that pass config.socket) — used by replication(). */
+/** The transport that the runtime entry registered, or null under ./core. Replication dials with it. */
 export function getDefaultTransport(): TransportFactory | null { return defaultTransport }
 
 export interface NormalizedConfig {
@@ -46,6 +47,7 @@ export interface NormalizedConfig {
   temporal: 'date' | 'string' // default decode for date/timestamp(tz) columns without an explicit target
   reuseBinaryOids: Set<number> // BINARY_FAST minus config.types overrides: cols to upgrade to binary on prepared-statement reuse
   reconnect: { enabled: boolean; base: number; max: number; maxRetries: number | null }
+  transport?: Transport
   socket?: () => MinipgSocket | Promise<MinipgSocket> // structural (node Duplex satisfies it); internals treat it as Duplex, guarding optional methods
   path?: string
   plugins: Plugin[]
@@ -170,7 +172,24 @@ function transactionPoolerDetected(host: string, port: number): boolean {
 function isFatalAuth(err: unknown): boolean {
   const code = (err as { code?: string } | null)?.code
   if (code === '28P01' || code === '28000' || code === '3D000') return true
-  return !!(err as { fatal?: boolean } | null)?.fatal
+  return !!(err as { fatal?: boolean } | null)?.fatal || isUntrustedCertificate(err)
+}
+
+// Node and Bun codes for a certificate that only a config or certificate change can fix. An expired
+// or not-yet-valid certificate is left out, because a renewal or a clock fix clears it without a
+// client change.
+const UNTRUSTED_CERTIFICATE_CODES = new Set([
+  'DEPTH_ZERO_SELF_SIGNED_CERT', 'SELF_SIGNED_CERT_IN_CHAIN', 'UNABLE_TO_VERIFY_LEAF_SIGNATURE',
+  'UNABLE_TO_GET_ISSUER_CERT', 'UNABLE_TO_GET_ISSUER_CERT_LOCALLY', 'CERT_UNTRUSTED', 'CERT_REVOKED',
+  'ERR_TLS_CERT_ALTNAME_INVALID',
+])
+/** Whether TLS verification rejected the server certificate for a reason that a retry cannot fix. */
+export function isUntrustedCertificate(err: unknown): boolean {
+  const e = err as { code?: string; name?: string; message?: string } | null
+  if (e?.code !== undefined && UNTRUSTED_CERTIFICATE_CODES.has(e.code)) return true
+  // Deno reports rustls errors by message only, for example "invalid peer certificate: UnknownIssuer".
+  const message = e?.message ?? ''
+  return e?.name === 'InvalidData' && message.includes('invalid peer certificate') && !/Expired|NotValidYet/.test(message)
 }
 
 // head: the canceled query until it ends. isConfirmed: the server closed the cancel connection, so the
@@ -375,7 +394,7 @@ export class Connection {
     // The DNS error would repeat the host, and with it any password inside. So the host is not echoed.
     if (host.includes('@')) throw new Error('minipg: the host contains "@", so it looks like a connection URL or includes credentials. Pass a connection URL as `url`, and credentials as `user` and `password`.')
     const port = config.port || Number(process.env.PGPORT) || 5432
-    const pooled = transactionPoolerDetected(host, port) // gates the `prepare` + `pipeline` auto-defaults
+    const pooled = config.pooler ?? transactionPoolerDetected(host, port) // gates the `prepare` + `pipeline` auto-defaults
     this.cfg = {
       host,
       port,
@@ -407,6 +426,7 @@ export class Connection {
         return { enabled: rc === true || (rc != null && typeof rc === 'object'), base: o.baseMs ?? 100, max: o.maxMs ?? 5000, maxRetries: o.maxRetries ?? null }
       })(config.reconnect),
       socket: config.socket,
+      transport: config.transport,
       path: config.path,
       plugins: config.plugins ?? [],
       isBehindPooler: pooled,
@@ -469,7 +489,7 @@ export class Connection {
       decode: c(p.decodeMs), total: c(end - p.t0),
       bytesSent: p.sent, bytesReceived: p.recv,
       rowCount: t.rowCount ?? (t.rows ? t.rows.length : null), columnCount: t.fields?.length ?? 0,
-      command: t.command ?? null, ...(err ? { error: err } : {}),
+      command: t.command ?? null, prepared: t.info?.prepared ?? false, ...(err ? { error: err } : {}),
     }
     p.metrics = m
     const info = t.info!
@@ -497,11 +517,13 @@ export class Connection {
       this.connecting = true; this.state = this.everConnected ? 'reconnecting' : 'connecting'
       this.parser = new Parser(); this.scramState = undefined // fresh per attempt
       this.connTimer = setTimeout(() => this.failAttempt(new Error(`connect timeout after ${this.cfg.connectTimeout}ms`)), this.cfg.connectTimeout)
-      // One transport path for all runtimes: config.socket (Deno/CF/WS/unix/custom) or the node:net/tls
-      // transport the Node entry registered. The factory returns an already-connected (TLS-negotiated) duplex.
+      // One transport path for all runtimes: config.socket (WS/unix/custom), config.transport (CF/Deno/Effect)
+      // or the node:net/tls transport the Node entry registered. Each returns a connected, TLS-negotiated duplex.
       const ac = new AbortController(); this.connectAbort = ac // failAttempt() aborts -> transport destroys its pending socket
-      const factory = this.cfg.socket ?? (defaultTransport ? () => defaultTransport!(this.cfg, ac.signal) : null)
-      if (!factory) return this.failAttempt(Object.assign(new Error('no transport: import from minipg/node (net/tls) or pass config.socket'), { fatal: true }))
+      const transport = this.cfg.transport
+      const connect = transport ? transport.connect.bind(transport) : defaultTransport
+      const factory = this.cfg.socket ?? (connect ? () => connect(this.cfg, ac.signal) : null)
+      if (!factory) return this.failAttempt(Object.assign(new Error('no transport: import from minipg/node (net/tls), or pass config.transport or config.socket'), { fatal: true }))
       Promise.resolve(factory()).then((s) => {
         const sock = s as unknown as Duplex // structural MinipgSocket -> internal Duplex view (optional methods guarded at use)
         if (!this.connecting) { try { sock.destroy() } catch { /* superseded/aborted while connecting */ } return }
@@ -794,6 +816,7 @@ export class Connection {
     } catch (e) {
       // the source threw or the socket died mid-copy: end copy mode; the server answers with an
       // ErrorResponse quoting the reason, which settles the task through the normal error path
+      void Promise.resolve(it.return?.()).catch(() => {})
       try { this.socket?.write(W.copyFail(`COPY aborted: ${e instanceof Error ? e.message : String(e)}`)) } catch { /* socket gone; the task settles via the socket-down path */ }
     }
   }
@@ -953,7 +976,7 @@ export class Connection {
       this.fireEnd(task, reason)
       this.rejectTask(task, reason)
       if (idx === 0) {
-        // CopyFail ends a COPY FROM STDIN, and the server ignores a CancelRequest while it reads COPY data.
+        // CopyFail ends a COPY FROM STDIN, and the server holds back a CancelRequest while it reads COPY data.
         if (!task.copySource) this.sendCancelRequest(task)
         task.graceTimer = setTimeout(() => { try { this.socket?.destroy() } catch { /* */ } }, 5000) // dead-network fallback
       }
@@ -964,16 +987,21 @@ export class Connection {
     }
   }
 
-  // Best-effort out-of-band CancelRequest. The node transport registers nodeCancel; transports without
-  // a registered canceller (e.g. cloudflare:sockets) rely on the grace-timer socket.destroy() fallback.
+  // Out-of-band CancelRequest through the transport's cancel, or the registered one when no transport is set.
+  // Without either, the grace timer's socket.destroy() is the fallback.
   private sendCancelRequest(head: Task): void {
     const key = this.backendKey
-    if (!key || !defaultCancel) return
+    const cancel = this.cfg.transport ? this.cfg.transport.cancel?.bind(this.cfg.transport) : defaultCancel
+    if (!key || !cancel) return
     // Two cancels in flight cannot be told apart, so the connection is not reused after the second one.
     if (this.pendingCancel) this.isRetiring = true
     const pending: PendingCancel = { head, isConfirmed: false, hasFailed: false }
     this.pendingCancel = pending
-    defaultCancel(this.cfg, key).then(
+    // A cancel that is still open after connectTimeout counts as failed, so the connection retires
+    // instead of waiting for the OS to give up on the cancel socket.
+    let timer: ReturnType<typeof setTimeout> | undefined
+    const deadline = new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error('cancel request timed out')), this.cfg.connectTimeout) })
+    Promise.race([cancel(this.cfg, key), deadline]).finally(() => clearTimeout(timer)).then(
       () => { pending.isConfirmed = true; if (this.pendingCancel === pending && !pending.head) this.resolveCanceledHead(pending) },
       () => { pending.hasFailed = true; if (this.pendingCancel === pending && !pending.head) this.resolveCanceledHead(pending) },
     )
@@ -1034,7 +1062,7 @@ export class Connection {
 
   private retire(): void {
     try { this.socket?.write(W.terminate()) } catch { /* */ }
-    this.onSocketDown(new Error('minipg: the connection was closed because the server did not confirm a cancel request, and that request could still stop a later query. Run the query again on a new connection.'))
+    this.onSocketDown(new Error('minipg: the connection was closed because a cancel request could still stop a later query on it. Run the query again on a new connection.'))
   }
 
   private finishTask(): void {
@@ -1621,7 +1649,8 @@ export class Connection {
       },
       return(): Promise<IteratorResult<Row>> {
         t.cancelled = true
-        if (!done && !err) self.cancelTask(t, Object.assign(new Error('stream closed early'), { name: 'AbortError' }))
+        // A cancel inside a transaction would abort the transaction, so there the rest is read and dropped.
+        if (!done && !err && !self.inTransaction) self.cancelTask(t, Object.assign(new Error('stream closed early'), { name: 'AbortError' }))
         if (paused) { paused = false; try { self.socket?.resume() } catch { /* */ } }
         return Promise.resolve({ value: undefined, done: true })
       },
@@ -1638,10 +1667,10 @@ export class Connection {
    *  Buffered bytes above `highWaterMark` (default 512KB) pause the socket where the transport
    *  supports pause/resume (node does); `result` resolves with the final 'COPY n' tag. Runs SOLO
    *  on the connection like copyFrom — pool users should check a connection out. break/return()
-   *  DETACHES: remaining frames are dropped as they arrive (no buffering) while the server finishes
-   *  the copy and the connection survives; timeout/signal do a HARD cancel instead (CancelRequest
-   *  where the transport registers one, else the grace-timer teardown). COPY accepts no $n params —
-   *  any dynamic values must be inlined with care. */
+   *  cancels the COPY like timeout/signal do (CancelRequest where the transport has one, else the
+   *  grace-timer teardown). Inside a transaction, where a cancel would abort the transaction, it
+   *  detaches instead: the remaining frames are dropped as they arrive while the server finishes the
+   *  copy. COPY accepts no $n params — any dynamic values must be inlined with care. */
   copyTo(sql: string, opts: { timeout?: number; signal?: AbortSignal; highWaterMark?: number } = {}): AsyncIterableIterator<Uint8Array> & { result: Promise<{ command: string | null; rowCount: number | null }> } {
     const self = this
     let chunks: Buffer[] = []
@@ -1680,7 +1709,9 @@ export class Connection {
         return new Promise<IteratorResult<Uint8Array>>((resolve, reject) => { waiting = { resolve, reject } })
       },
       return(): Promise<IteratorResult<Uint8Array>> {
-        t.cancelled = true; chunks = []; buffered = 0; resume(); done = true // detach: later 'd' frames are dropped in handle()
+        const isRunning = !done && !err
+        t.cancelled = true; chunks = []; buffered = 0; resume(); done = true // later 'd' frames are dropped in handle()
+        if (isRunning && !self.inTransaction) self.cancelTask(t, Object.assign(new Error('copy closed early'), { name: 'AbortError' }))
         return Promise.resolve({ value: undefined as never, done: true })
       },
       result,

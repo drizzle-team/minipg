@@ -15,7 +15,7 @@ The API for Effect applications, built on the same pool and connections as the a
 _Avoid_: Effect driver, Effect wrapper
 
 **Transport**:
-The runtime-specific code that opens the socket to the server (Node, Cloudflare, Deno, Neon WebSocket).
+The runtime-specific code that opens the socket to the server and sends cancel requests (Node, Cloudflare, Deno, Neon WebSocket).
 _Avoid_: adapter, socket layer
 
 ### Running several queries

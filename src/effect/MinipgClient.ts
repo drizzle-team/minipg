@@ -1,5 +1,5 @@
 // Effect's SqlClient contract implemented over the minipg pool and connections. This part is the same
-// on every runtime; each runtime's client module adds make, layer and layerConfig with its own pool.
+// for every entry point; core-client.ts and the runtime client modules add make, layer and layerConfig.
 import * as Arr from 'effect/Array'
 import * as Context from 'effect/Context'
 import type * as Duration from 'effect/Duration'
@@ -22,7 +22,7 @@ import type { ConnectionOptions } from 'node:tls'
 import type { Connection } from '../connection.ts'
 import { Cursor, type CursorOptions } from '../cursor.ts'
 import { PgError } from '../errors.ts'
-import type { QueryMetrics } from '../plugin.ts'
+import { metricAttributes } from '../plugin.ts'
 import type { Pool } from '../pool.ts'
 import type { RawParams } from '../encode.ts'
 import type { ConnectConfig, QueryOptions as MinipgQueryOptions, QueryResult } from '../types.ts'
@@ -59,7 +59,8 @@ export interface MinipgClient extends Client.SqlClient {
   /** COPY … FROM STDIN with the COPY payload read from a Stream. An interrupt or a failed source sends
    *  CopyFail, so no rows from the COPY remain. */
   readonly copyFrom: <E, R>(sql: string, source: Stream.Stream<Uint8Array | string, E, R>) => Effect.Effect<QueryResult<never>, SqlError | E, R>
-  /** COPY … TO STDOUT as a Stream of raw bytes. Closing the Stream early cancels the COPY on the server. */
+  /** COPY … TO STDOUT as a Stream of raw bytes. Closing the Stream early cancels the COPY on the server,
+   *  except inside a transaction, where the rest of the COPY is read and dropped. */
   readonly copyTo: (sql: string, options?: { readonly highWaterMark?: number }) => Stream.Stream<Uint8Array, SqlError>
   /** A server-side cursor on a dedicated connection, as a Stream of row batches of up to `fetchSize` rows. */
   readonly cursor: <Row = Record<string, unknown>>(options: CursorOptions) => Stream.Stream<Row[], SqlError>
@@ -107,6 +108,7 @@ export interface MinipgClientConfig {
   readonly port?: number | undefined
   /** A unix-domain socket path, used instead of host and port. */
   readonly path?: string | undefined
+  /** `true` verifies the server certificate and host name, as in @effect/sql-pg. */
   readonly ssl?: boolean | ConnectionOptions | undefined
   readonly database?: string | undefined
   readonly username?: string | undefined
@@ -123,10 +125,10 @@ export interface MinipgClientConfig {
    *  SpanPropagationEnabled for the layer. Off by default, and then the driver collects no timings. */
   readonly metrics?: boolean | undefined
 
-  readonly socket?: ConnectConfig['socket']
   readonly decode?: ConnectConfig['decode']
   readonly temporal?: ConnectConfig['temporal']
   readonly prepare?: ConnectConfig['prepare']
+  readonly pooler?: ConnectConfig['pooler']
   readonly pipeline?: ConnectConfig['pipeline']
   readonly types?: ConnectConfig['types']
 }
@@ -136,12 +138,20 @@ export type FromPoolOptions = Pick<MinipgClientConfig, 'spanAttributes' | 'trans
 
 let clientIdCounter = 0
 
-/** Creates a client over a pool that the caller owns: the async and Effect entry points then share its
- *  connections, and the pool stays open when the scope closes. */
-export const makeFromPool = Effect.fnUntraced(function* (pool: Pool, config: FromPoolOptions = {}) {
+/** Creates a client over the pool that `acquire` yields, as `PgClient.fromPool` does. `acquire` runs in
+ *  the client's scope, so `Effect.acquireRelease` ties the pool's lifetime to it, and `Effect.succeed`
+ *  passes a pool that the caller owns and keeps open. */
+export const fromPool = Effect.fnUntraced(function* (options: FromPoolOptions & { readonly acquire: Effect.Effect<Pool, SqlError, Scope.Scope> }) {
+  const { acquire: acquirePool, ...config } = options
+  const pool = yield* acquirePool
   // Connect once, so a wrong config fails when the layer is built and not at the first statement.
-  yield* Effect.tryPromise({ try: () => pool.acquire().then((c) => pool.release(c)), catch: (e) => toSqlError(e, 'connect') })
-  const target = pool.target
+  const target = yield* Effect.tryPromise({
+    try: () => pool.acquire().then((conn) => {
+      pool.release(conn)
+      return { host: conn.cfg.path ?? conn.cfg.host, port: conn.cfg.port, database: conn.cfg.database }
+    }),
+    catch: (e) => toSqlError(e, 'connect'),
+  })
   const compiler = makeCompiler(config.transformQueryNames, config.transformJson)
   const transformRows = config.transformResultNames
     ? Statement.defaultTransforms(config.transformResultNames, config.transformJson).array
@@ -156,8 +166,9 @@ export const makeFromPool = Effect.fnUntraced(function* (pool: Pool, config: Fro
   })
   // Inside `pipeline`, every statement borrows the pipeline's connection instead of the pool.
   const pipelineConnection = Context.Service<Connection>(`@drizzle-team/minipg/MinipgClient/Pipeline/${clientIdCounter++}`)
+  const toSqlConnection = (conn: Connection) => new ConnectionImpl(conn, config.metrics === true)
   const acquirer = Effect.flatMap(Effect.serviceOption(pipelineConnection), (pinned) =>
-    Effect.map(Option.isSome(pinned) ? Effect.succeed(pinned.value) : poolConnection, (conn) => new ConnectionImpl(conn, config.metrics === true)))
+    Effect.map(Option.isSome(pinned) ? Effect.succeed(pinned.value) : poolConnection, toSqlConnection))
 
   const spanAttributes = [
     ...(config.spanAttributes ? Object.entries(config.spanAttributes) : []),
@@ -169,6 +180,8 @@ export const makeFromPool = Effect.fnUntraced(function* (pool: Pool, config: Fro
   ] satisfies ReadonlyArray<readonly [string, unknown]>
   const client = yield* Client.make({
     acquirer,
+    // A transaction always takes its own connection, so it never pulls the pipeline's statements into it.
+    transactionAcquirer: Effect.map(poolConnection, toSqlConnection),
     compiler,
     prepareTransactionControls: true,
     commit,
@@ -192,30 +205,32 @@ export const makeFromPool = Effect.fnUntraced(function* (pool: Pool, config: Fro
   const traced = <A, E, R>(operation: string, text: string, effect: Effect.Effect<A, E, R>) =>
     Effect.withSpan(effect, spanName, spanOptions(operation, text))
 
+  const metrics = config.metrics === true
   const query = ((sql: string, params: Params = [], options: QueryOptions = {}) =>
     traced('query', sql, withConnection((conn) =>
-      Effect.tryPromise({
-        try: (signal) => conn.query(sql, params, { ...options, signal } as never) as Promise<unknown>,
+      annotateMetrics(Effect.tryPromise({
+        try: (signal) => conn.query(sql, params, { metrics, ...options, signal } as never) as Promise<QueryResult<unknown> | Uint8Array[]>,
         catch: (e) => toSqlError(e, 'query', conn),
-      })))) as MinipgQuery
+      }))))) as MinipgQuery
 
   const plainWithTransaction = client.withTransaction
-  const withTransaction = <R, E, A>(self: Effect.Effect<A, E, R>, options?: TransactionOptions) => {
-    const set = options && setTransaction(options)
-    if (!set) return plainWithTransaction(self)
-    return Effect.flatMap(Effect.serviceOption(client.transactionService), (outer) =>
-      Option.isSome(outer)
-        ? plainWithTransaction(self)
-        : plainWithTransaction(Effect.andThen(client.unsafe(set), self)))
-  }
+  const withTransaction = <R, E, A>(self: Effect.Effect<A, E, R>, options?: TransactionOptions) =>
+    Effect.suspend(() => {
+      const set = options && setTransaction(options)
+      if (!set) return plainWithTransaction(self)
+      return Effect.flatMap(Effect.serviceOption(client.transactionService), (outer) =>
+        Option.isSome(outer)
+          ? plainWithTransaction(self)
+          : plainWithTransaction(Effect.andThen(client.unsafe(set), self)))
+    })
 
   const bulk = <O extends object>(
     operation: 'bulkInsert' | 'bulkUpdate' | 'copyMany',
     table: string,
-    f: (conn: Connection, options: O & { signal: AbortSignal }) => Promise<QueryResult<never>>,
+    f: (conn: Connection, options: O & { signal: AbortSignal; metrics: boolean }) => Promise<QueryResult<never>>,
     options: O,
   ) => traced(operation, table, withConnection((conn) =>
-    Effect.tryPromise({ try: (signal) => f(conn, { ...options, signal }), catch: (e) => toSqlError(e, operation, conn) })))
+    annotateMetrics(Effect.tryPromise({ try: (signal) => f(conn, { metrics, ...options, signal }), catch: (e) => toSqlError(e, operation, conn) }))))
   const bulkInsert = (...[table, columns, rows, options]: Parameters<Connection['bulkInsert']>) =>
     bulk('bulkInsert', table, (conn, withSignal) => conn.bulkInsert(table, columns, rows, withSignal), options ?? {})
   const bulkUpdate = (...[table, columns, rows, options]: Parameters<Connection['bulkUpdate']>) =>
@@ -238,21 +253,17 @@ export const makeFromPool = Effect.fnUntraced(function* (pool: Pool, config: Fro
           }
         },
       }
-      return withConnection((conn) => Effect.tryPromise({
-        try: (signal) => conn.copyFrom(sql, payload, { signal }),
+      return withConnection((conn) => annotateMetrics(Effect.tryPromise({
+        try: (signal) => conn.copyFrom(sql, payload, { signal, metrics }),
         catch: (e) => sourceFailure ? sourceFailure.error : toSqlError(e, 'copyFrom', conn),
-      }).pipe(Effect.catch((e): Effect.Effect<never, SqlError | E> =>
+      })).pipe(Effect.catch((e): Effect.Effect<never, SqlError | E> =>
         e instanceof SourceFailure ? Effect.fail(e.error as E) : e instanceof SqlError ? Effect.fail(e) : Effect.die(e))))
     }))
 
   const copyTo = (sql: string, options: { readonly highWaterMark?: number } = {}) =>
-    Stream.unwrap(Effect.map(scopedConnection, (conn) => {
-      const abort = new AbortController()
-      const it = conn.copyTo(sql, { ...options, signal: abort.signal })
-      // An early close cancels the COPY: copyTo's own return() would let the server send the rest.
-      const bytes = { [Symbol.asyncIterator]: () => ({ next: () => it.next(), return: () => { abort.abort(); return it.return!() } }) }
-      return Stream.fromAsyncIterable(bytes, (e) => toSqlError(e, 'copyTo', conn))
-    })).pipe(Stream.withSpan(spanName, spanOptions('copyTo', sql)))
+    Stream.unwrap(Effect.map(scopedConnection, (conn) =>
+      Stream.fromAsyncIterable({ [Symbol.asyncIterator]: () => conn.copyTo(sql, options) }, (e) => toSqlError(e, 'copyTo', conn)),
+    )).pipe(Stream.withSpan(spanName, spanOptions('copyTo', sql)))
 
   const cursor = <Row = Record<string, unknown>>(options: CursorOptions) =>
     Stream.unwrap(Effect.map(poolConnection, (conn) => {
@@ -311,7 +322,7 @@ class ConnectionImpl implements SqlConnection {
 
   private query<Row>(operation: string, f: (options: { signal: AbortSignal; metrics: boolean }) => Promise<QueryResult<Row>>) {
     const result = Effect.tryPromise({ try: (signal) => f({ signal, metrics: this.metrics }), catch: (e) => toSqlError(e, operation, this.conn) })
-    return this.metrics ? Effect.tap(result, (r) => r.metrics ? Effect.annotateCurrentSpan(metricAttributes(r.metrics)) : Effect.void) : result
+    return this.metrics ? annotateMetrics(result) : result
   }
 
   private rows<Row>(f: (options: { signal: AbortSignal; metrics: boolean }) => Promise<QueryResult<Row>>) {
@@ -344,17 +355,8 @@ class ConnectionImpl implements SqlConnection {
   }
 }
 
-// The same names as minipg's otel() plugin.
-const metricAttributes = (m: QueryMetrics) => ({
-  'db.response.returned_rows': m.rowCount ?? 0,
-  'db.client.response.body.size': m.bytesReceived,
-  'minipg.bytes_sent': m.bytesSent,
-  'minipg.queue_wait_ms': m.queueWait,
-  'minipg.ttfb_ms': m.ttfb,
-  'minipg.download_ms': m.download,
-  'minipg.decode_ms': m.decode,
-  'minipg.total_ms': m.total,
-})
+const annotateMetrics = <A extends QueryResult<unknown> | Uint8Array[], E>(effect: Effect.Effect<A, E>) =>
+  Effect.tap(effect, (result) => 'metrics' in result && result.metrics ? Effect.annotateCurrentSpan(metricAttributes(result.metrics)) : Effect.void)
 
 class SourceFailure {
   constructor(readonly error: unknown) {}
@@ -362,8 +364,8 @@ class SourceFailure {
 
 /** Postgres answers COMMIT with the ROLLBACK tag when the transaction was already aborted. */
 const commit = (conn: SqlConnection) =>
-  Effect.flatMap(conn.executeRaw('COMMIT', []) as Effect.Effect<QueryResult<never>, SqlError>, (result) =>
-    result.command === 'ROLLBACK'
+  Effect.flatMap(conn.executeRaw('COMMIT', []), (result) =>
+    (result as QueryResult<never>).command === 'ROLLBACK'
       ? Effect.fail(new SqlError({
         reason: new UnknownError({
           cause: new Error('COMMIT rolled back an aborted transaction'),
@@ -427,12 +429,12 @@ export const layerFrom = <E, R>(
 
 /** A layer over a pool that the caller owns. Closing the layer's scope leaves the pool open. */
 export const layerFromPool = (pool: Pool, options?: FromPoolOptions) =>
-  layerFrom(makeFromPool(pool, options))
+  layerFrom(fromPool({ ...options, acquire: Effect.succeed(pool) }))
 
 /** The Postgres statement compiler: $n placeholders, double-quoted identifiers, and json fragments as jsonb. */
 export const makeCompiler = (transform?: (_: string) => string, transformJson = true) => {
   const transformValue = transformJson && transform ? Statement.defaultTransforms(transform).value : undefined
-  return Statement.makeCompiler<MinipgCustom>({
+  return Statement.makeCompiler<MinipgJson>({
     dialect: 'pg',
     placeholder: (i) => `$${i}`,
     onIdentifier: transform
@@ -453,6 +455,5 @@ export const makeCompiler = (transform?: (_: string) => string, transformJson = 
 
 const escape = Statement.defaultEscape('"')
 
-type MinipgCustom = MinipgJson
 interface MinipgJson extends Custom<'MinipgJson', unknown> {}
 const MinipgJson = Statement.custom<MinipgJson>('MinipgJson')

@@ -5,6 +5,7 @@ import { SqlClient } from 'effect/sql/SqlClient'
 import type { SqlError } from 'effect/sql/SqlError'
 import { PgError, testPool } from '../helpers/db.ts'
 import { runTest } from '../helpers/effect.ts'
+import { MinipgClient } from '../../src/effect/index.ts'
 
 const T = `effect_errors_${process.pid}`
 
@@ -32,6 +33,14 @@ afterAll(async () => {
 })
 
 describe('SqlError reasons', () => {
+  test('an invalid connection URL fails the layer with a SqlError', async () => {
+    const layer = MinipgClient.layer({ url: Redacted.make('mysql://localhost/db') })
+    const exit = await Effect.runPromise(Effect.exit(Effect.provide(run('select 1'), layer)))
+    if (Exit.isSuccess(exit)) throw new Error('expected the layer to fail')
+    const failure = exit.cause.reasons.find(Cause.isFailReason)
+    expect((failure?.error as SqlError | undefined)?.reason._tag).toBe('ConnectionError')
+  })
+
   test('a unique violation carries the constraint name, and the cause is the full PgError', async () => {
     const err = await sqlError(run(`insert into ${T} values (3, 'a@x', 1)`))
     expect(err.reason._tag).toBe('UniqueViolation')

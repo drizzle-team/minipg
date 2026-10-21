@@ -5,7 +5,7 @@
 // instance for testing. minipg emits OTel spans following DB semantic conventions — which is also what
 // makes Sentry (its Node SDK runs on OpenTelemetry) display them, so `otel()` alone often suffices.
 import { createRequire } from 'node:module'
-import type { Plugin, QueryInfo, QueryMetrics } from './plugin.ts'
+import { metricAttributes, type Plugin, type QueryInfo, type QueryMetrics } from './plugin.ts'
 
 // minimal shapes so we don't depend on the real SDK types
 interface SpanLike { setAttribute?(k: string, v: unknown): void; setAttributes?(a: Record<string, unknown>): void; setStatus?(s: { code: number; message?: string }): void; recordException?(e: unknown): void; end?(): void }
@@ -30,13 +30,12 @@ export function otel(opts: { tracer?: TracerLike; captureText?: boolean } = {}):
     name: 'otel',
     onQueryStart(info: QueryInfo) {
       return tracer.startSpan('pg.query', { attributes: {
-        'db.system': 'postgresql', 'db.namespace': info.database, 'db.operation.name': operationOf(info.sql),
-        ...(info.host ? { 'server.address': info.host } : {}), ...(withText ? { 'db.query.text': info.sql } : {}), 'minipg.prepared': info.prepared } })
+        'db.system.name': 'postgresql', 'db.namespace': info.database, 'db.operation.name': operationOf(info.sql),
+        ...(info.host ? { 'server.address': info.host } : {}), ...(withText ? { 'db.query.text': info.sql } : {}) } })
     },
     onQueryEnd(span: unknown, _info: QueryInfo, m: QueryMetrics) {
       const s = span as SpanLike
-      s.setAttributes?.({ 'db.response.returned_rows': m.rowCount ?? 0, 'db.client.response.body.size': m.bytesReceived,
-        'minipg.queue_wait_ms': m.queueWait, 'minipg.ttfb_ms': m.ttfb, 'minipg.download_ms': m.download, 'minipg.decode_ms': m.decode, 'minipg.total_ms': m.total })
+      s.setAttributes?.(metricAttributes(m))
       s.end?.()
     },
     onQueryError(span: unknown, _info: QueryInfo, err: Error) {

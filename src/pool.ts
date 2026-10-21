@@ -5,7 +5,7 @@
 // recovering database. Dead idle connections are evicted on checkout; open transactions
 // are rolled back before reuse. In-flight queries are never silently replayed.
 import { AsyncLocalStorage } from 'node:async_hooks'
-import { Connection } from './connection.ts'
+import { Connection, isUntrustedCertificate } from './connection.ts'
 import type { TxFn } from './connection.ts'
 import { resolveUrl } from './url.ts'
 import type { PoolConfig, QueryOptions, QueryResult, TxOptions } from './types.ts'
@@ -45,6 +45,7 @@ function classify(err: unknown): 'fatal' | 'unavailable' {
   // loop (isFatalAuth); without it here a config error looks like an outage, so the breaker trips,
   // every acquire waits out the full acquireTimeout, and the probe just re-runs the same failure.
   if ((err as { fatal?: boolean } | null)?.fatal === true) return 'fatal'
+  if (isUntrustedCertificate(err)) return 'fatal'
   if (typeof e?.message === 'string' && DISABLED_ENDPOINT.test(e.message)) return 'fatal'
   return 'unavailable' // ECONNREFUSED/RESET/timeout, 57P0x shutdown, connection terminated, ...
 }
@@ -118,12 +119,6 @@ export class Pool {
     this.guardTx = cfg.txGuard !== false
     this.idleMs = cfg.idleTimeoutMillis ?? 0
     this.notifyRelease = installVercelCompat(this, this.idleMs)
-  }
-
-  /** The server and database this pool connects to, after the URL and the defaults apply. */
-  get target(): { host: string; port: number; database: string } {
-    const c = new Connection({ ...this.cfg, reconnect: false }).cfg
-    return { host: c.path ?? c.host, port: c.port, database: c.database }
   }
 
   get size(): number { return this.all.size }
