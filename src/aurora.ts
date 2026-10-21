@@ -6,7 +6,8 @@
 // mapper for decode — it converts each typed `Field` back to its PG text and feeds a synthetic wire
 // DataRow to `buildMapperFactory`, so results decode identically to the socket driver (int8→BigInt,
 // numeric→string, temporal→Date, bytea→Buffer, …). We force resultSetOptions longReturnType/decimalReturnType
-// = STRING so int8/numeric arrive as exact text.
+// = STRING so int8/numeric arrive as exact text; emulators (local-data-api) ignore that and send a bare JSON
+// number, so the response body is parsed with long integers kept as their exact digits (parseExact).
 //
 // Params: the CALLER owns the SQL and its `:name`/`:pN` placeholders — we never rewrite it. Use `bind()`:
 //   db.query('insert into t (a,b) values (:p1, :uid)', [ bind.bigint(10), bind.uuid(id, 'uid') ])
@@ -15,13 +16,17 @@
 // decode targets from YOUR declaration instead of the Data API's reported typeName — the only way to
 // decode a type its metadata cannot name (enum/domain/composite arrive as their own typname).
 // Interactive transactions work (begin/transaction) via a threaded transactionId. No streaming/cursors
-// (1 MiB response cap), no COPY/LISTEN, no array bind params (pass as text/JSON) — Data API limitations.
+// (1 MiB response cap), no COPY/LISTEN — Data API limitations. Array params: the Data API rejects native
+// arrayValue parameters, so a raw JS array is sent as a PG '{…}' literal string. Array RESULTS arrive as
+// typed arrayValue lists that cannot carry NULL elements — the Data API drops them, so a decoded array
+// silently loses its NULLs (a limitation of the wire format, not recoverable client-side).
 import { buildMapperFactory, type RowMapperFactory } from './mapper.ts'
 import { buildDecoders } from './decode.ts'
 import { INSTANT_OIDS, tagArrayCol, type CodegenCol } from './decode.ts'
 import { shapeCols, mergeUnknownCols, ARRAY_OID, type ShapeSpec } from './spec.ts'
 import type { ShapeMapper } from './shape.ts'
 import { parseDataRow } from './protocol.ts'
+import { arrayLiteral } from './encode.ts'
 import { PgError } from './errors.ts'
 import { signRequest, type AwsCredentials } from './sigv4.ts'
 import type { Decoder, ResultMode, QueryResult, TxOptions } from './types.ts'
@@ -74,6 +79,8 @@ function encodeRaw(v: unknown, name: string): SqlParameter {
   if (typeof v === 'number') return { name, value: Number.isInteger(v) ? { longValue: v } : { doubleValue: v } }
   if (Buffer.isBuffer(v)) return { name, value: { blobValue: v.toString('base64') } }
   if (v instanceof Date) return { name, typeHint: 'TIMESTAMP', value: { stringValue: tsText(v) } }
+  // Untyped '{…}' literal: the server infers the array type. JSON here is a 22P02 "malformed array literal".
+  if (Array.isArray(v)) return { name, value: { stringValue: arrayLiteral(v) } }
   if (typeof v === 'object') return { name, typeHint: 'JSON', value: { stringValue: JSON.stringify(v) } }
   return { name, value: { stringValue: String(v) } }
 }
@@ -92,6 +99,8 @@ const TYPENAME_OID: Record<string, number> = {
   time: 1083, timestamp: 1114, timestamptz: 1184, interval: 1186, timetz: 1266, bit: 1560, varbit: 1562,
   numeric: 1700, uuid: 2950, jsonb: 3802, int4range: 3904, numrange: 3906, tsrange: 3908, tstzrange: 3910,
   daterange: 3912, int8range: 3926,
+  // JDBC names, not pg_type ones: the Data API reports serial and identity columns as their pseudo-type.
+  serial: 23, bigserial: 20, smallserial: 21,
 }
 
 // pg_type names an array type by prefixing its element's name with '_' ('_int4' is int4[]), which is
@@ -109,17 +118,55 @@ function oidForTypeName(t: string): number {
 }
 
 interface ColumnMetadata { name?: string; label?: string; typeName: string }
-interface Field { isNull?: boolean; stringValue?: string; longValue?: number; doubleValue?: number; booleanValue?: boolean; blobValue?: string }
+// longValue(s) are strings when parseExact had to keep digits a JS number would round.
+interface ArrayValue { stringValues?: string[]; longValues?: (number | string)[]; doubleValues?: number[]; booleanValues?: boolean[]; arrayValues?: ArrayValue[] }
+interface Field { isNull?: boolean; stringValue?: string; longValue?: number | string; doubleValue?: number; booleanValue?: boolean; blobValue?: string; arrayValue?: ArrayValue }
+
+// The Data API sends timestamptz/timetz converted to UTC with the offset stripped. Put '+00' back so the
+// text matches what the server sends every other entry (temporal:'string' output, raw/buffer modes).
+const UTC_TYPENAMES = new Set(['timestamptz', 'timetz', '_timestamptz', '_timetz'])
+const HAS_OFFSET = /[+-]\d\d(?::?\d\d){0,2}( BC)?$/
+const withUtc = (s: string): string => // leaves 'infinity' & co alone; PG puts the offset before ' BC'
+  HAS_OFFSET.test(s) || !/^\d/.test(s) ? s : s.endsWith(' BC') ? s.slice(0, -3) + '+00 BC' : s + '+00'
+
+// Quote an element exactly when PG's array_out would, so arrays with no element decoder (inet[], enum[],
+// …) come back as the same raw literal the wire driver returns: empty, NULL, or containing a delimiter,
+// quote, backslash, brace or whitespace.
+const NEEDS_QUOTE = { ',': /^$|^null$|[",\\{} \t\n\r\v\f]/i, ';': /^$|^null$|[";\\{} \t\n\r\v\f]/i } // array_isspace is ASCII-only
+const quoteEl = (s: string, delim: ',' | ';'): string => (NEEDS_QUOTE[delim].test(s) ? '"' + s.replace(/\\/g, '\\\\').replace(/"/g, '\\"') + '"' : s)
+// An arrayValue -> its PG '{…}' literal, for the oid-based array decoders. Nested arrayValues are the
+// dimensions of a multi-dimensional array. box is the one built-in type whose array delimiter isn't ','.
+function arrayToLiteral(a: ArrayValue, utc: boolean, delim: ',' | ';'): string {
+  const els = a.arrayValues ? a.arrayValues.map((x) => arrayToLiteral(x, utc, delim))
+    : a.stringValues ? a.stringValues.map((s) => quoteEl(utc ? withUtc(s) : s, delim))
+    : a.longValues ? a.longValues.map(String)
+    : a.doubleValues ? a.doubleValues.map(String)
+    : a.booleanValues ? a.booleanValues.map((b) => (b ? 't' : 'f'))
+    : []
+  return '{' + els.join(delim) + '}'
+}
 
 // A Field -> its PG text bytes (so the SAME compiled mapper the wire driver uses can decode it).
-function fieldToText(f: Field): Buffer | null {
+function fieldToText(f: Field, utc: boolean, delim: ',' | ';'): Buffer | null {
   if (f.isNull) return null
-  if (f.stringValue !== undefined) return Buffer.from(f.stringValue, 'utf8')
+  if (f.stringValue !== undefined) return Buffer.from(utc ? withUtc(f.stringValue) : f.stringValue, 'utf8')
   if (f.longValue !== undefined) return Buffer.from(String(f.longValue), 'utf8')
   if (f.doubleValue !== undefined) return Buffer.from(String(f.doubleValue), 'utf8')
   if (f.booleanValue !== undefined) return Buffer.from(f.booleanValue ? 't' : 'f', 'utf8')
   if (f.blobValue !== undefined) return Buffer.from('\\x' + Buffer.from(f.blobValue, 'base64').toString('hex'), 'utf8')
+  if (f.arrayValue !== undefined) return Buffer.from(arrayToLiteral(f.arrayValue, utc, delim), 'utf8')
   return null
+}
+
+// JSON.parse that keeps longValue/longValues integers past 2^53 exact, as digit strings (a reviver with
+// context.source would do it natively, but needs a newer runtime than the package's >= 18). Inside a JSON
+// string every '"' is escaped, so `"longValue":` can only ever match a real key.
+const LONG_RE = /("longValue"\s*:\s*)(-?\d{16,})|("longValues"\s*:\s*\[)([^\]]*)/g
+const UNSAFE_INT_RE = /-?\d{16,}/g
+function parseExact(text: string): unknown {
+  if (!text.includes('"longValue')) return JSON.parse(text)
+  return JSON.parse(text.replace(LONG_RE, (m, k1: string | undefined, n: string | undefined, k2: string | undefined, list: string | undefined) =>
+    k1 !== undefined ? k1 + '"' + n + '"' : k2! + list!.replace(UNSAFE_INT_RE, '"$&"')))
 }
 
 const firstKeyword = (sql: string): string | null => { const m = sql.match(/^[\s(]*([a-zA-Z]+)/); return m ? m[1]!.toUpperCase() : null }
@@ -233,10 +280,10 @@ export class AuroraClient {
         ? await this.signOverride({ method: 'POST', url, body: payload, headers: { 'Content-Type': 'application/json' } })
         : await signRequest({ method: 'POST', url, body: payload, service: SERVICE, region: this.region, credentials: this.credentials!, headers: { 'Content-Type': 'application/json' } })
       const res = await this.fetchImpl(url, { method: 'POST', headers, body: payload, signal })
-      if (res.ok) return (await res.json()) as T
+      if (res.ok) return parseExact(await res.text()) as T
       const errType = (res.headers.get('x-amzn-errortype') ?? '').split(':')[0] ?? ''
       let parsed: { message?: string } = {}
-      try { parsed = (await res.json()) as { message?: string } } catch { /* non-JSON */ }
+      try { parsed = ((await res.json()) as { message?: string } | null) ?? {} } catch { /* non-JSON */ }
       if (attempt < this.maxRetries && (errType.includes('DatabaseResuming') || errType.includes('Throttling') || res.status === 429)) {
         await sleep(Math.min(5000, 200 * 2 ** attempt) * (0.5 + Math.random() * 0.5))
         continue
@@ -287,9 +334,11 @@ export class AuroraClient {
       throw new Error(`minipg/aurora: shape declares ${cols.length} column(s) but the statement returned ${meta.length} (${meta.map((c) => c.label ?? c.name).join(', ')}) — a shape is positional, so a mismatch would decode the wrong column`)
     }
     const ncols = cols.length
+    const utc = meta.map((m) => UTC_TYPENAMES.has(m.typeName))
+    const delim = meta.map((m) => (m.typeName === '_box' ? ';' as const : ',' as const))
     const mapper = mode === 'array' || mode === 'object' ? this.mapperFactory(cols, mode, this.decoders) : null
     const rows = r.records.map((rec) => {
-      const cells = rec.map(fieldToText)
+      const cells = rec.map((f, i) => fieldToText(f, utc[i]!, delim[i]!))
       let size = 2; for (const c of cells) size += 4 + (c ? c.length : 0)
       const b = Buffer.allocUnsafe(size); b.writeInt16BE(ncols, 0); let pos = 2
       for (const c of cells) { if (c == null) { b.writeInt32BE(-1, pos); pos += 4 } else { b.writeInt32BE(c.length, pos); pos += 4; c.copy(b, pos); pos += c.length } }

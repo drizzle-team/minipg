@@ -49,6 +49,24 @@ process.exit(failed ? 1 : 0)
 `
 fs.writeFileSync(path.join(scratch, 'probe.mjs'), probe)
 
+// CJS consumers load the ESM build through require(esm) (Node >=22.12), so every subpath must resolve
+// under the `require` condition too — an `import`-only entry fails with ERR_PACKAGE_PATH_NOT_EXPORTED.
+// '/cf' and '/effect/cf' are only resolved: require() of their cloudflare:sockets import trips a Node
+// internal assertion.
+const required = `
+const PKG = ${JSON.stringify(PKG)}
+const subpaths = ${JSON.stringify(subpaths)}
+let failed = false
+for (const s of subpaths) {
+  try {
+    if (s === '/cf' || s === '/effect/cf') require.resolve(PKG + s)
+    else require(PKG + s)
+  } catch (e) { console.error(\`require \${PKG}\${s}: \${e.code ?? e.name} \${e.message}\`); failed = true }
+}
+process.exit(failed ? 1 : 0)
+`
+fs.writeFileSync(path.join(scratch, 'required.cjs'), required)
+
 // The root entry and ./effect route by runtime condition and have NO fallback on purpose: a target
 // without TCP (browser, edge-light) must fail to resolve them at build time. `import`/`default` would be
 // a fallback.
@@ -87,6 +105,7 @@ fs.writeFileSync(path.join(scratch, 'routed-deno.mjs'), routedDeno)
 
 try {
   execFileSync('node', ['probe.mjs'], { cwd: scratch, stdio: 'inherit' })
+  execFileSync('node', ['required.cjs'], { cwd: scratch, stdio: 'inherit' })
   execFileSync('node', ['--conditions=workerd', 'routed.mjs'], { cwd: scratch, stdio: 'inherit' })
   execFileSync('node', ['--conditions=deno', 'routed-deno.mjs'], { cwd: scratch, stdio: 'inherit' })
   process.exit(0)
