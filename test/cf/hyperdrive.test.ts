@@ -2,7 +2,7 @@
 // `HYPERDRIVE` binding is configured (test/cf/wrangler.jsonc) with a localConnectionString pointing at
 // our local cluster, so Miniflare exposes env.HYPERDRIVE.{host,port,user,password,database} that route
 // to it — the same shape a production Hyperdrive binding has. Requires `bun run test:setup`.
-import { it, expect } from 'vitest'
+import { it, expect } from 'vite-plus/test'
 import { env } from 'cloudflare:test'
 import { connect } from '../../src/cf.ts'
 

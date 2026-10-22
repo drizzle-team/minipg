@@ -421,14 +421,14 @@ describe('startup parameters: options + per-session timeouts (R4)', () => {
       await c.query('reset all')
       expect(await show(c, 'statement_timeout')).toBe('4500ms')
       expect(await show(c, 'search_path')).toBe('r4test')
-    } finally { c.end() }
+    } finally { await c.end() }
   })
 
   test('?options= in a connection string round-trips (percent-encoded)', async () => {
     const { host, port, user, password, database } = TEST_CONFIG as { host: string; port: number; user: string; password: string; database: string }
     const url = `postgres://${user}:${password}@${host}:${port}/${database}?options=${encodeURIComponent('-c search_path=r4url')}`
     const c = await connect(url)
-    try { expect(await show(c, 'search_path')).toBe('r4url') } finally { c.end() }
+    try { expect(await show(c, 'search_path')).toBe('r4url') } finally { await c.end() }
   })
 
   test('a NUL byte in a startup parameter throws before any bytes reach the wire', async () => {
@@ -448,7 +448,7 @@ describe('channel_binding (SCRAM without channel binding)', () => {
     expect((err as Error).message).toContain('Enable `ssl`') // names the field to set…
     expect((err as Error).message).toContain('`channel_binding=prefer`') // …and the stance to fall back to
     const c = await connect(`${base()}?channel_binding=prefer`)
-    try { expect((await c.query('select 1 as ok', [], { mode: 'object' })).rows[0]).toEqual({ ok: 1 }) } finally { c.end() }
+    try { expect((await c.query('select 1 as ok', [], { mode: 'object' })).rows[0]).toEqual({ ok: 1 }) } finally { await c.end() }
   })
   test('an unknown channel_binding value fails URL parsing like libpq', async () => {
     const err = await caught(() => connect(`${base()}?channel_binding=maybe`))

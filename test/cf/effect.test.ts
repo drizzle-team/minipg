@@ -1,5 +1,5 @@
 // The Effect entry point inside real workerd.
-import { it, expect } from 'vitest'
+import { it, expect } from 'vite-plus/test'
 import { Effect, Layer, Redacted } from 'effect'
 import { SqlClient } from 'effect/sql/SqlClient'
 import { createPool } from '../../src/cf.ts'

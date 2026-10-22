@@ -212,7 +212,7 @@ describe('copyTo — COPY … TO STDOUT raw byte relay', () => {
       expect(lines[999]).toBe('1000\tv1000')
       expect(await it.result).toEqual({ command: 'COPY', rowCount: 1000 })
       expect((await c.query('select 7::int4 as x', [], { mode: 'object' })).rows[0]).toEqual({ x: 7 }) // connection reusable
-    } finally { c.end() }
+    } finally { await c.end() }
   }, TEST_TIMEOUT)
 
   test('direct pipe: source.copyTo (FORMAT binary) feeds target.copyFrom — zero decode, content-equal', async () => {
@@ -230,7 +230,7 @@ describe('copyTo — COPY … TO STDOUT raw byte relay', () => {
     } finally {
       await src.query('drop table if exists cto_src').catch(() => {})
       await dst.query('drop table if exists cto_dst').catch(() => {})
-      src.end(); dst.end()
+      await src.end(); await dst.end()
     }
   }, TEST_TIMEOUT)
 
@@ -244,7 +244,7 @@ describe('copyTo — COPY … TO STDOUT raw byte relay', () => {
       expect((err as PgError).code).toBe('22012') // division by zero, mid-stream
       await expect(it.result).rejects.toThrow()
       expect((await c.query('select 1::int4 as x')).rows.length).toBe(1) // connection survives
-    } finally { c.end() }
+    } finally { await c.end() }
   }, TEST_TIMEOUT)
 
   test('break cancels the copy, and the connection serves the next query', async () => {
@@ -255,7 +255,7 @@ describe('copyTo — COPY … TO STDOUT raw byte relay', () => {
       for await (const chunk of it) { first = chunk; break }
       expect(first).not.toBeNull()
       expect((await c.query('select 42::int4 as x', [], { mode: 'object' })).rows[0]).toEqual({ x: 42 })
-    } finally { c.end() }
+    } finally { await c.end() }
   }, TEST_TIMEOUT)
 
   test('inside a transaction, break leaves the transaction usable and COMMIT commits', async () => {
@@ -264,6 +264,6 @@ describe('copyTo — COPY … TO STDOUT raw byte relay', () => {
       await c.query('begin')
       for await (const _ of c.copyTo('copy (select g from generate_series(1, 20000) g) to stdout')) break
       expect((await c.query('commit')).command).toBe('COMMIT')
-    } finally { c.end() }
+    } finally { await c.end() }
   }, TEST_TIMEOUT)
 })

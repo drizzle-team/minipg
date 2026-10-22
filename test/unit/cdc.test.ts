@@ -587,7 +587,7 @@ test('cdc stop: idempotent, settles the in-flight handler, acks what completed',
   expect(p1).toBe(p2) // idempotent: the second call returns the exact first promise
 
   let resolved = false
-  p1.then(() => { resolved = true })
+  void p1.then(() => { resolved = true })
   await Bun.sleep(30)
   expect(resolved).toBe(false) // stop() must not resolve while the handler is still pending
   expect(lastFlushed(session.sent)).toBeLessThan(endLsn) // not acked yet either

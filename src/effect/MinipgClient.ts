@@ -206,6 +206,7 @@ export const fromPool = Effect.fnUntraced(function* (options: FromPoolOptions & 
     Effect.withSpan(effect, spanName, spanOptions(operation, text))
 
   const metrics = config.metrics === true
+  // oxlint-disable-next-line typescript/no-useless-default-assignment -- JavaScript callers can omit both
   const query = ((sql: string, params: Params = [], options: QueryOptions = {}) =>
     traced('query', sql, withConnection((conn) =>
       annotateMetrics(Effect.tryPromise({

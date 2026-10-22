@@ -106,7 +106,7 @@ async function differential(sql: string, opts: Record<string, unknown>): Promise
     expect(got.columns).toEqual(expected.columns)
     expect(got.rows).toEqual(expected.rows)
     return expected.rows[0] as Record<string, unknown>
-  } finally { wire.end() }
+  } finally { await wire.end() }
 }
 
 describe(`the big datatype matrix (engine: ${VARIANT})`, () => {

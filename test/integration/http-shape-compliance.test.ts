@@ -26,7 +26,7 @@ async function compliant(sql: string, opts: AnyOpts): Promise<void> {
     })
     const got = await (db as unknown as { query: (s: string, p: unknown[], o: AnyOpts) => Promise<{ rows: unknown[] }> }).query(sql, [], opts)
     expect(got.rows).toEqual(expected.rows)
-  } finally { wire.end() }
+  } finally { await wire.end() }
 }
 
 describe('minipg/http decodes shapes EXACTLY like the wire driver', () => {

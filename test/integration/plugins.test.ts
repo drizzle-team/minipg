@@ -74,7 +74,7 @@ describe('otel() plugin (mock tracer)', () => {
   const mockTracer = () => {
     const spans: any[] = []
     return { spans, startSpan(name: string, opts?: { attributes?: Record<string, unknown> }) {
-      const s = { name, attrs: { ...(opts?.attributes ?? {}) }, ended: false, status: undefined as any, exceptions: [] as unknown[],
+      const s = { name, attrs: { ...opts?.attributes }, ended: false, status: undefined as any, exceptions: [] as unknown[],
         setAttributes(a: Record<string, unknown>) { Object.assign(this.attrs, a) }, setStatus(st: any) { this.status = st }, recordException(e: unknown) { this.exceptions.push(e) }, end() { this.ended = true } }
       spans.push(s); return s } }
   }
@@ -131,7 +131,7 @@ describe('sentry() plugin (mock client)', () => {
 describe('multiple plugins compose', () => {
   test('collector + otel both fire for one query', async () => {
     const events: any[] = []
-    const t = { spans: [] as any[], startSpan(_n: string, o?: any) { const s = { attrs: { ...(o?.attributes ?? {}) }, ended: false, setAttributes(a: any) { Object.assign(this.attrs, a) }, end() { this.ended = true } }; this.spans.push(s); return s } }
+    const t = { spans: [] as any[], startSpan(_n: string, o?: any) { const s = { attrs: { ...o?.attributes }, ended: false, setAttributes(a: any) { Object.assign(this.attrs, a) }, end() { this.ended = true } }; this.spans.push(s); return s } }
     const c = await withPlugins([collector((e) => events.push(e)), otel({ tracer: t })])
     await c.query('select 1')
     expect(events.length).toBe(1)

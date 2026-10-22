@@ -2,8 +2,7 @@
 Default to using Bun instead of Node.js.
 
 - Use `bun <file>` instead of `node <file>` or `ts-node <file>`
-- Use `bun test` instead of `jest` or `vitest`
-- Use `bun build <file.html|file.ts|file.css>` instead of `webpack` or `esbuild`
+- Use `bun test` instead of `jest` or `vitest` for the unit and integration suites
 - Use `bun install` instead of `npm install` or `yarn install` or `pnpm install`
 - Use `bun run <script>` instead of `npm run <script>` or `yarn run <script>` or `pnpm run <script>`
 - Use `bunx <package> <command>` instead of `npx <package> <command>`
@@ -18,6 +17,17 @@ Default to using Bun instead of Node.js.
 - `WebSocket` is built-in. Don't use `ws`.
 - Prefer `Bun.file` over `node:fs`'s readFile/writeFile
 - Bun.$`ls` instead of execa.
+
+## Toolchain
+
+Vite+ (`vp`) builds, lints and runs the Cloudflare suite. `vite.config.ts` holds the settings for all
+three. See `docs/adr/0017-vite-plus-toolchain.md`.
+
+- `bun run build` runs `vp pack`. Do not add a separate bundler.
+- `bun run lint` runs `vp lint`. Every enabled rule is an error. Turn off a deliberate case on one
+  line with `// oxlint-disable-next-line <rule> -- <reason>`.
+- `bun run test:cf` runs `vp test`, which is Vitest inside workerd. Only `test/cf` uses Vitest.
+- Keep `vite-plus`, the `vite` alias and `overrides.vite` on the same version.
 
 ## Agent skills
 
@@ -60,7 +70,7 @@ test("hello world", () => {
 
 ## Frontend
 
-Use HTML imports with `Bun.serve()`. Don't use `vite`. HTML imports fully support React, CSS, Tailwind.
+Use HTML imports with `Bun.serve()`. HTML imports fully support React, CSS, Tailwind.
 
 Server:
 

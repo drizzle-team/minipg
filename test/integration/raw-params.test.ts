@@ -17,7 +17,7 @@ describe('rawParams()', () => {
       expect(r.rows[0]).toEqual({ v: 9007199254740993n, s: 'café 😀', n: null })
       const normal = await c.query('select $1::int8 as v, $2::text as s, $3::text as n', [9007199254740993n, 'café 😀', null], { mode: 'object' })
       expect(r.rows[0]).toEqual(normal.rows[0])
-    } finally { c.end() }
+    } finally { await c.end() }
   }, TEST_TIMEOUT)
 
   test('binary + mixed formats: caller-chosen per-parameter format codes reach Bind untouched', async () => {
@@ -31,7 +31,7 @@ describe('rawParams()', () => {
       // one format code applies to ALL parameters
       const all = await c.query('select $1 as a, $2 as b', rawParams({ formats: [1], values: [i8, i4] }), { params: ['int8', 'int4'], mode: 'object' })
       expect(all.rows[0]).toEqual({ a: 300n, b: -7 })
-    } finally { c.end() }
+    } finally { await c.end() }
   }, TEST_TIMEOUT)
 
   test("composes with mode:'wire': bytes in, frames out, driver converts nothing", async () => {
@@ -41,7 +41,7 @@ describe('rawParams()', () => {
       const stream = Buffer.concat(frames.map((f) => Buffer.from(f)))
       expect(new Parser().push(stream).map((m) => m.type)).toEqual(['T', 'D', 'C'])
       expect(stream.toString('latin1')).toContain('gateway-bytes')
-    } finally { c.end() }
+    } finally { await c.end() }
   }, TEST_TIMEOUT)
 
   test('framing validation only: bad formats length throws locally; declared-types count mismatch errors', async () => {
@@ -53,6 +53,6 @@ describe('rawParams()', () => {
       // the caller owns byte correctness: garbage binary bytes surface as the SERVER's error, not silence
       const bad = await caught(() => c.query('select $1::int8', rawParams({ formats: [1], values: [t('xx')] }), { params: ['int8'] }))
       expect((bad as Error).message).toMatch(/binary|format|insufficient/i)
-    } finally { c.end() }
+    } finally { await c.end() }
   }, TEST_TIMEOUT)
 })

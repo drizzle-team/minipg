@@ -15,7 +15,7 @@
 import type { Decoder } from './types.ts'
 import { parseJsonBuffer } from './jsonparse.ts'
 import { genJsonParsers, specNeedsWalk, buildJsonWalk, type JsonMarker, type JsonPlan, type JsTarget } from './json.ts'
-import { extAt, extLeafFor, parseLineAbc, parseLineTuple } from './geo.ts'
+import { extAt, extLeafFor } from './geo.ts'
 import { customAt, customDelimFor, customLeafFor } from './registry.ts'
 
 // ---------------------------------------------------------------------------------------------

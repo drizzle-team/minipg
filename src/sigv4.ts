@@ -84,10 +84,10 @@ export async function signRequest(i: SignRequestInput): Promise<Record<string, s
   const u = new URL(i.url)
   const amzDate = i.amzDate ?? amzDateNow()
   const payloadHash = await sha256Hex(i.body)
-  const toSign: Record<string, string> = { ...(i.headers ?? {}), host: u.host, 'x-amz-date': amzDate, 'x-amz-content-sha256': payloadHash }
+  const toSign: Record<string, string> = { ...i.headers, host: u.host, 'x-amz-date': amzDate, 'x-amz-content-sha256': payloadHash }
   if (i.credentials.sessionToken) toSign['x-amz-security-token'] = i.credentials.sessionToken
   const { authorization } = await signV4({ method: i.method, path: u.pathname, query: u.search.replace(/^\?/, ''), headers: toSign, body: i.body, service: i.service, region: i.region, credentials: i.credentials, amzDate })
-  const out: Record<string, string> = { ...(i.headers ?? {}), 'X-Amz-Date': amzDate, 'X-Amz-Content-Sha256': payloadHash, Authorization: authorization }
+  const out: Record<string, string> = { ...i.headers, 'X-Amz-Date': amzDate, 'X-Amz-Content-Sha256': payloadHash, Authorization: authorization }
   if (i.credentials.sessionToken) out['X-Amz-Security-Token'] = i.credentials.sessionToken
   return out
 }

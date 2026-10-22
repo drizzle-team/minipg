@@ -1622,6 +1622,7 @@ export class Connection {
   }
 
   stream<Row = unknown[]>(sql: string, params: readonly unknown[] = [], opts: StreamOptions = {}): AsyncIterableIterator<Row> {
+    // oxlint-disable-next-line typescript/no-this-alias -- the iterator's own methods rebind `this`
     const self = this
     const buf: Row[] = []
     let waiting: { resolve: (r: IteratorResult<Row>) => void; reject: (e: Error) => void } | null = null
@@ -1672,6 +1673,7 @@ export class Connection {
    *  detaches instead: the remaining frames are dropped as they arrive while the server finishes the
    *  copy. COPY accepts no $n params — any dynamic values must be inlined with care. */
   copyTo(sql: string, opts: { timeout?: number; signal?: AbortSignal; highWaterMark?: number } = {}): AsyncIterableIterator<Uint8Array> & { result: Promise<{ command: string | null; rowCount: number | null }> } {
+    // oxlint-disable-next-line typescript/no-this-alias -- the iterator's own methods rebind `this`
     const self = this
     let chunks: Buffer[] = []
     let buffered = 0

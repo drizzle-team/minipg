@@ -24,13 +24,17 @@ async function openSocket(c: TransportTarget) {
   // (encrypt-without-verify elsewhere) effectively behaves like verify-full here. No
   // expectedServerHostname: workerd rejects the option; SNI defaults to the connect() hostname.
   const secure = socket.startTls()
-  // workerd reports handshake failures on `closed` while `opened` stays PENDING — a bare await
-  // on opened hangs forever on e.g. an untrusted certificate. Race them.
+  // workerd reports a handshake failure (an untrusted certificate, for example) in one of two ways,
+  // depending on its version: `opened` rejects with a generic "internal error", or `closed` settles
+  // while `opened` stays pending forever. Race them, and name the TLS step in both cases.
+  const handshakeFailed = (e: unknown): never => {
+    throw new Error(`minipg/cf: TLS handshake failed during startTls — ${(e as Error)?.message ?? e}`, { cause: e })
+  }
   await Promise.race([
-    secure.opened,
+    secure.opened.catch(handshakeFailed),
     secure.closed.then(
       () => { throw new Error('minipg/cf: TLS handshake failed — connection closed during startTls (untrusted certificate?)') },
-      (e) => { throw new Error(`minipg/cf: TLS handshake failed during startTls — ${(e as Error)?.message ?? e}`) },
+      handshakeFailed,
     ),
   ])
   return secure

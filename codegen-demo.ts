@@ -2,12 +2,16 @@
 // syntax-highlighted for the terminal. No hand-rolled bytes / Function.
 //   bun codegen-demo.ts        (or: bun run demo:codegen)
 import { highlight } from 'cli-highlight'
-import prettier from 'prettier'
+import { format } from 'vite-plus/fmt'
 import { JsonArray, Shape, connect } from './src/index.ts'
 
-const pretty = (src: string) => prettier.format(src, { parser: 'babel', semi: false, singleQuote: true, printWidth: 100 })
+const pretty = async (src: string) => {
+  const { code, errors } = await format('mapper.js', src, { semi: false, singleQuote: true, printWidth: 100 })
+  if (errors.length > 0) throw new Error(errors.map((e) => e.message).join('\n'))
+  return code
+}
 const colorize = (src: string) => highlight(src, { language: 'javascript', ignoreIllegals: true })
-const show = async (src: string) => console.log(colorize(await pretty(src))) // prettier first (can't parse ANSI), then colorize
+const show = async (src: string) => console.log(colorize(await pretty(src))) // format first (it cannot parse ANSI), then colorize
 
 // 1) Declare a shape, inspect its generated result-set mapper — pure library API.
 const user = Shape({

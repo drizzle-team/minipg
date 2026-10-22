@@ -12,7 +12,6 @@ import type { Connection } from '../../../src/index.ts'
 
 // --- tiny accessors honoring noUncheckedIndexedAccess ---------------------
 const aCell = (r: { rows: unknown[] }, i = 0, j = 0): unknown => (r.rows[i] as unknown[])[j]
-const oCell = (r: { rows: unknown[] }, col: string, i = 0): unknown => (r.rows[i] as Record<string, unknown>)[col]
 
 let c: Connection
 beforeAll(async () => { c = await testConnect() })
@@ -434,7 +433,7 @@ describe('UTF-8 fidelity, multibyte & NUL guards', () => {
     const s = '😀'
     const r = await c.query('select $1::text a', [s])
     expect(aCell(r)).toBe(s)
-    expect([...(aCell(r) as string)].length).toBe(1)
+    expect(Array.from(aCell(r) as string).length).toBe(1)
     expect((aCell(r) as string).codePointAt(0)).toBe(0x1f600)
   })
 

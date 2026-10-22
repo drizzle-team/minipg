@@ -4,7 +4,7 @@
 //
 // Needs the local PG cluster reachable from workerd (`bun run test:setup`, listening on 127.0.0.1:54329).
 // Run with: `bun run test:cf`.
-import { it, expect } from 'vitest'
+import { it, expect } from 'vite-plus/test'
 import { connect, createPool } from '../../src/cf.ts'
 
 const CFG = { host: '127.0.0.1', port: 54329, user: 'postgres', password: 'postgres', database: 'testdb' }

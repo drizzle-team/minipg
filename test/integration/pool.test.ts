@@ -691,7 +691,7 @@ describe('multiple pools & config isolation', () => {
   })
 
   test('using a pool does not mutate the passed config object', async () => {
-    const cfg = { ...({ host: '127.0.0.1', port: 54329, user: 'postgres', password: 'postgres', database: 'testdb', max: 2, applicationName: appName() }) }
+    const cfg = { host: '127.0.0.1', port: 54329, user: 'postgres', password: 'postgres', database: 'testdb', max: 2, applicationName: appName() }
     const snapshot = JSON.stringify(cfg)
     const { createPool } = await import('../../src/index.ts')
     const pool = createPool(cfg)

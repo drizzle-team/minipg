@@ -13,7 +13,7 @@ describe('minipg/http without a global Buffer', () => {
     try {
       const frames = await c.query(`select 9007199254740993::int8 as big, 'café 😀' as s, null::text as z`, [], { mode: 'wire' })
       body = Buffer.concat(frames.map((f) => Buffer.from(f)))
-    } finally { c.end() }
+    } finally { await c.end() }
 
     const script = `
       delete globalThis.Buffer // simulate Vercel Edge / browser: no Buffer before the entry loads

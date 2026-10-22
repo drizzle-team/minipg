@@ -58,7 +58,7 @@ describe('MinipgClient.query', () => {
       const next = (yield* client.query('select 9')).rows
       return { failed, timedOut, elapsed, next }
     }), { maxConnections: 1 })
-    const reason = Exit.isFailure(result.failed) ? (result.failed.cause.reasons.find(Cause.isFailReason)?.error as { reason: { _tag: string } }).reason._tag : undefined
+    const reason = Exit.isFailure(result.failed) ? (result.failed.cause.reasons.find(Cause.isFailReason)?.error as { reason: { _tag: string } } | undefined)?.reason._tag : undefined
     expect(reason).toBe('UnknownError')
     expect(Exit.isFailure(result.timedOut)).toBe(true)
     expect(result.elapsed).toBeLessThan(2000)

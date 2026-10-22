@@ -1,6 +1,6 @@
 // Packaging gauntlet for @drizzle-team/minipg: packs the tree exactly as found
 // and runs four independent validators against that one tarball. Consumes
-// dist/ as-is and never builds — tsdown's clean:true would regenerate any
+// dist/ as-is and never builds — vp pack's clean: true would regenerate any
 // file removed from dist/, which would make a deleted-file check untestable.
 //   node scripts/verify-publish.mjs   (or: bun run verify:publish)
 import { execFileSync } from 'node:child_process'

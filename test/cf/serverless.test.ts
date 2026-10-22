@@ -1,8 +1,8 @@
 // Real-workerd tests for the serverless driver entries (minipg/neon-ws, /neon-http, /aurora). Confirms
 // they actually run on the Cloudflare Workers runtime — global WebSocket / fetch / crypto.subtle,
 // nodejs_compat (Buffer / node:stream), and the interpreted decode fallback (workerd has no eval, so the
-// 'auto' mapper must pick the interpreted path). Neon URLs are injected as bindings by vitest.config.ts.
-import { it, expect, describe } from 'vitest'
+// 'auto' mapper must pick the interpreted path). Neon URLs are injected as bindings by vite.config.ts.
+import { it, expect, describe } from 'vite-plus/test'
 import { env } from 'cloudflare:test'
 import { connect as connectWs } from '../../src/neon-ws.ts'
 import { connect as connectHttp } from '../../src/neon-http.ts'

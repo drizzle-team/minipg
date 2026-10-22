@@ -10,8 +10,6 @@ import { run, bench, group, summary, do_not_optimize } from 'mitata'
 import { Shape, Json, JsonArray } from '../src/index.ts'
 import { parseJsonBuffer } from '../src/jsonparse.ts'
 
-const a = '{"big": 12312312312312312}'
-
 const reviver = (_k: string, v: unknown, ctx?: { source?: string }) =>
   typeof v === 'number' && Number.isInteger(v) && !Number.isSafeInteger(v) && ctx && typeof ctx.source === 'string' && /^-?\d+$/.test(ctx.source) ? ctx.source : v
 

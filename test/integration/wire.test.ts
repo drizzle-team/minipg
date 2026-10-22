@@ -28,7 +28,7 @@ describe("mode:'wire'", () => {
       expect(cells.map((x) => (x === null ? null : x.toString('utf8')))).toEqual(['1', 'hi', null])
       const obj = await c.query(`select 1 as a, 'hi' as b, null::text as n`, [], { mode: 'object' })
       expect(obj.rows[0]).toEqual({ a: 1, b: 'hi', n: null })
-    } finally { c.end() }
+    } finally { await c.end() }
   }, TEST_TIMEOUT)
 
   test("insert without returning: ['C'] — no T, no 'n' (NoData excluded as nondeterministic)", async () => {
@@ -39,7 +39,7 @@ describe("mode:'wire'", () => {
       expect(tags(frames)).toEqual(['C'])
       expect(reparse(frames)[0]!.body.toString('latin1')).toContain('INSERT 0 1')
       expect(tags(await c.query('', [], { mode: 'wire' }))).toEqual(['I']) // empty sql -> EmptyQueryResponse
-    } finally { c.end() }
+    } finally { await c.end() }
   }, TEST_TIMEOUT)
 
   test('a failing statement RESOLVES with the E frame in-band; the connection stays usable', async () => {
@@ -52,7 +52,7 @@ describe("mode:'wire'", () => {
       // parse-time failure: nothing precedes the E
       expect(tags(await c.query('selec 1', [], { mode: 'wire' }))).toEqual(['E'])
       expect((await c.query('select 41+1 as x', [], { mode: 'object' })).rows[0]).toEqual({ x: 42 })
-    } finally { c.end() }
+    } finally { await c.end() }
   }, TEST_TIMEOUT)
 
   test('prepared reuse: second run legitimately has no T — and stays TEXT (no binary-on-reuse upgrade)', async () => {
@@ -66,7 +66,7 @@ describe("mode:'wire'", () => {
       // reuseBinaryOids types — array/object modes WOULD have flipped them to binary here)
       const dOf = (fr: Uint8Array[]) => Buffer.from(reparse(fr).find((m) => m.type === 'D')!.body)
       expect(dOf(again).equals(dOf(first))).toBe(true)
-    } finally { c.end() }
+    } finally { await c.end() }
   }, TEST_TIMEOUT)
 
   test('DDL-invalidated named statement: E resolves in-band (no transparent retry), next run self-heals with a fresh T', async () => {
@@ -84,7 +84,7 @@ describe("mode:'wire'", () => {
       expect(parseRowDescription(reparse(healed)[0]!.body).map((f) => f.name)).toEqual(['a', 'b'])
     } finally {
       await c2.query(`drop table ${K}_ddl`).catch(() => {})
-      c.end(); c2.end()
+      await c.end(); await c2.end()
     }
   }, TEST_TIMEOUT)
 
@@ -99,7 +99,7 @@ describe("mode:'wire'", () => {
       expect(Buffer.concat(a.map((f) => Buffer.from(f))).toString('latin1')).toContain('first')
       expect(tags(b)).toEqual(['T', 'E'])
       expect(Buffer.concat(d.map((f) => Buffer.from(f))).toString('latin1')).toContain('third')
-    } finally { c.end() }
+    } finally { await c.end() }
   }, TEST_TIMEOUT)
 
   test('wire BEGIN…COMMIT composition: a deferred-constraint failure AT COMMIT is visible in the COMMIT entry', async () => {
@@ -123,7 +123,7 @@ describe("mode:'wire'", () => {
       expect(n.rows[0]).toEqual({ n: 0 }) // nothing committed
     } finally {
       await c.query(`drop table ${K}_dc`).catch(() => {})
-      c.end()
+      await c.end()
     }
   }, TEST_TIMEOUT)
 
@@ -135,7 +135,7 @@ describe("mode:'wire'", () => {
       expect(err).not.toBeInstanceOf(PgError) // a timeout is not a backend message
       const combo = await caught(() => (c as unknown as { query: (...a: unknown[]) => Promise<unknown> }).query('select 1', [], { mode: 'wire', binary: true }))
       expect((combo as Error).message).toMatch(/shape\/binary decode options don't apply/)
-    } finally { c.end() }
+    } finally { await c.end() }
   }, TEST_TIMEOUT)
 
   test('>64KB pipelined burst: boundaries survive the mid-burst flush; every statement stays whole and ordered', async () => {
@@ -150,7 +150,7 @@ describe("mode:'wire'", () => {
         expect(cells[0]!.toString('utf8')).toBe(big + i)
         expect(cells[1]!.toString('utf8')).toBe(String(i))
       })
-    } finally { c.end() }
+    } finally { await c.end() }
   }, TEST_TIMEOUT)
 })
 
@@ -161,5 +161,5 @@ test("span coalescing: entry count is independent of row count ('nothing per mes
     const msgs = reparse(frames)
     expect(msgs.filter((m) => m.type === 'D').length).toBe(1000)   // one thousand rows…
     expect(frames.length).toBeLessThan(10)                          // …a handful of contiguous runs (chunk-bounded, never row-bounded)
-  } finally { c.end() }
+  } finally { await c.end() }
 }, TEST_TIMEOUT)

@@ -24,3 +24,4 @@ sst-env.d.ts
 
 # README examples written by test/integration/effect-readme.test.ts
 test/.readme-examples/
+.vitest/

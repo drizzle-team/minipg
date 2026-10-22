@@ -1,9 +1,9 @@
 // Runnable minipg examples against the local test cluster.
 // Start the cluster once with `bun run test:setup`, then: bun index.ts
-import { Pool, Json } from './src/index.ts'
+import { Pool } from './src/index.ts'
 import type { Plugin } from './src/plugin.ts'
 
-const sqlLog: Plugin = { name: 'sql-log', onQueryStart: i => void console.log('→', i.sql, i.prepared ? '(reuse)' : '') }
+const sqlLog: Plugin = { name: 'sql-log', onQueryStart: (i) => console.log('→', i.sql, i.prepared ? '(reuse)' : '') }
 const c = new Pool({ path: '/tmp/minipg_sock/.s.PGSQL.54329', user: 'postgres', database: 'testdb', plugins: [sqlLog]})
 
 const sql = `select row_to_json(x) as row from (select array[9007199254740993, 2, 3]::int8[]) x`
