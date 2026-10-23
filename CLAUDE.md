@@ -20,10 +20,11 @@ Default to using Bun instead of Node.js.
 
 ## Toolchain
 
-Vite+ (`vp`) builds, lints and runs the Cloudflare suite. `vite.config.ts` holds the settings for all
-three. See `docs/adr/0017-vite-plus-toolchain.md`.
+Vite+ (`vp`) builds, formats, lints and runs the Cloudflare suite. `vite.config.ts` holds the settings for
+all four. See `docs/adr/0017-vite-plus-toolchain.md`.
 
 - `bun run build` runs `vp pack`. Do not add a separate bundler.
+- `bun run fmt` runs `vp fmt`. The pre-commit hook formats staged files, and CI runs `bun run fmt --check`.
 - `bun run lint` runs `vp lint`. Every enabled rule is an error. Turn off a deliberate case on one
   line with `// oxlint-disable-next-line <rule> -- <reason>`.
 - `bun run test:cf` runs `vp test`, which is Vitest inside workerd. Only `test/cf` uses Vitest.

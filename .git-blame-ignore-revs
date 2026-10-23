@@ -1,0 +1,6 @@
+# Commits that only change formatting. git blame skips them with:
+#   git config blame.ignoreRevsFile .git-blame-ignore-revs
+# GitHub reads this file without that setting.
+
+# Format the repository with vp fmt
+5d6d2ba1b753e4fa824f2b907e6ac47afd8463e7

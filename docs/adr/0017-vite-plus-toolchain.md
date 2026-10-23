@@ -1,6 +1,6 @@
-# Vite+ builds and lints, and bun test keeps the main suites
+# Vite+ builds, formats and lints, and bun test keeps the main suites
 
-minipg builds with `vp pack` and lints with `vp lint`, both from Vite+. One dev dependency and one `vite.config.ts` replace tsdown, a Vitest 2 setup and their configs. The unit and integration suites stay on `bun test`, because they import `bun:test` and use Bun runtime APIs that Vitest cannot run. `vp test` runs only the Cloudflare suite. It runs inside workerd through `@cloudflare/vitest-plugin`, so the suite tests the current Workers runtime. The old pool pinned a workerd from 2024, and that runtime hid two bugs in the Cloudflare transport.
+minipg builds with `vp pack`, formats with `vp fmt` and lints with `vp lint`, all from Vite+. One dev dependency and one `vite.config.ts` replace tsdown, prettier, a Vitest 2 setup and their configs. The unit and integration suites stay on `bun test`, because they import `bun:test` and use Bun runtime APIs that Vitest cannot run. `vp test` runs only the Cloudflare suite. It runs inside workerd through `@cloudflare/vitest-plugin`, so the suite tests the current Workers runtime. The old pool pinned a workerd from 2024, and that runtime hid two bugs in the Cloudflare transport.
 
 ## Considered options
 

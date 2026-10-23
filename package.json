@@ -166,6 +166,7 @@
     "db:pull": "drizzle-kit pull",
     "db:studio": "drizzle-kit studio",
     "lint": "vp lint",
+    "fmt": "vp fmt",
     "prepare": "vp config --no-agent"
   },
   "devDependencies": {

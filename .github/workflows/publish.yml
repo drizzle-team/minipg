@@ -41,6 +41,7 @@ jobs:
           node-version: '24'
           package-manager-cache: false
       - run: bun install --frozen-lockfile
+      - run: bun run fmt --check
       - run: bun run lint
       - run: bun run typecheck
       - run: bun run build
