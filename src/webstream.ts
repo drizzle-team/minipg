@@ -1,5 +1,5 @@
 import { W } from './protocol.ts'
-type ByteReader = { read(): Promise<{ value?: Uint8Array; done: boolean }>; releaseLock(): void; cancel?(reason?: unknown): Promise<void> }
+type ByteReader = { read(): Promise<{ value?: Uint8Array; done: boolean }>; releaseLock(): void; cancel?(reason?: unknown): Promise<void>; closed?: Promise<void> }
 type ByteWriter = { write(b: Uint8Array): Promise<unknown>; releaseLock(): void; close?(): Promise<void>; abort?(reason?: unknown): Promise<void> }
 
 /** Postgres' STARTTLS exchange over a plaintext socket: send the 8-byte SSLRequest, read the
@@ -48,6 +48,9 @@ export function duplexFromWeb(readable: unknown, writable: unknown): Duplex {
   // explicit bridge below uses nothing but the Web Streams API and the Duplex constructor.
   const reader = (readable as { getReader(): ByteReader }).getReader()
   const writer = (writable as { getWriter(): ByteWriter }).getWriter()
+  // workerd rejects `closed` when destroy() cancels the reader, and reports that rejection as
+  // unhandled unless someone listens. The pump already sees the same error through read().
+  reader.closed?.catch(() => { /* handled by the pump */ })
   let pumping = false
   const duplex: Duplex = new Duplex({
     allowHalfOpen: false, // peer EOF finishes both sides and auto-destroys -> the core sees its 'close'
