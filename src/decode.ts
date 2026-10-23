@@ -59,29 +59,49 @@ function bigintReviver(as: 'string' | 'bigint') {
       ? (as === 'bigint' ? BigInt(ctx.source) : ctx.source) : v
 }
 
-/** The json/jsonb decoder for a given jsonBigints mode. 'number' = plain native JSON.parse.
- *  'string'/'bigint' are HYBRID: a cheap byte pre-scan (mayHaveBigInt) detects whether a value
- *  could contain an integer > 2^53. The common case (none) takes the native JSON.parse fast
- *  path; only flagged values pay the slow exact path (source-text reviver, or the pure-JS
- *  buffer parser when ctx.source is unavailable). Order-independent (covers jsonb). Only whole
- *  integers are preserved; high-precision *decimals* still need a declared Json({x:'numeric'}). */
-export function jsonDecoder(mode: JsonBigints): Decoder {
-  if (mode === 'number') return asJson
-  // Detect a possible bigint (>=16 consecutive digits) with a native regex on the string we
-  // build for JSON.parse anyway — cheaper than a JS byte loop, and the slow path reuses the
-  // string. Never a false negative (correctness holds); false positives only take the slow path.
-  const BIG = /[0-9]{16}/ // no /g — stateless .test, safe to reuse
+// A JSON integer token of 16+ digits (one JSON.parse may round), checked with a native regex on the string
+// built for JSON.parse anyway. The lookarounds skip fraction and exponent digits — a full-precision float
+// like 0.30000000000000004 has a 16-digit run, and would otherwise send every float-heavy value down the
+// slow path. Never a false negative: an integer token is never preceded by a digit, '.', 'e' or a sign
+// other than its own '-'. A digit run inside a string can still match; that only costs the slow path.
+const BIG_INT = /(?<![\d.eE+-])-?\d{16}(?!\d*[.eE])/ // no /g — stateless .test, safe to reuse
+
+/** JSON text -> value with integers past 2^53 kept exact (as digit strings or BigInts, per `mode`). The
+ *  common case (no big integer) is native JSON.parse; only flagged values pay the exact path: the
+ *  source-text reviver, or the pure-JS buffer parser when ctx.source is unavailable. `b` is the same text
+ *  as bytes when the caller already has them. */
+function bigintJsonParser(mode: 'string' | 'bigint'): (s: string, b?: Buffer) => unknown {
   if (jsonSourceSupported) {
     const rev = bigintReviver(mode)
-    return (b) => { const s = b.toString('utf8'); return BIG.test(s) ? JSON.parse(s, rev as never) : JSON.parse(s) }
+    return (s) => (BIG_INT.test(s) ? JSON.parse(s, rev as never) : JSON.parse(s))
   }
-  return (b) => { const s = b.toString('utf8'); return BIG.test(s) ? parseJsonBuffer(b, 0, b.length, mode) : JSON.parse(s) }
+  return (s, b) => {
+    if (!BIG_INT.test(s)) return JSON.parse(s)
+    const buf = b ?? Buffer.from(s, 'utf8')
+    return parseJsonBuffer(buf, 0, buf.length, mode)
+  }
+}
+
+/** The json/jsonb decoder for a given jsonBigints mode. 'number' = plain native JSON.parse.
+ *  'string'/'bigint' keep integers past 2^53 exact (see bigintJsonParser). Order-independent (covers
+ *  jsonb). Only whole integers are preserved; high-precision *decimals* still need a declared
+ *  Json({x:'numeric'}). */
+export function jsonDecoder(mode: JsonBigints): Decoder {
+  if (mode === 'number') return asJson
+  const parse = bigintJsonParser(mode)
+  return (b) => parse(b.toString('utf8'), b)
 }
 
 export function buildDecoders(overrides?: Record<number, Decoder>, jsonBigints: JsonBigints = 'number'): Map<number, Decoder> {
   if (!overrides && jsonBigints === 'number') return defaultDecoders
   const m = new Map(defaultDecoders)
-  if (jsonBigints !== 'number') { const d = jsonDecoder(jsonBigints); m.set(114, d); m.set(3802, d) }
+  if (jsonBigints !== 'number') {
+    const d = jsonDecoder(jsonBigints); m.set(114, d); m.set(3802, d)
+    // json[]/jsonb[] elements too: the generic array path parses them with plain JSON.parse. A map entry
+    // for an array OID takes precedence over that path in both mappers.
+    const arr = parseArrayLiteral(bigintJsonParser(jsonBigints))
+    const ad: Decoder = (b) => arr(b.toString('utf8')); m.set(199, ad); m.set(3807, ad)
+  }
   if (overrides) for (const [oid, fn] of Object.entries(overrides)) m.set(Number(oid), fn)
   return m
 }

@@ -14,8 +14,8 @@ export async function negotiateSslRequest(readable: unknown, writable: unknown):
     const { value, done } = await reader.read()
     if (done || !value || value.byteLength === 0) throw new Error('minipg/cf: connection closed during the SSLRequest exchange')
     const b = value[0]!
-    if (b === 0x4e) throw new Error("minipg/cf: server refused TLS ('N' to SSLRequest) — sslmode=require cannot proceed (is ssl enabled server-side?)") // 'N'
-    if (b !== 0x53) throw new Error(`minipg/cf: unexpected SSLRequest reply 0x${b.toString(16)} — not a Postgres server?`) // not 'S'
+    if (b === 0x4e) throw Object.assign(new Error("minipg/cf: server refused TLS ('N' to SSLRequest) — sslmode=require cannot proceed (is ssl enabled server-side?)"), { fatal: true }) // 'N'
+    if (b !== 0x53) throw Object.assign(new Error(`minipg/cf: unexpected SSLRequest reply 0x${b.toString(16)} — not a Postgres server?`), { fatal: true }) // not 'S'
     if (value.byteLength > 1) throw new Error('minipg/cf: unexpected data after the SSLRequest reply — refusing to upgrade') // nothing may be buffered past 'S'
   } finally {
     reader.releaseLock(); writer.releaseLock() // BOTH locks must be free before startTls()

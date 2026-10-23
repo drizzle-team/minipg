@@ -7,7 +7,7 @@
 // DataRow to `buildMapperFactory`, so results decode identically to the socket driver (int8→BigInt,
 // numeric→string, temporal→Date, bytea→Buffer, …). We force resultSetOptions longReturnType/decimalReturnType
 // = STRING so int8/numeric arrive as exact text; emulators (local-data-api) ignore that and send a bare JSON
-// number, so the response body is parsed with long integers kept as their exact digits (parseExact).
+// number, so a body carrying one is parsed with integers past 2^53 kept as their exact digits.
 //
 // Params: the CALLER owns the SQL and its `:name`/`:pN` placeholders — we never rewrite it. Use `bind()`:
 //   db.query('insert into t (a,b) values (:p1, :uid)', [ bind.bigint(10), bind.uuid(id, 'uid') ])
@@ -22,6 +22,7 @@
 // silently loses its NULLs (a limitation of the wire format, not recoverable client-side).
 import { buildMapperFactory, type RowMapperFactory } from './mapper.ts'
 import { buildDecoders } from './decode.ts'
+import { parseJsonBuffer } from './jsonparse.ts'
 import { INSTANT_OIDS, tagArrayCol, type CodegenCol } from './decode.ts'
 import { shapeCols, mergeUnknownCols, ARRAY_OID, type ShapeSpec } from './spec.ts'
 import type { ShapeMapper } from './shape.ts'
@@ -118,7 +119,7 @@ function oidForTypeName(t: string): number {
 }
 
 interface ColumnMetadata { name?: string; label?: string; typeName: string }
-// longValue(s) are strings when parseExact had to keep digits a JS number would round.
+// longValue(s) are strings when parseBody had to keep digits a JS number would round.
 interface ArrayValue { stringValues?: string[]; longValues?: (number | string)[]; doubleValues?: number[]; booleanValues?: boolean[]; arrayValues?: ArrayValue[] }
 interface Field { isNull?: boolean; stringValue?: string; longValue?: number | string; doubleValue?: number; booleanValue?: boolean; blobValue?: string; arrayValue?: ArrayValue }
 
@@ -158,15 +159,15 @@ function fieldToText(f: Field, utc: boolean, delim: ',' | ';'): Buffer | null {
   return null
 }
 
-// JSON.parse that keeps longValue/longValues integers past 2^53 exact, as digit strings (a reviver with
-// context.source would do it natively, but needs a newer runtime than the package's >= 18). Inside a JSON
-// string every '"' is escaped, so `"longValue":` can only ever match a real key.
-const LONG_RE = /("longValue"\s*:\s*)(-?\d{16,})|("longValues"\s*:\s*\[)([^\]]*)/g
-const UNSAFE_INT_RE = /-?\d{16,}/g
-function parseExact(text: string): unknown {
-  if (!text.includes('"longValue')) return JSON.parse(text)
-  return JSON.parse(text.replace(LONG_RE, (m, k1: string | undefined, n: string | undefined, k2: string | undefined, list: string | undefined) =>
-    k1 !== undefined ? k1 + '"' + n + '"' : k2! + list!.replace(UNSAFE_INT_RE, '"$&"')))
+// Native JSON.parse, unless a longValue/longValues entry holds an integer of 16+ digits (one JSON.parse
+// may round): then the bigint-safe buffer parser, which returns those as exact digit strings. The gate is
+// keyed on the field names, not jsonDecoder's any-16-digit-run check — a full-precision doubleValue has
+// one of those in nearly every row. Inside a JSON string every '"' is escaped, so `"longValue":` can only
+// match a real key.
+const LONG_BIG = /"longValues?"\s*:\s*(?:\[[-\d,\s]*?)?-?\d{16}/
+function parseBody(b: Buffer): unknown {
+  const s = b.toString('utf8')
+  return LONG_BIG.test(s) ? parseJsonBuffer(b, 0, b.length, 'string') : JSON.parse(s)
 }
 
 const firstKeyword = (sql: string): string | null => { const m = sql.match(/^[\s(]*([a-zA-Z]+)/); return m ? m[1]!.toUpperCase() : null }
@@ -280,7 +281,7 @@ export class AuroraClient {
         ? await this.signOverride({ method: 'POST', url, body: payload, headers: { 'Content-Type': 'application/json' } })
         : await signRequest({ method: 'POST', url, body: payload, service: SERVICE, region: this.region, credentials: this.credentials!, headers: { 'Content-Type': 'application/json' } })
       const res = await this.fetchImpl(url, { method: 'POST', headers, body: payload, signal })
-      if (res.ok) return parseExact(await res.text()) as T
+      if (res.ok) return parseBody(Buffer.from(await res.arrayBuffer())) as T
       const errType = (res.headers.get('x-amzn-errortype') ?? '').split(':')[0] ?? ''
       let parsed: { message?: string } = {}
       try { parsed = ((await res.json()) as { message?: string } | null) ?? {} } catch { /* non-JSON */ }

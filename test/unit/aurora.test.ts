@@ -324,6 +324,12 @@ describe('aurora: arrayValue results decode (report #1)', () => {
     expect(r.rows[0]).toEqual({ ip: '{192.168.1.1,10.0.0.0/8}', mood: '{happy,"so so"}', bx: '{(1,1),(0,0);(3,3),(2,2)}' }) // box[] delimits with ';'
   })
 
+  test('jsonb[] elements honor jsonBigints (the big integer stays exact inside the stringValues)', async () => {
+    const { fetchImpl } = rs([{ name: 'j', typeName: '_jsonb' }], [[{ arrayValue: { stringValues: ['{"x": 9007199254740993}', '{"y": [1, -1000000000000000001]}'] } }]])
+    const r = await (await connect({ ...CFG(fetchImpl), jsonBigints: 'bigint' })).query('select …', [], { mode: 'object' })
+    expect(r.rows[0]).toEqual({ j: [{ x: 9007199254740993n }, { y: [1, -1000000000000000001n] }] })
+  })
+
   test("a box[] shape splits on ';', never inside a box (1-D and multi-dimensional)", async () => {
     const { fetchImpl } = rs(
       [{ name: 'a', typeName: '_box' }, { name: 'm', typeName: '_box' }, { name: 's', typeName: 'box' }],
