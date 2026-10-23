@@ -10,7 +10,7 @@
     {
       "binding": "HYPERDRIVE",
       "id": "a0000000000000000000000000000000",
-      "localConnectionString": "postgres://postgres:postgres@127.0.0.1:54329/testdb"
-    }
-  ]
+      "localConnectionString": "postgres://postgres:postgres@127.0.0.1:54329/testdb",
+    },
+  ],
 }

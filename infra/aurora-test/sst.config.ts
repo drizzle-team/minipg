@@ -19,26 +19,26 @@ export default $config({
       protect: false,
       home: 'aws',
       providers: { aws: { region: process.env.AWS_REGION || 'us-east-1' } },
-    }
+    };
   },
   async run() {
     // The account's default VPC — free, and Aurora + Data API don't need any special networking.
-    const vpc = aws.ec2.getVpcOutput({ default: true })
-    const subnets = aws.ec2.getSubnetsOutput({ filters: [{ name: 'vpc-id', values: [vpc.id] }] })
-    const sg = aws.ec2.getSecurityGroupOutput({ vpcId: vpc.id, name: 'default' })
+    const vpc = aws.ec2.getVpcOutput({ default: true });
+    const subnets = aws.ec2.getSubnetsOutput({ filters: [{ name: 'vpc-id', values: [vpc.id] }] });
+    const sg = aws.ec2.getSecurityGroupOutput({ vpcId: vpc.id, name: 'default' });
 
     const db = new sst.aws.Aurora('MinipgAurora', {
       engine: 'postgres',
       dataApi: true,
       scaling: { min: '0 ACU', max: '4 ACU', pauseAfter: '5 minutes' },
       vpc: { subnets: subnets.ids, securityGroups: [sg.id] },
-    })
+    });
 
     // output names match the .env vars, so they're easy to copy across after deploy
     return {
       AURORA_RESOURCE_ARN: db.clusterArn,
       AURORA_SECRET_ARN: db.secretArn,
       AURORA_DATABASE: db.database,
-    }
+    };
   },
-})
+});

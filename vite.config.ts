@@ -1,5 +1,5 @@
-import { cloudflareTest } from '@cloudflare/vitest-plugin'
-import { defineConfig } from 'vite-plus'
+import { cloudflareTest } from '@cloudflare/vitest-plugin';
+import { defineConfig } from 'vite-plus';
 
 export default defineConfig({
   // minipg has no runtime dependencies, so the build only transpiles each file.
@@ -59,4 +59,4 @@ export default defineConfig({
   staged: {
     '*.{ts,mjs,js}': 'vp lint',
   },
-})
+});
