@@ -67,12 +67,22 @@ export function nodeTransport(cfg: TransportTarget, signal: AbortSignal): Promis
   })
 }
 
+export function bunClosesOnLocalEnd(bunVersion: string | undefined = (globalThis as { process?: { versions?: { bun?: string } } }).process?.versions?.bun): boolean {
+  if (typeof bunVersion !== 'string') return false
+  const [major = 0, minor = 0] = bunVersion.split('.').map((n) => parseInt(n, 10))
+  return major < 1 || (major === 1 && minor < 4)
+}
+const SKIP_CANCEL_END = bunClosesOnLocalEnd()
+
 /** Out-of-band CancelRequest on a fresh throwaway connection (mirrors SSL negotiation). Resolves when
  *  the server closes that connection, which it does only after it has signaled the backend. */
 export function nodeCancel(cfg: TransportTarget, key: { pid: number; secret: number }): Promise<void> {
   return new Promise<void>((resolve, reject) => {
     const cancel = W.cancelRequest(key.pid, key.secret)
-    const send = (s: net.Socket | tls.TLSSocket) => { try { s.write(cancel); s.end() } catch (e) { reject(e) } }
+    // The server's close is the confirmation. On Bun < 1.4 a local end() fires 'close' right away, which
+    // would confirm the cancel before the server even read it — so there the half-close is skipped and
+    // 'close' comes only when the server closes (which it does without our FIN once it has signaled).
+    const send = (s: net.Socket | tls.TLSSocket) => { try { s.write(cancel); if (!SKIP_CANCEL_END) s.end() } catch (e) { reject(e) } }
     const plain = net.connect(cfg.path ? { path: cfg.path } : { host: cfg.host, port: cfg.port }, () => {
       if (!cfg.ssl || cfg.path) return send(plain) // like nodeTransport: no SSL on a unix socket
       plain.write(W.sslRequest())
