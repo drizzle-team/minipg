@@ -1,5 +1,10 @@
 # @drizzle-team/minipg
 
+> [!IMPORTANT]
+> This repository is archived. The driver now lives in the
+> [`postgres` folder of the drizzle-orm repository](https://github.com/drizzle-team/drizzle-orm/tree/main/postgres)
+> and is released from there as Drizzle Postgres. Open issues and pull requests in drizzle-orm.
+
 > [!WARNING]
 > Internal Drizzle Team package. Not supported for outside use. Breaking changes can land
 > without notice.
